@@ -8,7 +8,6 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
-	// "os" // <-- 移除 os 包的导入，因为不再从环境变量读取
 	"strings"
 	"time"
 
@@ -17,7 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	types "k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
-	"gopkg.in/yaml.v3" // 确保导入了 yaml.v3
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -34,8 +33,9 @@ var httpClient = &http.Client{
 }
 
 type TelegramConfig struct {
-	BotToken string   `json:"bot_token" yaml:"bot_token"` // BotToken 现在直接从 YAML/JSON 配置文件填充
-	ChatIDs  []string `json:"chat_ids" yaml:"chat_ids"`
+	BotToken           string   `json:"bot_token" yaml:"bot_token"`
+	ChatIDs            []string `json:"chat_ids" yaml:"chat_ids"`
+	NotificationTemplate string   `json:"notification_template" yaml:"notification_template"` // 新增模板字段
 }
 
 type ProtectedRule struct {
@@ -57,7 +57,7 @@ func loadConfig(file string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read config file '%s': %w", file, err)
 	}
-	if err := yaml.Unmarshal(data, &config); err != nil { // 使用 yaml.Unmarshal
+	if err := yaml.Unmarshal(data, &config); err != nil {
 		return fmt.Errorf("failed to unmarshal config from '%s': %w", file, err)
 	}
 	return nil
@@ -66,6 +66,11 @@ func loadConfig(file string) error {
 // escapeMarkdownV2 escapes special characters for Telegram MarkdownV2 parse_mode
 // See https://core.telegram.org/bots/api#markdownv2-style
 func escapeMarkdownV2(text string) string {
+	// 定义需要转义的字符
+	// _ * [ ] ( ) ~ ` > # + - = | { } . !
+	// 注意，这里只需要转义那些可能出现在用户数据中，与模板自身Markdown语法冲突的字符。
+	// 如果用户在模板中使用了，例如 `_` 表示斜体，那么它不应该被转义。
+	// 但如果 `denyReason` 中包含 `_`，则需要转义以避免破坏模板格式。
 	replacer := strings.NewReplacer(
 		"_", "\\_",
 		"*", "\\*",
@@ -97,21 +102,31 @@ func sendTelegramNotification(user string, operation string, clusterName string,
 
 	timestamp := time.Now().Format("2006-01-02 15:04:05 MST")
 
-	// 转义所有可能包含特殊 Markdown 字符的变量
+	// 转义所有可能包含特殊 Markdown 字符的变量，确保它们不会破坏模板的 Markdown 格式
 	escapedUser := escapeMarkdownV2(user)
 	escapedOperation := escapeMarkdownV2(operation)
-	escapedClusterName := escapeMarkdownV2(config.ClusterName) // clusterName 直接从 config 中读取
+	escapedClusterName := escapeMarkdownV2(clusterName) // clusterName 可能也包含特殊字符
 	escapedDenyReason := escapeMarkdownV2(denyReason)
 	escapedTimestamp := escapeMarkdownV2(timestamp)
 
+	// 使用配置的模板，如果模板为空，则使用默认模板
+	template := config.Telegram.NotificationTemplate
+	if template == "" {
+		template = "⚠️ *Kubernetes Deletion Blocked*\n" +
+			"--------------------------------\n" +
+			"👤 *User:* `%s`\n" +
+			"🔨 *Operation:* `%s`\n" +
+			"☸️ *Cluster:* `%s`\n" +
+			"🚫 *Reason:* %s\n" +
+			"🕒 *Time:* %s"
+		klog.V(4).Info("Using default Telegram notification template.")
+	} else {
+		klog.V(4).Infof("Using custom Telegram notification template: %s", template)
+	}
+
+	// 将转义后的变量填充到模板中
 	message := fmt.Sprintf(
-		"⚠️ *Kubernetes Deletion Blocked*\n"+
-			"--------------------------------\n"+
-			"👤 *User:* `%s`\n"+
-			"🔨 *Operation:* `%s`\n"+
-			"☸️ *Cluster:* `%s`\n"+
-			"🚫 *Reason:* %s\n"+
-			"🕒 *Time:* %s",
+		template,
 		escapedUser, escapedOperation, escapedClusterName, escapedDenyReason, escapedTimestamp,
 	)
 
@@ -128,7 +143,7 @@ func sendTelegramNotification(user string, operation string, clusterName string,
 			values := url.Values{}
 			values.Add("chat_id", chatID)
 			values.Add("text", message)
-			values.Add("parse_mode", "MarkdownV2") // 注意这里改为 MarkdownV2，与转义函数匹配
+			values.Add("parse_mode", "MarkdownV2") // 明确指定 MarkdownV2
 
 			resp, err := httpClient.PostForm(apiURL, values)
 			if err != nil {
@@ -273,15 +288,12 @@ func main() {
 		klog.Fatalf("Failed to load config from %s: %v", *configFile, err)
 	}
 
-	// 移除了从环境变量读取 TELEGRAM_BOT_TOKEN 的逻辑
-
 	klog.Info("=========================================================")
 	klog.Info("Starting Kubernetes Delete Interceptor Admission Webhook")
 	klog.Infof("Configuration File: %s", *configFile)
 	klog.Infof("Interceptor Enabled: %v", config.Enabled)
 	if config.Enabled {
 		klog.Infof("Cluster Name for Notifications: %s", config.ClusterName)
-		// 现在直接检查 config.Telegram.BotToken
 		if config.Telegram.BotToken != "" {
 			maskedToken := config.Telegram.BotToken
 			if len(maskedToken) > 5 {
@@ -290,6 +302,11 @@ func main() {
 			klog.Infof("Telegram Notifications configured (Token prefix: %s, Chat IDs: %d)", maskedToken, len(config.Telegram.ChatIDs))
 			if len(config.Telegram.ChatIDs) == 0 {
 				klog.Warning("Telegram Bot Token is provided, but no Chat IDs are configured. Notifications will NOT be sent.")
+			}
+			if config.Telegram.NotificationTemplate != "" {
+				klog.Infof("Using custom notification template.")
+			} else {
+				klog.Infof("Using default notification template.")
 			}
 		} else {
 			klog.Warning("Telegram Bot Token is empty in config file. Telegram notifications will NOT be sent.")

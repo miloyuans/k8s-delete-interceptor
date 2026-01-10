@@ -163,7 +163,7 @@ func validate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 4. 只拦截删除操作
-	if review.Request.Operation != v1.OperationDelete {
+	if review.Request.Operation != v1.Delete { // 已修复：使用 v1.Delete
 		klog.V(4).Infof("[Request %s] Allowed: Operation is %s (not DELETE)", reqUID, operation)
 		sendResponse(w, reqUID, true, fmt.Sprintf("Operation %s is not subject to deletion interception.", operation))
 		return

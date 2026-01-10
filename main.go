@@ -8,7 +8,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
-	"os" // 导入 os 包
+	// "os" // <-- 移除 os 包的导入，因为不再从环境变量读取
 	"strings"
 	"time"
 
@@ -17,7 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	types "k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
-	"gopkg.in/yaml.v3"
+	"gopkg.in/yaml.v3" // 确保导入了 yaml.v3
 )
 
 var (
@@ -34,39 +34,37 @@ var httpClient = &http.Client{
 }
 
 type TelegramConfig struct {
-	BotToken string   `json:"bot_token"` // BotToken 现在主要从环境变量填充
-	ChatIDs  []string `json:"chat_ids"`
+	BotToken string   `json:"bot_token" yaml:"bot_token"` // BotToken 现在直接从 YAML/JSON 配置文件填充
+	ChatIDs  []string `json:"chat_ids" yaml:"chat_ids"`
 }
 
 type ProtectedRule struct {
-	Kind  string   `json:"kind"`
-	Names []string `json:"names"`
+	Kind  string   `json:"kind" yaml:"kind"`
+	Names []string `json:"names" yaml:"names"`
 }
 
 type Config struct {
-	Enabled     bool            `json:"enabled"`
-	ClusterName string          `json:"cluster_name"`
-	Telegram    TelegramConfig  `json:"telegram"`
-	Protected   []ProtectedRule `json:"protected"`
+	Enabled     bool            `json:"enabled" yaml:"enabled"`
+	ClusterName string          `json:"cluster_name" yaml:"cluster_name"`
+	Telegram    TelegramConfig  `json:"telegram" yaml:"telegram"`
+	Protected   []ProtectedRule `json:"protected" yaml:"protected"`
 }
 
 var config Config
 
 func loadConfig(file string) error {
-    data, err := ioutil.ReadFile(file)
-    if err != nil {
-        return fmt.Errorf("failed to read config file '%s': %w", file, err)
-    }
-    // 将 json.Unmarshal 替换为 yaml.Unmarshal
-    if err := yaml.Unmarshal(data, &config); err != nil {
-        return fmt.Errorf("failed to unmarshal config from '%s': %w", file, err)
-    }
-    return nil
+	data, err := ioutil.ReadFile(file)
+	if err != nil {
+		return fmt.Errorf("failed to read config file '%s': %w", file, err)
+	}
+	if err := yaml.Unmarshal(data, &config); err != nil { // 使用 yaml.Unmarshal
+		return fmt.Errorf("failed to unmarshal config from '%s': %w", file, err)
+	}
+	return nil
 }
 
 func sendTelegramNotification(user string, operation string, clusterName string, denyReason string) {
-	// Telegram Bot Token 现在将从环境变量填充到 config.Telegram.BotToken
-	// 所以这里直接使用 config.Telegram.BotToken
+	// BotToken 现在直接从 config.Telegram 中获取，它会从文件加载
 	if config.Telegram.BotToken == "" || len(config.Telegram.ChatIDs) == 0 {
 		klog.Warning("Telegram config (token or chat_ids) missing or incomplete, skipping notification")
 		return
@@ -242,14 +240,7 @@ func main() {
 		klog.Fatalf("Failed to load config from %s: %v", *configFile, err)
 	}
 
-	// 从环境变量读取 Telegram Bot Token，覆盖配置文件中的值（如果存在）
-	if token := os.Getenv("TELEGRAM_BOT_TOKEN"); token != "" {
-		config.Telegram.BotToken = token
-		klog.Info("Telegram Bot Token loaded from environment variable.")
-	} else {
-		klog.Warning("TELEGRAM_BOT_TOKEN environment variable is not set. Telegram notifications will NOT be sent unless already configured in file.")
-	}
-
+	// 移除了从环境变量读取 TELEGRAM_BOT_TOKEN 的逻辑
 
 	klog.Info("=========================================================")
 	klog.Info("Starting Kubernetes Delete Interceptor Admission Webhook")
@@ -257,6 +248,7 @@ func main() {
 	klog.Infof("Interceptor Enabled: %v", config.Enabled)
 	if config.Enabled {
 		klog.Infof("Cluster Name for Notifications: %s", config.ClusterName)
+		// 现在直接检查 config.Telegram.BotToken
 		if config.Telegram.BotToken != "" {
 			maskedToken := config.Telegram.BotToken
 			if len(maskedToken) > 5 {
@@ -267,7 +259,7 @@ func main() {
 				klog.Warning("Telegram Bot Token is provided, but no Chat IDs are configured. Notifications will NOT be sent.")
 			}
 		} else {
-			klog.Warning("Telegram Bot Token is empty. Telegram notifications will NOT be sent.")
+			klog.Warning("Telegram Bot Token is empty in config file. Telegram notifications will NOT be sent.")
 		}
 		klog.Infof("Loaded %d protected rules for resource kinds: %v", len(config.Protected), func() []string {
 			kinds := make([]string, len(config.Protected))
@@ -282,7 +274,7 @@ func main() {
 	klog.Info("=========================================================")
 
 	http.HandleFunc("/validate", validate)
-	http.HandleFunc("/healthz", healthz) // 添加 healthz 端点
+	http.HandleFunc("/healthz", healthz)
 
 	cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
 	if err != nil {

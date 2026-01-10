@@ -8,32 +8,32 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os" // 导入 os 包
 	"strings"
-	"time" // 确保导入了 time 包
+	"time"
 
 	"github.com/gobwas/glob"
-	v1 "k8s.io/api/admission/v1" // 明确指定 v1
+	v1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	types "k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog/v2" // 确保使用 klog/v2
+	"k8s.io/klog/v2"
 )
 
 var (
 	tlsCert       = flag.String("tlscert", "/etc/certs/tls.crt", "TLS certificate file")
 	tlsKey        = flag.String("tlskey", "/etc/certs/tls.key", "TLS key file")
 	configFile    = flag.String("config", "/etc/config/protected.yaml", "Path to protected config file")
-	webhookNs     = "webhook-system"       // webhook 所在的 ns，避免拦截自己
-	webhookDeploy = "delete-interceptor"   // webhook 的 Deployment 名称
-	webhookSvc    = "delete-interceptor-svc" // webhook 的 Service 名称
+	webhookNs     = "webhook-system"
+	webhookDeploy = "delete-interceptor"
+	webhookSvc    = "delete-interceptor-svc"
 )
 
-// 定义带超时的 HTTP Client，防止通知请求卡死
 var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
 }
 
 type TelegramConfig struct {
-	BotToken string   `json:"bot_token"`
+	BotToken string   `json:"bot_token"` // BotToken 现在主要从环境变量填充
 	ChatIDs  []string `json:"chat_ids"`
 }
 
@@ -43,9 +43,9 @@ type ProtectedRule struct {
 }
 
 type Config struct {
-	Enabled     bool            `json:"enabled"`      // 全局开关
-	ClusterName string          `json:"cluster_name"` // 集群名称
-	Telegram    TelegramConfig  `json:"telegram"`     // Telegram 配置
+	Enabled     bool            `json:"enabled"`
+	ClusterName string          `json:"cluster_name"`
+	Telegram    TelegramConfig  `json:"telegram"`
 	Protected   []ProtectedRule `json:"protected"`
 }
 
@@ -62,16 +62,15 @@ func loadConfig(file string) error {
 	return nil
 }
 
-// 异步发送 Telegram 通知 (包含 Panic 恢复和错误处理)
 func sendTelegramNotification(user string, operation string, clusterName string, denyReason string) {
-	// 基础检查
+	// Telegram Bot Token 现在将从环境变量填充到 config.Telegram.BotToken
+	// 所以这里直接使用 config.Telegram.BotToken
 	if config.Telegram.BotToken == "" || len(config.Telegram.ChatIDs) == 0 {
 		klog.Warning("Telegram config (token or chat_ids) missing or incomplete, skipping notification")
 		return
 	}
 
-	// 构造消息内容
-	timestamp := time.Now().Format("2006-01-02 15:04:05 MST") // 添加时区信息
+	timestamp := time.Now().Format("2006-01-02 15:04:05 MST")
 	message := fmt.Sprintf(
 		"⚠️ *Kubernetes Deletion Blocked*\n"+
 			"--------------------------------\n"+
@@ -83,9 +82,7 @@ func sendTelegramNotification(user string, operation string, clusterName string,
 		user, operation, clusterName, denyReason, timestamp,
 	)
 
-	// 启动异步 Goroutine
 	go func() {
-		// Panic Recover：防止通知逻辑崩溃导致整个程序退出
 		defer func() {
 			if r := recover(); r != nil {
 				klog.Errorf("[PANIC RECOVERED] Telegram notification goroutine crashed: %v", r)
@@ -98,25 +95,20 @@ func sendTelegramNotification(user string, operation string, clusterName string,
 			values := url.Values{}
 			values.Add("chat_id", chatID)
 			values.Add("text", message)
-			values.Add("parse_mode", "Markdown") // 支持 Markdown 格式
+			values.Add("parse_mode", "Markdown")
 
-			// 使用带超时的 Client 发送请求
 			resp, err := httpClient.PostForm(apiURL, values)
 			if err != nil {
-				// 网络错误，连接超时等
 				klog.Errorf("Failed to send Telegram notification to chatID %s (URL: %s): %v", chatID, apiURL, err)
 				continue
 			}
 
-			// 读取响应体以便调试
-			body, _ := ioutil.ReadAll(resp.Body) // 忽略读取错误，反正只用于日志
+			body, _ := ioutil.ReadAll(resp.Body)
 			resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
-				// API 返回错误（如 Token 无效，ChatID 错误）
 				klog.Errorf("Telegram API error for chatID %s. Status: %d, Response: %s", chatID, resp.StatusCode, string(body))
 			} else {
-				// 发送成功
 				klog.Infof("Telegram notification successfully sent to chatID %s", chatID)
 			}
 		}
@@ -124,7 +116,6 @@ func sendTelegramNotification(user string, operation string, clusterName string,
 }
 
 func validate(w http.ResponseWriter, r *http.Request) {
-	// 1. 读取 Body
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		klog.Errorf("Failed to read request body: %v", err)
@@ -132,7 +123,6 @@ func validate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. 解析 Review 对象
 	var review v1.AdmissionReview
 	if err := json.Unmarshal(body, &review); err != nil {
 		klog.Errorf("Failed to unmarshal admission review: %v", err)
@@ -155,21 +145,18 @@ func validate(w http.ResponseWriter, r *http.Request) {
 
 	klog.V(4).Infof("[Request %s] Received: User=%s, Op=%s, Resource=%s/%s, NS=%s", reqUID, user, operation, kind, name, namespace)
 
-	// 3. 检查全局开关
 	if !config.Enabled {
 		klog.Infof("[Request %s] Allowed: Global interceptor is DISABLED", reqUID)
 		sendResponse(w, reqUID, true, "Interceptor is globally disabled.")
 		return
 	}
 
-	// 4. 只拦截删除操作
-	if review.Request.Operation != v1.Delete { // 已修复：使用 v1.Delete
+	if review.Request.Operation != v1.Delete {
 		klog.V(4).Infof("[Request %s] Allowed: Operation is %s (not DELETE)", reqUID, operation)
 		sendResponse(w, reqUID, true, fmt.Sprintf("Operation %s is not subject to deletion interception.", operation))
 		return
 	}
 
-	// 5. 排除自身 (Self-Exclusion) - 防止无法删除 Webhook 自身导致死锁
 	if (kind == "Deployment" && namespace == webhookNs && name == webhookDeploy) ||
 		(kind == "Service" && namespace == webhookNs && name == webhookSvc) ||
 		(kind == "Namespace" && name == webhookNs) {
@@ -178,41 +165,29 @@ func validate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 6. 规则匹配逻辑
 	allowed := true
 	var denyReason string
 
 	for _, rule := range config.Protected {
-		// 匹配 Kind
 		if strings.EqualFold(rule.Kind, kind) {
 			target := name
-			// Namespace 资源没有 namespace 字段，name 就是目标
-			// 对于 Cluster-scoped resources (e.g. ClusterRole, CustomResourceDefinition) 也没有 namespace
-			// current target is already 'name' which is correct for both namespaced and cluster-scoped resources
-			// The original `if strings.EqualFold(kind, "Namespace") { target = name }` is redundant here
-			// but harmless, 'name' is already the correct target.
-
-			// 匹配 Names (支持 Glob)
 			for _, pattern := range rule.Names {
 				g, err := glob.Compile(pattern)
 				if err != nil {
 					klog.Errorf("Invalid glob pattern in config: '%s' for kind '%s', error: %v. This rule will be skipped.", pattern, kind, err)
-					continue // 跳过此无效模式，继续检查下一个规则
+					continue
 				}
 
 				if g.Match(target) {
-					// --- 命中规则，拒绝删除 ---
 					allowed = false
 					denyReason = fmt.Sprintf("Protected resource: Cannot delete %s '%s' (matched pattern: '%s').", kind, target, pattern)
 
 					klog.Warningf("[Request %s] DENIED: %s. User: %s, Resource: %s/%s, NS: %s", reqUID, denyReason, user, kind, name, namespace)
 
-					// 7. 触发异步通知
-					// 构造操作描述
 					opDesc := fmt.Sprintf("DELETE %s %s (NS: %s)", kind, target, namespace)
 					sendTelegramNotification(user, opDesc, config.ClusterName, denyReason)
 
-					goto respond // 找到匹配规则后，直接跳转到响应，不再检查其他规则
+					goto respond
 				}
 			}
 		}
@@ -236,7 +211,7 @@ func sendResponse(w http.ResponseWriter, uid types.UID, allowed bool, message st
 	if !allowed {
 		resp.Response.Result = &metav1.Status{
 			Message: message,
-			Code:    http.StatusForbidden, // 403 Forbidden
+			Code:    http.StatusForbidden,
 		}
 	}
 
@@ -250,20 +225,30 @@ func sendResponse(w http.ResponseWriter, uid types.UID, allowed bool, message st
 	w.Write(jsonResp)
 }
 
+// healthz 处理函数，简单返回 200 OK
+func healthz(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "ok")
+}
+
 func main() {
-	// 初始化 klog flags
 	klog.InitFlags(nil)
 	flag.Parse()
-
-	// 强制将日志输出到 stderr 方便容器收集
 	flag.Set("logtostderr", "true")
 
-	// 加载配置
 	if err := loadConfig(*configFile); err != nil {
 		klog.Fatalf("Failed to load config from %s: %v", *configFile, err)
 	}
 
-	// 打印启动日志
+	// 从环境变量读取 Telegram Bot Token，覆盖配置文件中的值（如果存在）
+	if token := os.Getenv("TELEGRAM_BOT_TOKEN"); token != "" {
+		config.Telegram.BotToken = token
+		klog.Info("Telegram Bot Token loaded from environment variable.")
+	} else {
+		klog.Warning("TELEGRAM_BOT_TOKEN environment variable is not set. Telegram notifications will NOT be sent unless already configured in file.")
+	}
+
+
 	klog.Info("=========================================================")
 	klog.Info("Starting Kubernetes Delete Interceptor Admission Webhook")
 	klog.Infof("Configuration File: %s", *configFile)
@@ -272,7 +257,7 @@ func main() {
 		klog.Infof("Cluster Name for Notifications: %s", config.ClusterName)
 		if config.Telegram.BotToken != "" {
 			maskedToken := config.Telegram.BotToken
-			if len(maskedToken) > 5 { // 至少显示前5位，防止过短的token被完全隐藏
+			if len(maskedToken) > 5 {
 				maskedToken = maskedToken[:5] + "..."
 			}
 			klog.Infof("Telegram Notifications configured (Token prefix: %s, Chat IDs: %d)", maskedToken, len(config.Telegram.ChatIDs))
@@ -295,8 +280,8 @@ func main() {
 	klog.Info("=========================================================")
 
 	http.HandleFunc("/validate", validate)
+	http.HandleFunc("/healthz", healthz) // 添加 healthz 端点
 
-	// 加载证书
 	cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
 	if err != nil {
 		klog.Fatalf("Failed to load TLS certificate and key from '%s' and '%s': %v", *tlsCert, *tlsKey, err)

@@ -63,14 +63,47 @@ func loadConfig(file string) error {
 	return nil
 }
 
+// escapeMarkdownV2 escapes special characters for Telegram MarkdownV2 parse_mode
+// See https://core.telegram.org/bots/api#markdownv2-style
+func escapeMarkdownV2(text string) string {
+	replacer := strings.NewReplacer(
+		"_", "\\_",
+		"*", "\\*",
+		"[", "\\[",
+		"]", "\\]",
+		"(", "\\(",
+		")", "\\)",
+		"~", "\\~",
+		"`", "\\`",
+		">", "\\>",
+		"#", "\\#",
+		"+", "\\+",
+		"-", "\\-",
+		"=", "\\=",
+		"|", "\\|",
+		"{", "\\{",
+		"}", "\\}",
+		".", "\\.",
+		"!", "\\!",
+	)
+	return replacer.Replace(text)
+}
+
 func sendTelegramNotification(user string, operation string, clusterName string, denyReason string) {
-	// BotToken 现在直接从 config.Telegram 中获取，它会从文件加载
 	if config.Telegram.BotToken == "" || len(config.Telegram.ChatIDs) == 0 {
 		klog.Warning("Telegram config (token or chat_ids) missing or incomplete, skipping notification")
 		return
 	}
 
 	timestamp := time.Now().Format("2006-01-02 15:04:05 MST")
+
+	// 转义所有可能包含特殊 Markdown 字符的变量
+	escapedUser := escapeMarkdownV2(user)
+	escapedOperation := escapeMarkdownV2(operation)
+	escapedClusterName := escapeMarkdownV2(config.ClusterName) // clusterName 直接从 config 中读取
+	escapedDenyReason := escapeMarkdownV2(denyReason)
+	escapedTimestamp := escapeMarkdownV2(timestamp)
+
 	message := fmt.Sprintf(
 		"⚠️ *Kubernetes Deletion Blocked*\n"+
 			"--------------------------------\n"+
@@ -79,7 +112,7 @@ func sendTelegramNotification(user string, operation string, clusterName string,
 			"☸️ *Cluster:* `%s`\n"+
 			"🚫 *Reason:* %s\n"+
 			"🕒 *Time:* %s",
-		user, operation, clusterName, denyReason, timestamp,
+		escapedUser, escapedOperation, escapedClusterName, escapedDenyReason, escapedTimestamp,
 	)
 
 	go func() {
@@ -95,7 +128,7 @@ func sendTelegramNotification(user string, operation string, clusterName string,
 			values := url.Values{}
 			values.Add("chat_id", chatID)
 			values.Add("text", message)
-			values.Add("parse_mode", "Markdown")
+			values.Add("parse_mode", "MarkdownV2") // 注意这里改为 MarkdownV2，与转义函数匹配
 
 			resp, err := httpClient.PostForm(apiURL, values)
 			if err != nil {

@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	types "k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -52,14 +53,15 @@ type Config struct {
 var config Config
 
 func loadConfig(file string) error {
-	data, err := ioutil.ReadFile(file)
-	if err != nil {
-		return fmt.Errorf("failed to read config file '%s': %w", file, err)
-	}
-	if err := json.Unmarshal(data, &config); err != nil {
-		return fmt.Errorf("failed to unmarshal config from '%s': %w", file, err)
-	}
-	return nil
+    data, err := ioutil.ReadFile(file)
+    if err != nil {
+        return fmt.Errorf("failed to read config file '%s': %w", file, err)
+    }
+    // 将 json.Unmarshal 替换为 yaml.Unmarshal
+    if err := yaml.Unmarshal(data, &config); err != nil {
+        return fmt.Errorf("failed to unmarshal config from '%s': %w", file, err)
+    }
+    return nil
 }
 
 func sendTelegramNotification(user string, operation string, clusterName string, denyReason string) {

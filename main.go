@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -32,6 +33,12 @@ var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
 }
 
+const (
+	userActionAllow   = "allow"
+	userActionObserve = "observe"
+	userActionDeny    = "deny"
+)
+
 type TelegramConfig struct {
 	BotToken           string   `json:"bot_token" yaml:"bot_token"`
 	ChatIDs            []string `json:"chat_ids" yaml:"chat_ids"`
@@ -43,11 +50,17 @@ type ProtectedRule struct {
 	Names []string `json:"names" yaml:"names"`
 }
 
+type UserPolicyRule struct {
+	Action string   `json:"action" yaml:"action"`
+	Users  []string `json:"users" yaml:"users"`
+}
+
 type Config struct {
-	Enabled     bool            `json:"enabled" yaml:"enabled"`
-	ClusterName string          `json:"cluster_name" yaml:"cluster_name"`
-	Telegram    TelegramConfig  `json:"telegram" yaml:"telegram"`
-	Protected   []ProtectedRule `json:"protected" yaml:"protected"`
+	Enabled      bool             `json:"enabled" yaml:"enabled"`
+	ClusterName  string           `json:"cluster_name" yaml:"cluster_name"`
+	Telegram     TelegramConfig   `json:"telegram" yaml:"telegram"`
+	Protected    []ProtectedRule  `json:"protected" yaml:"protected"`
+	UserPolicies []UserPolicyRule `json:"user_policies" yaml:"user_policies"`
 }
 
 var config Config
@@ -61,6 +74,82 @@ func loadConfig(file string) error {
 		return fmt.Errorf("failed to unmarshal config from '%s': %w", file, err)
 	}
 	return nil
+}
+
+func isValidUserAction(action string) bool {
+	switch action {
+	case userActionAllow, userActionObserve, userActionDeny:
+		return true
+	default:
+		return false
+	}
+}
+
+func matchPattern(pattern string, candidate string) (bool, string, error) {
+	trimmedPattern := strings.TrimSpace(pattern)
+	if trimmedPattern == "" {
+		return false, "", fmt.Errorf("pattern is empty")
+	}
+
+	if strings.HasPrefix(strings.ToLower(trimmedPattern), "regex:") {
+		expr := strings.TrimSpace(trimmedPattern[len("regex:"):])
+		if expr == "" {
+			return false, "", fmt.Errorf("regex expression is empty")
+		}
+
+		re, err := regexp.Compile(expr)
+		if err != nil {
+			return false, "", fmt.Errorf("invalid regex '%s': %w", expr, err)
+		}
+		return re.MatchString(candidate), "regex", nil
+	}
+
+	g, err := glob.Compile(trimmedPattern)
+	if err != nil {
+		return false, "", fmt.Errorf("invalid glob '%s': %w", trimmedPattern, err)
+	}
+
+	return g.Match(candidate), "glob", nil
+}
+
+func matchUserPolicy(user string) (bool, string, string, string) {
+	for _, rule := range config.UserPolicies {
+		action := strings.ToLower(strings.TrimSpace(rule.Action))
+		if !isValidUserAction(action) {
+			klog.Errorf("Invalid user policy action '%s'. Supported actions: %s, %s, %s. Rule will be skipped.", rule.Action, userActionAllow, userActionObserve, userActionDeny)
+			continue
+		}
+
+		for _, pattern := range rule.Users {
+			matched, matcher, err := matchPattern(pattern, user)
+			if err != nil {
+				klog.Errorf("Invalid user policy pattern '%s' for action '%s': %v. This pattern will be skipped.", pattern, action, err)
+				continue
+			}
+
+			if matched {
+				return true, action, pattern, matcher
+			}
+		}
+	}
+
+	return false, "", "", ""
+}
+
+func formatResource(kind string, name string, namespace string) string {
+	if namespace == "" {
+		return fmt.Sprintf("%s '%s'", kind, name)
+	}
+
+	return fmt.Sprintf("%s '%s' in namespace '%s'", kind, name, namespace)
+}
+
+func formatOperation(kind string, name string, namespace string) string {
+	if namespace == "" {
+		return fmt.Sprintf("DELETE %s %s (Cluster Scoped)", kind, name)
+	}
+
+	return fmt.Sprintf("DELETE %s %s (NS: %s)", kind, name, namespace)
 }
 
 // escapeMarkdownV2 escapes special characters for Telegram MarkdownV2 parse_mode
@@ -94,7 +183,7 @@ func escapeMarkdownV2(text string) string {
 	return replacer.Replace(text)
 }
 
-func sendTelegramNotification(user string, operation string, clusterName string, denyReason string) {
+func sendTelegramNotification(user string, operation string, clusterName string, eventTitle string, reason string) {
 	if config.Telegram.BotToken == "" || len(config.Telegram.ChatIDs) == 0 {
 		klog.Warning("Telegram config (token or chat_ids) missing or incomplete, skipping notification")
 		return
@@ -106,7 +195,8 @@ func sendTelegramNotification(user string, operation string, clusterName string,
 	escapedUser := escapeMarkdownV2(user)
 	escapedOperation := escapeMarkdownV2(operation)
 	escapedClusterName := escapeMarkdownV2(clusterName) // clusterName 可能也包含特殊字符
-	escapedDenyReason := escapeMarkdownV2(denyReason)
+	escapedEventTitle := escapeMarkdownV2(eventTitle)
+	escapedReason := escapeMarkdownV2(reason)
 	escapedTimestamp := escapeMarkdownV2(timestamp)
 
 	// 使用配置的模板，如果模板为空，则使用默认模板
@@ -119,6 +209,10 @@ func sendTelegramNotification(user string, operation string, clusterName string,
 			"☸️ *Cluster:* `%s`\n" +
 			"🚫 *Reason:* %s\n" +
 			"🕒 *Time:* %s"
+		if escapedEventTitle == "" {
+			escapedEventTitle = "Kubernetes Deletion Blocked"
+		}
+		template = strings.Replace(template, "Kubernetes Deletion Blocked", escapedEventTitle, 1)
 		klog.V(4).Info("Using default Telegram notification template.")
 	} else {
 		klog.V(4).Infof("Using custom Telegram notification template: %s", template)
@@ -127,7 +221,7 @@ func sendTelegramNotification(user string, operation string, clusterName string,
 	// 将转义后的变量填充到模板中
 	message := fmt.Sprintf(
 		template,
-		escapedUser, escapedOperation, escapedClusterName, escapedDenyReason, escapedTimestamp,
+		escapedUser, escapedOperation, escapedClusterName, escapedReason, escapedTimestamp,
 	)
 
 	go func() {
@@ -190,6 +284,8 @@ func validate(w http.ResponseWriter, r *http.Request) {
 	name := review.Request.Name
 	namespace := review.Request.Namespace
 	operation := string(review.Request.Operation)
+	resourceDesc := formatResource(kind, name, namespace)
+	opDesc := formatOperation(kind, name, namespace)
 
 	klog.V(4).Infof("[Request %s] Received: User=%s, Op=%s, Resource=%s/%s, NS=%s", reqUID, user, operation, kind, name, namespace)
 
@@ -213,6 +309,27 @@ func validate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if matched, action, pattern, matcher := matchUserPolicy(user); matched {
+		switch action {
+		case userActionAllow:
+			klog.Infof("[Request %s] Allowed: User '%s' matched user policy pattern '%s' (%s) with action=%s", reqUID, user, pattern, matcher, action)
+			sendResponse(w, reqUID, true, "")
+			return
+		case userActionObserve:
+			reason := fmt.Sprintf("Observed delete request for %s: user '%s' matched user policy pattern '%s' (%s). Operation allowed.", resourceDesc, user, pattern, matcher)
+			klog.Infof("[Request %s] Observed: %s", reqUID, reason)
+			sendTelegramNotification(user, opDesc, config.ClusterName, "Kubernetes Deletion Observed", reason)
+			sendResponse(w, reqUID, true, "")
+			return
+		case userActionDeny:
+			denyReason := fmt.Sprintf("User policy blocked delete for %s: user '%s' matched user policy pattern '%s' (%s).", resourceDesc, user, pattern, matcher)
+			klog.Warningf("[Request %s] DENIED: %s", reqUID, denyReason)
+			sendTelegramNotification(user, opDesc, config.ClusterName, "Kubernetes Deletion Blocked", denyReason)
+			sendResponse(w, reqUID, false, denyReason)
+			return
+		}
+	}
+
 	allowed := true
 	var denyReason string
 
@@ -232,8 +349,7 @@ func validate(w http.ResponseWriter, r *http.Request) {
 
 					klog.Warningf("[Request %s] DENIED: %s. User: %s, Resource: %s/%s, NS: %s", reqUID, denyReason, user, kind, name, namespace)
 
-					opDesc := fmt.Sprintf("DELETE %s %s (NS: %s)", kind, target, namespace)
-					sendTelegramNotification(user, opDesc, config.ClusterName, denyReason)
+					sendTelegramNotification(user, opDesc, config.ClusterName, "Kubernetes Deletion Blocked", denyReason)
 
 					goto respond
 				}
@@ -318,6 +434,11 @@ func main() {
 			}
 			return kinds
 		}())
+		if len(config.UserPolicies) > 0 {
+			klog.Infof("Loaded %d user policy rules", len(config.UserPolicies))
+		} else {
+			klog.Infof("No user policy rules configured.")
+		}
 	} else {
 		klog.Warning("Global interceptor is DISABLED. All deletion requests will be allowed, and no notifications will be sent.")
 	}

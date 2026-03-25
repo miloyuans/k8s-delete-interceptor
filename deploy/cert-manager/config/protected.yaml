@@ -1,0 +1,32 @@
+enabled: true
+cluster_name: prod-cluster
+
+telegram:
+  bot_token: "123456:replace-me"
+  chat_ids:
+    - "-1001234567890"
+  notification_template: ""
+
+user_policies:
+  - action: allow
+    users:
+      - "*k8s-cicd-sa*"
+
+  - action: observe
+    users:
+      - "regex:^system:serviceaccount:monitoring:.*$"
+
+  - action: deny
+    users:
+      - "*dangerous-sa*"
+
+protected:
+  - kind: Namespace
+    names:
+      - kube-system
+      - prod-*
+
+  - kind: Deployment
+    names:
+      - ingress-*
+      - argocd-*

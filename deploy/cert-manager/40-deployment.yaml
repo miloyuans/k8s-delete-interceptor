@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: delete-interceptor
+  namespace: webhook-system
+  labels:
+    app.kubernetes.io/name: delete-interceptor
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: delete-interceptor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: delete-interceptor
+    spec:
+      serviceAccountName: delete-interceptor
+      automountServiceAccountToken: false
+      containers:
+        - name: webhook
+          image: ghcr.io/replace-me/k8s-delete-interceptor:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - -config=/etc/config/protected.yaml
+            - -tlscert=/etc/certs/tls.crt
+            - -tlskey=/etc/certs/tls.key
+          ports:
+            - name: https
+              containerPort: 8443
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: config
+              mountPath: /etc/config
+              readOnly: true
+            - name: tls
+              mountPath: /etc/certs
+              readOnly: true
+      volumes:
+        - name: config
+          secret:
+            secretName: delete-interceptor-config
+            items:
+              - key: protected.yaml
+                path: protected.yaml
+        - name: tls
+          secret:
+            secretName: delete-interceptor-serving-cert

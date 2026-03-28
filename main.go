@@ -37,6 +37,17 @@ const (
 	userActionAllow   = "allow"
 	userActionObserve = "observe"
 	userActionDeny    = "deny"
+	defaultNotificationTemplate = "" +
+		"*{{title}}*\n" +
+		"------------------------------\n" +
+		"*Cluster:* `{{cluster}}`\n" +
+		"*Action:* `{{action_label}}`\n" +
+		"*Resource:* `{{resource}}`\n" +
+		"*User:* `{{user}}`\n" +
+		"*Operation:* `{{operation}}`\n" +
+		"*Reason:* {{reason}}\n" +
+		"*Time:* `{{time}}`\n" +
+		"*Request UID:* `{{request_uid}}`"
 )
 
 type TelegramConfig struct {
@@ -53,6 +64,22 @@ type ProtectedRule struct {
 type UserPolicyRule struct {
 	Action string   `json:"action" yaml:"action"`
 	Users  []string `json:"users" yaml:"users"`
+}
+
+type NotificationContext struct {
+	Title      string
+	Action     string
+	ActionLabel string
+	User       string
+	Operation  string
+	Cluster    string
+	Reason     string
+	Timestamp  string
+	Kind       string
+	Name       string
+	Namespace  string
+	Resource   string
+	RequestUID string
 }
 
 type Config struct {
@@ -152,6 +179,105 @@ func formatOperation(kind string, name string, namespace string) string {
 	return fmt.Sprintf("DELETE %s %s (NS: %s)", kind, name, namespace)
 }
 
+func formatNamespace(namespace string) string {
+	if namespace == "" {
+		return "cluster-scoped"
+	}
+
+	return namespace
+}
+
+func formatNotificationActionLabel(action string) string {
+	switch action {
+	case "blocked":
+		return "拦截"
+	case "allowed":
+		return "放行"
+	case "observed":
+		return "放行"
+	default:
+		return action
+	}
+}
+
+func buildNotificationTitle(actionLabel string) string {
+	if actionLabel == "" {
+		return "K8s 删除操作通知"
+	}
+
+	return fmt.Sprintf("K8s 删除操作%s通知", actionLabel)
+}
+
+func buildNotificationContext(reqUID types.UID, user string, kind string, name string, namespace string, operation string, action string, reason string) NotificationContext {
+	actionLabel := formatNotificationActionLabel(action)
+
+	return NotificationContext{
+		Title:      buildNotificationTitle(actionLabel),
+		Action:     action,
+		ActionLabel: actionLabel,
+		User:       user,
+		Operation:  operation,
+		Cluster:    config.ClusterName,
+		Reason:     reason,
+		Timestamp:  time.Now().Format("2006-01-02 15:04:05 MST"),
+		Kind:       kind,
+		Name:       name,
+		Namespace:  formatNamespace(namespace),
+		Resource:   formatResource(kind, name, namespace),
+		RequestUID: string(reqUID),
+	}
+}
+
+func renderNotificationTemplate(template string, ctx NotificationContext) string {
+	if template == "" {
+		template = defaultNotificationTemplate
+	}
+
+	values := map[string]string{
+		"title":        escapeMarkdownV2(ctx.Title),
+		"action":       escapeMarkdownV2(ctx.Action),
+		"action_label": escapeMarkdownV2(ctx.ActionLabel),
+		"user":         escapeMarkdownV2(ctx.User),
+		"operation":    escapeMarkdownV2(ctx.Operation),
+		"cluster":      escapeMarkdownV2(ctx.Cluster),
+		"reason":       escapeMarkdownV2(ctx.Reason),
+		"time":         escapeMarkdownV2(ctx.Timestamp),
+		"kind":         escapeMarkdownV2(ctx.Kind),
+		"name":         escapeMarkdownV2(ctx.Name),
+		"namespace":    escapeMarkdownV2(ctx.Namespace),
+		"resource":     escapeMarkdownV2(ctx.Resource),
+		"request_uid":  escapeMarkdownV2(ctx.RequestUID),
+	}
+
+	if strings.Contains(template, "{{") {
+		replacerArgs := []string{
+			"{{title}}", values["title"],
+			"{{action}}", values["action"],
+			"{{action_label}}", values["action_label"],
+			"{{user}}", values["user"],
+			"{{operation}}", values["operation"],
+			"{{cluster}}", values["cluster"],
+			"{{reason}}", values["reason"],
+			"{{time}}", values["time"],
+			"{{kind}}", values["kind"],
+			"{{name}}", values["name"],
+			"{{namespace}}", values["namespace"],
+			"{{resource}}", values["resource"],
+			"{{request_uid}}", values["request_uid"],
+		}
+		return strings.NewReplacer(replacerArgs...).Replace(template)
+	}
+
+	return fmt.Sprintf(
+		template,
+		values["user"],
+		values["operation"],
+		values["cluster"],
+		values["reason"],
+		values["time"],
+	)
+}
+
 // escapeMarkdownV2 escapes special characters for Telegram MarkdownV2 parse_mode
 // See https://core.telegram.org/bots/api#markdownv2-style
 func escapeMarkdownV2(text string) string {
@@ -183,13 +309,22 @@ func escapeMarkdownV2(text string) string {
 	return replacer.Replace(text)
 }
 
-func sendTelegramNotification(user string, operation string, clusterName string, eventTitle string, reason string) {
+func sendTelegramNotification(ctx NotificationContext) {
 	if config.Telegram.BotToken == "" || len(config.Telegram.ChatIDs) == 0 {
 		klog.Warning("Telegram config (token or chat_ids) missing or incomplete, skipping notification")
 		return
 	}
 
-	timestamp := time.Now().Format("2006-01-02 15:04:05 MST")
+	user := ctx.User
+	operation := ctx.Operation
+	clusterName := ctx.Cluster
+	eventTitle := ctx.Title
+	reason := ctx.Reason
+	timestamp := ctx.Timestamp
+	if timestamp == "" {
+		timestamp = time.Now().Format("2006-01-02 15:04:05 MST")
+	}
+
 
 	// 转义所有可能包含特殊 Markdown 字符的变量，确保它们不会破坏模板的 Markdown 格式
 	escapedUser := escapeMarkdownV2(user)
@@ -198,6 +333,11 @@ func sendTelegramNotification(user string, operation string, clusterName string,
 	escapedEventTitle := escapeMarkdownV2(eventTitle)
 	escapedReason := escapeMarkdownV2(reason)
 	escapedTimestamp := escapeMarkdownV2(timestamp)
+	_ = escapedUser
+	_ = escapedOperation
+	_ = escapedClusterName
+	_ = escapedReason
+	_ = escapedTimestamp
 
 	// 使用配置的模板，如果模板为空，则使用默认模板
 	template := config.Telegram.NotificationTemplate
@@ -219,10 +359,7 @@ func sendTelegramNotification(user string, operation string, clusterName string,
 	}
 
 	// 将转义后的变量填充到模板中
-	message := fmt.Sprintf(
-		template,
-		escapedUser, escapedOperation, escapedClusterName, escapedReason, escapedTimestamp,
-	)
+	message := renderNotificationTemplate(config.Telegram.NotificationTemplate, ctx)
 
 	go func() {
 		defer func() {
@@ -318,13 +455,13 @@ func validate(w http.ResponseWriter, r *http.Request) {
 		case userActionObserve:
 			reason := fmt.Sprintf("Observed delete request for %s: user '%s' matched user policy pattern '%s' (%s). Operation allowed.", resourceDesc, user, pattern, matcher)
 			klog.Infof("[Request %s] Observed: %s", reqUID, reason)
-			sendTelegramNotification(user, opDesc, config.ClusterName, "Kubernetes Deletion Observed", reason)
+			sendTelegramNotification(buildNotificationContext(reqUID, user, kind, name, namespace, opDesc, "observed", reason))
 			sendResponse(w, reqUID, true, "")
 			return
 		case userActionDeny:
 			denyReason := fmt.Sprintf("User policy blocked delete for %s: user '%s' matched user policy pattern '%s' (%s).", resourceDesc, user, pattern, matcher)
 			klog.Warningf("[Request %s] DENIED: %s", reqUID, denyReason)
-			sendTelegramNotification(user, opDesc, config.ClusterName, "Kubernetes Deletion Blocked", denyReason)
+			sendTelegramNotification(buildNotificationContext(reqUID, user, kind, name, namespace, opDesc, "blocked", denyReason))
 			sendResponse(w, reqUID, false, denyReason)
 			return
 		}
@@ -349,7 +486,7 @@ func validate(w http.ResponseWriter, r *http.Request) {
 
 					klog.Warningf("[Request %s] DENIED: %s. User: %s, Resource: %s/%s, NS: %s", reqUID, denyReason, user, kind, name, namespace)
 
-					sendTelegramNotification(user, opDesc, config.ClusterName, "Kubernetes Deletion Blocked", denyReason)
+					sendTelegramNotification(buildNotificationContext(reqUID, user, kind, name, namespace, opDesc, "blocked", denyReason))
 
 					goto respond
 				}

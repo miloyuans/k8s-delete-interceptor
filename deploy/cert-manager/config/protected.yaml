@@ -21,6 +21,21 @@ audit:
   enabled: true
   directory: /var/log/k8s-delete-interceptor
   file_retention_days: 7
+  telegram:
+    use_global: true
+    bot_token: ""
+    chat_ids: []
+    notification_template: |
+      📝 *{{title}}*
+
+      *动作*: `{{action_label}}`
+      *集群*: `{{cluster}}`
+      *资源*: `{{resource}}`
+      *用户*: `{{user}}`
+      *操作*: `{{operation}}`
+      *原因*: {{reason}}
+      *请求ID*: `{{request_uid}}`
+      *时间*: `{{time}}`
   create:
     enabled: true
     notify_users:

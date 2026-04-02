@@ -56,6 +56,13 @@ type TelegramConfig struct {
 	NotificationTemplate string   `json:"notification_template" yaml:"notification_template"` // 新增模板字段
 }
 
+type AuditTelegramConfig struct {
+	UseGlobal            bool     `json:"use_global" yaml:"use_global"`
+	BotToken             string   `json:"bot_token" yaml:"bot_token"`
+	ChatIDs              []string `json:"chat_ids" yaml:"chat_ids"`
+	NotificationTemplate string   `json:"notification_template" yaml:"notification_template"`
+}
+
 type ProtectedRule struct {
 	Kind  string   `json:"kind" yaml:"kind"`
 	Names []string `json:"names" yaml:"names"`
@@ -279,6 +286,25 @@ func renderNotificationTemplate(template string, ctx NotificationContext) string
 	)
 }
 
+func isTelegramConfigConfigured(cfg TelegramConfig) bool {
+	return strings.TrimSpace(cfg.BotToken) != "" && len(cfg.ChatIDs) > 0
+}
+
+func resolveAuditTelegramConfig() TelegramConfig {
+	auditCfg := config.Audit.Telegram
+	customCfg := TelegramConfig{
+		BotToken:             auditCfg.BotToken,
+		ChatIDs:              auditCfg.ChatIDs,
+		NotificationTemplate: auditCfg.NotificationTemplate,
+	}
+
+	if auditCfg.UseGlobal || !isTelegramConfigConfigured(customCfg) {
+		return config.Telegram
+	}
+
+	return customCfg
+}
+
 // escapeMarkdownV2 escapes special characters for Telegram MarkdownV2 parse_mode
 // See https://core.telegram.org/bots/api#markdownv2-style
 func escapeMarkdownV2(text string) string {
@@ -311,7 +337,15 @@ func escapeMarkdownV2(text string) string {
 }
 
 func sendTelegramNotification(ctx NotificationContext) {
-	if config.Telegram.BotToken == "" || len(config.Telegram.ChatIDs) == 0 {
+	sendTelegramNotificationWithConfig(config.Telegram, ctx)
+}
+
+func sendAuditTelegramNotification(ctx NotificationContext) {
+	sendTelegramNotificationWithConfig(resolveAuditTelegramConfig(), ctx)
+}
+
+func sendTelegramNotificationWithConfig(telegramCfg TelegramConfig, ctx NotificationContext) {
+	if !isTelegramConfigConfigured(telegramCfg) {
 		klog.Warning("Telegram config (token or chat_ids) missing or incomplete, skipping notification")
 		return
 	}
@@ -341,7 +375,7 @@ func sendTelegramNotification(ctx NotificationContext) {
 	_ = escapedTimestamp
 
 	// 使用配置的模板，如果模板为空，则使用默认模板
-	template := config.Telegram.NotificationTemplate
+	template := telegramCfg.NotificationTemplate
 	if template == "" {
 		template = "⚠️ *Kubernetes Deletion Blocked*\n" +
 			"--------------------------------\n" +
@@ -360,7 +394,7 @@ func sendTelegramNotification(ctx NotificationContext) {
 	}
 
 	// 将转义后的变量填充到模板中
-	message := renderNotificationTemplate(config.Telegram.NotificationTemplate, ctx)
+	message := renderNotificationTemplate(telegramCfg.NotificationTemplate, ctx)
 
 	go func() {
 		defer func() {
@@ -369,9 +403,9 @@ func sendTelegramNotification(ctx NotificationContext) {
 			}
 		}()
 
-		apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", config.Telegram.BotToken)
+		apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", telegramCfg.BotToken)
 
-		for _, chatID := range config.Telegram.ChatIDs {
+		for _, chatID := range telegramCfg.ChatIDs {
 			values := url.Values{}
 			values.Add("chat_id", chatID)
 			values.Add("text", message)
@@ -601,7 +635,7 @@ func main() {
 		klog.Warning("Global interceptor is DISABLED. All deletion requests will be allowed.")
 	}
 	if config.Audit.Enabled {
-		klog.Infof("Audit enabled. Directory: %s, File retention: %d days, Create audit: %v, Update audit: %v, Mongo enabled: %v", func() string {
+		klog.Infof("Audit enabled. Directory: %s, File retention: %d days, Create audit: %v, Update audit: %v, Mongo enabled: %v, Audit telegram uses global: %v", func() string {
 			if strings.TrimSpace(config.Audit.Directory) == "" {
 				return defaultAuditDirectory
 			}
@@ -611,7 +645,11 @@ func main() {
 				return defaultFileRetentionDays
 			}
 			return config.Audit.FileRetentionDays
-		}(), config.Audit.Create.Enabled, config.Audit.Update.Enabled, config.Audit.Mongo.Enabled)
+		}(), config.Audit.Create.Enabled, config.Audit.Update.Enabled, config.Audit.Mongo.Enabled, config.Audit.Telegram.UseGlobal || !isTelegramConfigConfigured(TelegramConfig{
+			BotToken:             config.Audit.Telegram.BotToken,
+			ChatIDs:              config.Audit.Telegram.ChatIDs,
+			NotificationTemplate: config.Audit.Telegram.NotificationTemplate,
+		}))
 	} else {
 		klog.Infof("Audit disabled.")
 	}

@@ -42,6 +42,7 @@ type AuditConfig struct {
 	FileRetentionDays int                  `json:"file_retention_days" yaml:"file_retention_days"`
 	Create            AuditOperationConfig `json:"create" yaml:"create"`
 	Update            AuditOperationConfig `json:"update" yaml:"update"`
+	Telegram          AuditTelegramConfig  `json:"telegram" yaml:"telegram"`
 	Mongo             MongoAuditConfig     `json:"mongo" yaml:"mongo"`
 }
 
@@ -431,7 +432,7 @@ func handleCreateOrUpdateAudit(req *v1.AdmissionRequest) {
 
 	if shouldNotify, pattern, matcher := shouldNotifyMutationAudit(req.Operation, req.UserInfo.Username); shouldNotify {
 		notificationReason = fmt.Sprintf("%s request for %s matched audit notify whitelist pattern '%s' (%s). Operation allowed and audit recorded.", operationLabel, resourceDesc, pattern, matcher)
-		sendTelegramNotification(buildNotificationContext(
+		sendAuditTelegramNotification(buildNotificationContext(
 			req.UID,
 			req.UserInfo.Username,
 			req.Kind.Kind,

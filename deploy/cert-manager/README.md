@@ -35,6 +35,7 @@ Review and update `config/protected.yaml` before installation:
 - `telegram.bot_token`
 - `telegram.chat_ids`
 - `audit`
+- `audit.telegram`
 - `user_policies`
 - `protected`
 
@@ -85,6 +86,11 @@ kubectl apply -f deploy/cert-manager/50-validatingwebhookconfiguration.yaml
 ```
 
 This webhook registration includes `CREATE`, `UPDATE`, and `DELETE` so the service can audit create and update requests in addition to delete requests.
+
+Audit notifications can either:
+
+- reuse the global `telegram` config with `audit.telegram.use_global: true`
+- use their own bot, chats, and template with `audit.telegram.use_global: false`
 
 ## 9. Verify the webhook
 

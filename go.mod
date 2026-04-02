@@ -4,6 +4,7 @@ go 1.21
 
 require (
 	github.com/gobwas/glob v0.2.3
+	go.mongodb.org/mongo-driver v1.17.4
 	k8s.io/api v0.29.0
 	k8s.io/apimachinery v0.29.0
 	k8s.io/klog/v2 v2.110.1

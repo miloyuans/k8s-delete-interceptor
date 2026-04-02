@@ -65,6 +65,8 @@ spec:
             - name: tls
               mountPath: /etc/certs
               readOnly: true
+            - name: audit
+              mountPath: /var/log/k8s-delete-interceptor
       volumes:
         - name: config
           secret:
@@ -75,3 +77,5 @@ spec:
         - name: tls
           secret:
             secretName: delete-interceptor-serving-cert
+        - name: audit
+          emptyDir: {}

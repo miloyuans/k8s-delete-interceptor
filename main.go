@@ -88,6 +88,7 @@ type Config struct {
 	Telegram     TelegramConfig   `json:"telegram" yaml:"telegram"`
 	Protected    []ProtectedRule  `json:"protected" yaml:"protected"`
 	UserPolicies []UserPolicyRule `json:"user_policies" yaml:"user_policies"`
+	Audit        AuditConfig      `json:"audit" yaml:"audit"`
 }
 
 var config Config
@@ -171,12 +172,12 @@ func formatResource(kind string, name string, namespace string) string {
 	return fmt.Sprintf("%s '%s' in namespace '%s'", kind, name, namespace)
 }
 
-func formatOperation(kind string, name string, namespace string) string {
+func formatOperation(operation string, kind string, name string, namespace string) string {
 	if namespace == "" {
-		return fmt.Sprintf("DELETE %s %s (Cluster Scoped)", kind, name)
+		return fmt.Sprintf("%s %s %s (Cluster Scoped)", strings.ToUpper(operation), kind, name)
 	}
 
-	return fmt.Sprintf("DELETE %s %s (NS: %s)", kind, name, namespace)
+	return fmt.Sprintf("%s %s %s (NS: %s)", strings.ToUpper(operation), kind, name, namespace)
 }
 
 func formatNamespace(namespace string) string {
@@ -422,12 +423,19 @@ func validate(w http.ResponseWriter, r *http.Request) {
 	namespace := review.Request.Namespace
 	operation := string(review.Request.Operation)
 	resourceDesc := formatResource(kind, name, namespace)
-	opDesc := formatOperation(kind, name, namespace)
+	opDesc := formatOperation(operation, kind, name, namespace)
 
 	klog.V(4).Infof("[Request %s] Received: User=%s, Op=%s, Resource=%s/%s, NS=%s", reqUID, user, operation, kind, name, namespace)
 
+	if review.Request.Operation == v1.Create || review.Request.Operation == v1.Update {
+		handleCreateOrUpdateAudit(review.Request)
+		sendResponse(w, reqUID, true, "")
+		return
+	}
+
 	if !config.Enabled {
 		klog.Infof("[Request %s] Allowed: Global interceptor is DISABLED", reqUID)
+		emitAuditRecord(review.Request, auditDecisionAllowed, "Deletion allowed because the interceptor is globally disabled.", auditPolicyInterceptorOff, false, "")
 		sendResponse(w, reqUID, true, "Interceptor is globally disabled.")
 		return
 	}
@@ -442,6 +450,7 @@ func validate(w http.ResponseWriter, r *http.Request) {
 		(kind == "Service" && namespace == webhookNs && name == webhookSvc) ||
 		(kind == "Namespace" && name == webhookNs) {
 		klog.Infof("[Request %s] Allowed: Self-preservation rule matched for %s '%s' in namespace '%s'", reqUID, kind, name, namespace)
+		emitAuditRecord(review.Request, auditDecisionAllowed, "Deletion allowed because self-preservation rule matched.", auditPolicySelfPreservation, false, "")
 		sendResponse(w, reqUID, true, "Allowing deletion of self-webhook components.")
 		return
 	}
@@ -449,19 +458,23 @@ func validate(w http.ResponseWriter, r *http.Request) {
 	if matched, action, pattern, matcher := matchUserPolicy(user); matched {
 		switch action {
 		case userActionAllow:
-			klog.Infof("[Request %s] Allowed: User '%s' matched user policy pattern '%s' (%s) with action=%s", reqUID, user, pattern, matcher, action)
+			reason := fmt.Sprintf("Delete request allowed: user '%s' matched user policy pattern '%s' (%s).", user, pattern, matcher)
+			klog.Infof("[Request %s] Allowed: %s", reqUID, reason)
+			emitAuditRecord(review.Request, auditDecisionAllowed, reason, fmt.Sprintf("delete_user_policy_allow:%s", pattern), false, "")
 			sendResponse(w, reqUID, true, "")
 			return
 		case userActionObserve:
 			reason := fmt.Sprintf("Observed delete request for %s: user '%s' matched user policy pattern '%s' (%s). Operation allowed.", resourceDesc, user, pattern, matcher)
 			klog.Infof("[Request %s] Observed: %s", reqUID, reason)
 			sendTelegramNotification(buildNotificationContext(reqUID, user, kind, name, namespace, opDesc, "observed", reason))
+			emitAuditRecord(review.Request, auditDecisionAllowed, reason, fmt.Sprintf("delete_user_policy_observe:%s", pattern), true, reason)
 			sendResponse(w, reqUID, true, "")
 			return
 		case userActionDeny:
 			denyReason := fmt.Sprintf("User policy blocked delete for %s: user '%s' matched user policy pattern '%s' (%s).", resourceDesc, user, pattern, matcher)
 			klog.Warningf("[Request %s] DENIED: %s", reqUID, denyReason)
 			sendTelegramNotification(buildNotificationContext(reqUID, user, kind, name, namespace, opDesc, "blocked", denyReason))
+			emitAuditRecord(review.Request, auditDecisionBlocked, denyReason, fmt.Sprintf("delete_user_policy_deny:%s", pattern), true, denyReason)
 			sendResponse(w, reqUID, false, denyReason)
 			return
 		}
@@ -487,6 +500,7 @@ func validate(w http.ResponseWriter, r *http.Request) {
 					klog.Warningf("[Request %s] DENIED: %s. User: %s, Resource: %s/%s, NS: %s", reqUID, denyReason, user, kind, name, namespace)
 
 					sendTelegramNotification(buildNotificationContext(reqUID, user, kind, name, namespace, opDesc, "blocked", denyReason))
+					emitAuditRecord(review.Request, auditDecisionBlocked, denyReason, fmt.Sprintf("protected_rule:%s", pattern), true, denyReason)
 
 					goto respond
 				}
@@ -497,6 +511,7 @@ func validate(w http.ResponseWriter, r *http.Request) {
 respond:
 	if allowed {
 		klog.Infof("[Request %s] Allowed: No protected rules matched for %s '%s' in namespace '%s'", reqUID, kind, name, namespace)
+		emitAuditRecord(review.Request, auditDecisionAllowed, "Deletion allowed because no protected rule matched.", auditPolicyDeleteAudit, false, "")
 	}
 	sendResponse(w, reqUID, allowed, denyReason)
 }
@@ -541,6 +556,12 @@ func main() {
 		klog.Fatalf("Failed to load config from %s: %v", *configFile, err)
 	}
 
+	auditor, err := newAuditManager(config.Audit)
+	if err != nil {
+		klog.Fatalf("Failed to initialize audit manager: %v", err)
+	}
+	admissionAuditor = auditor
+
 	klog.Info("=========================================================")
 	klog.Info("Starting Kubernetes Delete Interceptor Admission Webhook")
 	klog.Infof("Configuration File: %s", *configFile)
@@ -577,7 +598,22 @@ func main() {
 			klog.Infof("No user policy rules configured.")
 		}
 	} else {
-		klog.Warning("Global interceptor is DISABLED. All deletion requests will be allowed, and no notifications will be sent.")
+		klog.Warning("Global interceptor is DISABLED. All deletion requests will be allowed.")
+	}
+	if config.Audit.Enabled {
+		klog.Infof("Audit enabled. Directory: %s, File retention: %d days, Create audit: %v, Update audit: %v, Mongo enabled: %v", func() string {
+			if strings.TrimSpace(config.Audit.Directory) == "" {
+				return defaultAuditDirectory
+			}
+			return config.Audit.Directory
+		}(), func() int {
+			if config.Audit.FileRetentionDays <= 0 {
+				return defaultFileRetentionDays
+			}
+			return config.Audit.FileRetentionDays
+		}(), config.Audit.Create.Enabled, config.Audit.Update.Enabled, config.Audit.Mongo.Enabled)
+	} else {
+		klog.Infof("Audit disabled.")
 	}
 	klog.Info("=========================================================")
 

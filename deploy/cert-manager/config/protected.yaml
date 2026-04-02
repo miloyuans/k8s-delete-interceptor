@@ -5,7 +5,37 @@ telegram:
   bot_token: "123456:replace-me"
   chat_ids:
     - "-1001234567890"
-  notification_template: ""
+  notification_template: |
+    🚨 *{{title}}*
+
+    *动作*: `{{action_label}}`
+    *集群*: `{{cluster}}`
+    *资源*: `{{resource}}`
+    *用户*: `{{user}}`
+    *操作*: `{{operation}}`
+    *原因*: {{reason}}
+    *请求ID*: `{{request_uid}}`
+    *时间*: `{{time}}`
+
+audit:
+  enabled: true
+  directory: /var/log/k8s-delete-interceptor
+  file_retention_days: 7
+  create:
+    enabled: true
+    notify_users:
+      - "*k8s-cicd-sa*"
+  update:
+    enabled: true
+    notify_users:
+      - "*k8s-cicd-sa*"
+  mongo:
+    enabled: false
+    uri: "mongodb://mongodb.mongodb.svc.cluster.local:27017"
+    database: "k8s_delete_interceptor"
+    collection: "admission_audit"
+    retention_days: 30
+    connect_timeout_seconds: 5
 
 user_policies:
   - action: allow

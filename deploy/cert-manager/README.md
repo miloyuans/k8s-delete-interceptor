@@ -34,10 +34,14 @@ Review and update `config/protected.yaml` before installation:
 - `cluster_name`
 - `telegram.bot_token`
 - `telegram.chat_ids`
+- `audit`
 - `user_policies`
 - `protected`
 
 If you do not want Telegram, leave `bot_token` empty and keep `chat_ids` empty.
+The sample Deployment mounts `audit.directory` with `emptyDir` so the webhook can start with a writable path.
+For real persistence, replace that volume with a persistent writable volume.
+With more than one replica, use shared RWX storage or per-pod storage such as a StatefulSet. A single RWO PVC is not a safe default for the current Deployment shape.
 
 ## 3. Apply the namespace
 
@@ -79,6 +83,8 @@ kubectl -n webhook-system rollout status deployment/delete-interceptor --timeout
 ```bash
 kubectl apply -f deploy/cert-manager/50-validatingwebhookconfiguration.yaml
 ```
+
+This webhook registration includes `CREATE`, `UPDATE`, and `DELETE` so the service can audit create and update requests in addition to delete requests.
 
 ## 9. Verify the webhook
 

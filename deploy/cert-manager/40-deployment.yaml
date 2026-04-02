@@ -21,6 +21,11 @@ spec:
         - name: webhook
           image: ghcr.io/replace-me/k8s-delete-interceptor:latest
           imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           args:
             - -config=/etc/config/protected.yaml
             - -tlscert=/etc/certs/tls.crt
@@ -67,10 +72,11 @@ spec:
               readOnly: true
             - name: audit
               mountPath: /var/log/k8s-delete-interceptor
+              subPathExpr: $(POD_NAME)
       volumes:
         - name: config
-          secret:
-            secretName: delete-interceptor-config
+          configMap:
+            name: delete-interceptor-config
             items:
               - key: protected.yaml
                 path: protected.yaml
@@ -78,4 +84,5 @@ spec:
           secret:
             secretName: delete-interceptor-serving-cert
         - name: audit
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: delete-interceptor-audit-pvc

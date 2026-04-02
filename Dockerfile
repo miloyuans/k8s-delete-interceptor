@@ -7,7 +7,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/k8s-delete-interceptor ./main.go
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/k8s-delete-interceptor .
 
 FROM alpine:3.20
 

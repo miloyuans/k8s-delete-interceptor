@@ -8,6 +8,7 @@ This directory contains a cert-manager based deployment for `k8s-delete-intercep
 - `10-serviceaccount.yaml`: dedicated service account
 - `20-cert-manager.yaml`: cert-manager issuers and serving certificate
 - `30-service.yaml`: internal HTTPS service
+- `35-audit-pvc.yaml`: shared RWX PVC for audit log storage
 - `40-deployment.yaml`: webhook deployment
 - `50-validatingwebhookconfiguration.yaml`: admission webhook registration
 - `config/protected.yaml`: example runtime configuration mounted into the pod
@@ -40,9 +41,9 @@ Review and update `config/protected.yaml` before installation:
 - `protected`
 
 If you do not want Telegram, leave `bot_token` empty and keep `chat_ids` empty.
-The sample Deployment mounts `audit.directory` with `emptyDir` so the webhook can start with a writable path.
-For real persistence, replace that volume with a persistent writable volume.
-With more than one replica, use shared RWX storage or per-pod storage such as a StatefulSet. A single RWO PVC is not a safe default for the current Deployment shape.
+The sample Deployment mounts `audit.directory` from a PVC.
+With `replicas: 2`, use a RWX-capable storage class.
+The sample mounts the same PVC into a pod-specific subdirectory, so each replica keeps its own audit files and does not append into the same log file.
 
 ## 3. Apply the namespace
 
@@ -50,15 +51,24 @@ With more than one replica, use shared RWX storage or per-pod storage such as a 
 kubectl apply -f deploy/cert-manager/00-namespace.yaml
 ```
 
-## 4. Create or update the runtime config secret
+## 4. Create or update the runtime config ConfigMap
 
 ```bash
-kubectl -n webhook-system create secret generic delete-interceptor-config \
+kubectl -n webhook-system create configmap delete-interceptor-config \
   --from-file=protected.yaml=deploy/cert-manager/config/protected.yaml \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-## 5. Apply service account, cert-manager resources, and service
+## 5. Create the audit PVC
+
+Edit `35-audit-pvc.yaml` first and replace `storageClassName` with a RWX-capable storage class.
+For two replicas, do not use a plain RWO disk class.
+
+```bash
+kubectl apply -f deploy/cert-manager/35-audit-pvc.yaml
+```
+
+## 6. Apply service account, cert-manager resources, and service
 
 ```bash
 kubectl apply -f deploy/cert-manager/10-serviceaccount.yaml
@@ -66,20 +76,23 @@ kubectl apply -f deploy/cert-manager/20-cert-manager.yaml
 kubectl apply -f deploy/cert-manager/30-service.yaml
 ```
 
-## 6. Wait for the serving certificate
+## 7. Wait for the serving certificate
 
 ```bash
 kubectl -n webhook-system wait --for=condition=Ready certificate/delete-interceptor-serving-cert --timeout=180s
 ```
 
-## 7. Deploy the webhook server
+## 8. Deploy the webhook server
 
 ```bash
 kubectl apply -f deploy/cert-manager/40-deployment.yaml
 kubectl -n webhook-system rollout status deployment/delete-interceptor --timeout=180s
 ```
 
-## 8. Register the validating webhook
+This sample Deployment runs with `replicas: 2`.
+Each pod writes audit files into its own subdirectory on the shared PVC using `subPathExpr: $(POD_NAME)`, which avoids two pods appending to the same daily log file.
+
+## 9. Register the validating webhook
 
 ```bash
 kubectl apply -f deploy/cert-manager/50-validatingwebhookconfiguration.yaml
@@ -92,7 +105,7 @@ Audit notifications can either:
 - reuse the global `telegram` config with `audit.telegram.use_global: true`
 - use their own bot, chats, and template with `audit.telegram.use_global: false`
 
-## 9. Verify the webhook
+## 10. Verify the webhook
 
 Check that the service has endpoints:
 
@@ -110,7 +123,19 @@ kubectl get validatingwebhookconfiguration delete-interceptor.k8s.io -o yaml
 
 Look for a populated `caBundle` under `webhooks[].clientConfig`.
 
-## 10. Quick test
+Check that the PVC is bound:
+
+```bash
+kubectl -n webhook-system get pvc delete-interceptor-audit-pvc
+```
+
+Check that each pod got its own audit directory:
+
+```bash
+kubectl -n webhook-system get pods -l app.kubernetes.io/name=delete-interceptor
+```
+
+## 11. Quick test
 
 Create a protected object name in `config/protected.yaml`, then try to delete it.
 
@@ -131,7 +156,8 @@ kubectl delete -f deploy/cert-manager/40-deployment.yaml
 kubectl delete -f deploy/cert-manager/30-service.yaml
 kubectl delete -f deploy/cert-manager/20-cert-manager.yaml
 kubectl delete -f deploy/cert-manager/10-serviceaccount.yaml
-kubectl -n webhook-system delete secret delete-interceptor-config
+kubectl delete -f deploy/cert-manager/35-audit-pvc.yaml
+kubectl -n webhook-system delete configmap delete-interceptor-config
 kubectl delete -f deploy/cert-manager/00-namespace.yaml
 ```
 

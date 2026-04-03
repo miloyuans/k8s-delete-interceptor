@@ -17,6 +17,11 @@ telegram:
     *请求ID*: `{{request_uid}}`
     *时间*: `{{time}}`
 
+notifications:
+  dedupe_window_seconds: 300
+  retry_failed_on_startup: true
+  max_retry_batch: 50
+
 audit:
   enabled: true
   directory: /var/log/k8s-delete-interceptor
@@ -91,6 +96,25 @@ audit:
     collection: "admission_audit"
     retention_days: 30
     connect_timeout_seconds: 5
+
+lifecycle:
+  enabled: true
+  notify_startup: true
+  notify_shutdown: true
+  detect_unclean_shutdown: true
+  telegram:
+    use_global: true
+    bot_token: ""
+    chat_ids: []
+    notification_template: |
+      ℹ️ *{{title}}*
+
+      *动作*: `{{action_label}}`
+      *集群*: `{{cluster}}`
+      *资源*: `{{resource}}`
+      *操作*: `{{operation_label}}`
+      *原因*: {{reason}}
+      *时间*: `{{time}}`
 
 user_policies:
   - action: allow

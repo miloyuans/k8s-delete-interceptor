@@ -9,9 +9,32 @@ webhooks:
     admissionReviewVersions:
       - v1
     sideEffects: None
-    failurePolicy: Fail
+    failurePolicy: Ignore
     matchPolicy: Equivalent
-    timeoutSeconds: 5
+    timeoutSeconds: 3
+    namespaceSelector:
+      matchExpressions:
+        - key: delete-interceptor.k8s.io/exclude
+          operator: NotIn
+          values:
+            - "true"
+    matchConditions:
+      - name: exclude-webhook-system-namespaced-requests
+        expression: 'request.namespace != "webhook-system"'
+      - name: exclude-webhook-system-namespace-object
+        expression: '!(request.resource.resource == "namespaces" && request.name == "webhook-system")'
+      - name: exclude-self-webhook-config
+        expression: '!(request.resource.group == "admissionregistration.k8s.io")'
+      - name: exclude-cert-manager
+        expression: '!(request.resource.group == "cert-manager.io")'
+      - name: exclude-authn-tokenreviews
+        expression: '!(request.resource.group == "authentication.k8s.io" && request.resource.resource == "tokenreviews")'
+      - name: exclude-authz-reviews
+        expression: '!(request.resource.group == "authorization.k8s.io")'
+      - name: exclude-node-leases
+        expression: '!(request.resource.group == "coordination.k8s.io" && request.resource.resource == "leases")'
+      - name: audit-create-update-sa-only
+        expression: 'request.operation == "DELETE" || request.userInfo.username.startsWith("system:serviceaccount:")'
     clientConfig:
       service:
         namespace: webhook-system

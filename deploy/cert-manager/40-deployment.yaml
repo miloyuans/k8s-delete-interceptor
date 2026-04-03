@@ -15,6 +15,7 @@ spec:
       labels:
         app.kubernetes.io/name: delete-interceptor
     spec:
+      terminationGracePeriodSeconds: 30
       serviceAccountName: delete-interceptor
       automountServiceAccountToken: false
       securityContext:

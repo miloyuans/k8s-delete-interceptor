@@ -34,6 +34,10 @@ const (
 	auditPolicyInterceptorOff   = "interceptor_disabled"
 	auditPolicySelfPreservation = "self_preservation"
 	auditSourceWebhook          = "admission-webhook"
+	auditEventTypeCreate        = "create"
+	auditEventTypeUpdate        = "update"
+	auditEventTypeDelete        = "delete"
+	auditEventTypeLifecycle     = "lifecycle"
 )
 
 var defaultAuditNotifyResources = []string{
@@ -85,6 +89,7 @@ type MongoAuditConfig struct {
 
 type AuditRecord struct {
 	Timestamp          time.Time       `json:"timestamp" bson:"timestamp"`
+	EventType          string          `json:"event_type" bson:"event_type"`
 	ClusterName        string          `json:"cluster_name" bson:"cluster_name"`
 	RequestUID         string          `json:"request_uid" bson:"request_uid"`
 	Source             string          `json:"source" bson:"source"`
@@ -254,7 +259,7 @@ func (a *auditManager) writeFile(record AuditRecord) error {
 		return err
 	}
 
-	filePath := filepath.Join(a.directory, fmt.Sprintf("audit-%s.jsonl", record.Timestamp.Format("2006-01-02")))
+	filePath := filepath.Join(a.directory, fmt.Sprintf("audit-%s-%s.jsonl", record.Timestamp.Format("2006-01-02"), auditRecordFileKey(record)))
 	payload, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("failed to marshal audit record: %w", err)
@@ -303,7 +308,13 @@ func (a *auditManager) cleanupOldFiles(now time.Time) error {
 			continue
 		}
 
-		datePart := strings.TrimSuffix(strings.TrimPrefix(name, "audit-"), ".jsonl")
+		middle := strings.TrimSuffix(strings.TrimPrefix(name, "audit-"), ".jsonl")
+		if len(middle) < len("2006-01-02") {
+			klog.Warningf("Skipping audit retention cleanup for unexpected file name '%s': date segment missing", name)
+			continue
+		}
+
+		datePart := middle[:len("2006-01-02")]
 		fileDate, err := time.Parse("2006-01-02", datePart)
 		if err != nil {
 			klog.Warningf("Skipping audit retention cleanup for unexpected file name '%s': %v", name, err)
@@ -490,6 +501,30 @@ func cloneRawMessage(raw []byte) json.RawMessage {
 	return json.RawMessage(cloned)
 }
 
+func auditEventTypeForOperation(operation v1.Operation) string {
+	switch operation {
+	case v1.Create:
+		return auditEventTypeCreate
+	case v1.Update:
+		return auditEventTypeUpdate
+	case v1.Delete:
+		return auditEventTypeDelete
+	default:
+		return strings.ToLower(string(operation))
+	}
+}
+
+func auditRecordFileKey(record AuditRecord) string {
+	key := strings.TrimSpace(strings.ToLower(record.EventType))
+	if key != "" {
+		return key
+	}
+	if strings.TrimSpace(record.Operation) != "" {
+		return strings.ToLower(record.Operation)
+	}
+	return "general"
+}
+
 func buildAuditRecord(req *v1.AdmissionRequest, decision string, reason string, matchedPolicy string, notified bool, notificationReason string) AuditRecord {
 	dryRun := false
 	if req.DryRun != nil {
@@ -498,6 +533,7 @@ func buildAuditRecord(req *v1.AdmissionRequest, decision string, reason string, 
 
 	return AuditRecord{
 		Timestamp:          time.Now(),
+		EventType:          auditEventTypeForOperation(req.Operation),
 		ClusterName:        config.ClusterName,
 		RequestUID:         string(req.UID),
 		Source:             auditSourceWebhook,
@@ -525,12 +561,58 @@ func buildAuditRecord(req *v1.AdmissionRequest, decision string, reason string, 
 	}
 }
 
+func buildLifecycleAuditRecord(event string, reason string, notified bool, notificationReason string) AuditRecord {
+	decision := auditDecisionAllowed
+	decisionLabel := notificationActionLabel(decision)
+	if event == lifecycleEventUnexpectedStop {
+		decision = auditDecisionBlocked
+		decisionLabel = notificationActionLabel(decision)
+	}
+
+	return AuditRecord{
+		Timestamp:          time.Now(),
+		EventType:          auditEventTypeLifecycle,
+		ClusterName:        config.ClusterName,
+		RequestUID:         "",
+		Source:             "service-lifecycle",
+		Username:           "system",
+		UserGroups:         nil,
+		IsServiceAccount:   false,
+		Operation:          lifecycleOperationType,
+		Kind:               lifecycleComponentKind,
+		Resource:           strings.ToLower(lifecycleComponentKind),
+		ResourceGroup:      "",
+		ResourceVersion:    "",
+		SubResource:        "",
+		Name:               lifecycleComponentName,
+		Namespace:          webhookNs,
+		ResourceDisplay:    formatResource(lifecycleComponentKind, lifecycleComponentName, webhookNs),
+		Decision:           decision,
+		DecisionLabel:      decisionLabel,
+		Reason:             reason,
+		MatchedPolicy:      event,
+		Notified:           notified,
+		NotificationReason: notificationReason,
+		DryRun:             false,
+		Object:             nil,
+		OldObject:          nil,
+	}
+}
+
 func emitAuditRecord(req *v1.AdmissionRequest, decision string, reason string, matchedPolicy string, notified bool, notificationReason string) {
 	if admissionAuditor == nil || !isAuditOperationEnabled(req.Operation) {
 		return
 	}
 
 	admissionAuditor.enqueue(buildAuditRecord(req, decision, reason, matchedPolicy, notified, notificationReason))
+}
+
+func emitLifecycleAuditRecord(event string, reason string, notified bool, notificationReason string) {
+	if admissionAuditor == nil || !admissionAuditor.enabled {
+		return
+	}
+
+	admissionAuditor.enqueue(buildLifecycleAuditRecord(event, reason, notified, notificationReason))
 }
 
 func handleCreateOrUpdateAudit(req *v1.AdmissionRequest) {

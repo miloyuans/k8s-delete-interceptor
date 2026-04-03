@@ -1,15 +1,20 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gobwas/glob"
@@ -25,8 +30,6 @@ var (
 	tlsKey        = flag.String("tlskey", "/etc/certs/tls.key", "TLS key file")
 	configFile    = flag.String("config", "/etc/config/protected.yaml", "Path to protected config file")
 	webhookNs     = "webhook-system"
-	webhookDeploy = "delete-interceptor"
-	webhookSvc    = "delete-interceptor-svc"
 )
 
 var httpClient = &http.Client{
@@ -98,6 +101,8 @@ type Config struct {
 	Protected    []ProtectedRule  `json:"protected" yaml:"protected"`
 	UserPolicies []UserPolicyRule `json:"user_policies" yaml:"user_policies"`
 	Audit        AuditConfig      `json:"audit" yaml:"audit"`
+	Lifecycle    LifecycleConfig  `json:"lifecycle" yaml:"lifecycle"`
+	Notifications NotificationControlConfig `json:"notifications" yaml:"notifications"`
 }
 
 var config Config
@@ -195,6 +200,30 @@ func formatNamespace(namespace string) string {
 	}
 
 	return namespace
+}
+
+func isSelfManagedAdmissionResource(kind string, name string) bool {
+	return strings.EqualFold(kind, "ValidatingWebhookConfiguration") && name == "delete-interceptor.k8s.io"
+}
+
+func shouldBypassForSelfPreservation(req *v1.AdmissionRequest) (bool, string) {
+	if req == nil {
+		return false, ""
+	}
+
+	if req.Namespace == webhookNs {
+		return true, fmt.Sprintf("Allowing request because namespace '%s' is reserved for the webhook's own runtime resources.", webhookNs)
+	}
+
+	if strings.EqualFold(req.Kind.Kind, "Namespace") && req.Name == webhookNs {
+		return true, fmt.Sprintf("Allowing request because namespace '%s' is reserved for the webhook itself.", webhookNs)
+	}
+
+	if isSelfManagedAdmissionResource(req.Kind.Kind, req.Name) {
+		return true, fmt.Sprintf("Allowing request because admission resource '%s' is owned by the webhook itself.", req.Name)
+	}
+
+	return false, ""
 }
 
 func formatNotificationActionLabel(action string) string {
@@ -417,14 +446,31 @@ func escapeMarkdownV2(text string) string {
 }
 
 func sendTelegramNotification(ctx NotificationContext) {
-	sendTelegramNotificationWithConfig(config.Telegram, ctx)
+	sendTelegramNotificationWithConfigMode(notificationChannelDefault, config.Telegram, ctx, true)
 }
 
 func sendAuditTelegramNotification(ctx NotificationContext) {
-	sendTelegramNotificationWithConfig(resolveAuditTelegramConfig(), ctx)
+	sendTelegramNotificationWithConfigMode(notificationChannelAudit, resolveAuditTelegramConfig(), ctx, true)
+}
+
+func sendTelegramNotificationWithConfigSync(telegramCfg TelegramConfig, ctx NotificationContext) {
+	sendTelegramNotificationWithConfigMode(notificationChannelDefault, telegramCfg, ctx, false)
 }
 
 func sendTelegramNotificationWithConfig(telegramCfg TelegramConfig, ctx NotificationContext) {
+	sendTelegramNotificationWithConfigMode(notificationChannelDefault, telegramCfg, ctx, true)
+}
+
+func sendLifecycleTelegramNotificationSync(ctx NotificationContext) {
+	sendTelegramNotificationWithConfigMode(notificationChannelLifecycle, resolveLifecycleTelegramConfig(), ctx, false)
+}
+
+func sendTelegramNotificationWithConfigMode(channel string, telegramCfg TelegramConfig, ctx NotificationContext, async bool) {
+	if notifier != nil {
+		notifier.Dispatch(channel, telegramCfg, ctx, async)
+		return
+	}
+
 	if !isTelegramConfigConfigured(telegramCfg) {
 		klog.Warning("Telegram config (token or chat_ids) missing or incomplete, skipping notification")
 		return
@@ -476,10 +522,10 @@ func sendTelegramNotificationWithConfig(telegramCfg TelegramConfig, ctx Notifica
 	// 将转义后的变量填充到模板中
 	message := renderNotificationTemplate(telegramCfg.NotificationTemplate, ctx)
 
-	go func() {
+	send := func() {
 		defer func() {
 			if r := recover(); r != nil {
-				klog.Errorf("[PANIC RECOVERED] Telegram notification goroutine crashed: %v", r)
+				klog.Errorf("[PANIC RECOVERED] Telegram notification sender crashed: %v", r)
 			}
 		}()
 
@@ -506,7 +552,64 @@ func sendTelegramNotificationWithConfig(telegramCfg TelegramConfig, ctx Notifica
 				klog.Infof("Telegram notification successfully sent to chatID %s", chatID)
 			}
 		}
+	}
+
+	if async {
+		go send()
+		return
+	}
+
+	send()
+}
+
+func deliverTelegramNotification(telegramCfg TelegramConfig, ctx NotificationContext) error {
+	if !isTelegramConfigConfigured(telegramCfg) {
+		return fmt.Errorf("telegram config (token or chat_ids) missing or incomplete")
+	}
+
+	message := renderNotificationTemplate(telegramCfg.NotificationTemplate, ctx)
+
+	defer func() {
+		if r := recover(); r != nil {
+			klog.Errorf("[PANIC RECOVERED] Telegram notification sender crashed: %v", r)
+		}
 	}()
+
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", telegramCfg.BotToken)
+	successCount := 0
+	failures := make([]string, 0)
+
+	for _, chatID := range telegramCfg.ChatIDs {
+		values := url.Values{}
+		values.Add("chat_id", chatID)
+		values.Add("text", message)
+		values.Add("parse_mode", "MarkdownV2")
+
+		resp, err := httpClient.PostForm(apiURL, values)
+		if err != nil {
+			klog.Errorf("Failed to send Telegram notification to chatID %s (URL: %s): %v", chatID, apiURL, err)
+			failures = append(failures, fmt.Sprintf("chatID %s post failed: %v", chatID, err))
+			continue
+		}
+
+		body, _ := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			klog.Errorf("Telegram API error for chatID %s. Status: %d, Response: %s", chatID, resp.StatusCode, string(body))
+			failures = append(failures, fmt.Sprintf("chatID %s api status %d", chatID, resp.StatusCode))
+			continue
+		}
+
+		successCount++
+		klog.Infof("Telegram notification successfully sent to chatID %s", chatID)
+	}
+
+	if successCount == 0 && len(failures) > 0 {
+		return fmt.Errorf(strings.Join(failures, "; "))
+	}
+
+	return nil
 }
 
 func validate(w http.ResponseWriter, r *http.Request) {
@@ -560,12 +663,10 @@ func validate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if (kind == "Deployment" && namespace == webhookNs && name == webhookDeploy) ||
-		(kind == "Service" && namespace == webhookNs && name == webhookSvc) ||
-		(kind == "Namespace" && name == webhookNs) {
+	if bypass, bypassReason := shouldBypassForSelfPreservation(review.Request); bypass {
 		klog.Infof("[Request %s] Allowed: Self-preservation rule matched for %s '%s' in namespace '%s'", reqUID, kind, name, namespace)
-		emitAuditRecord(review.Request, auditDecisionAllowed, "Deletion allowed because self-preservation rule matched.", auditPolicySelfPreservation, false, "")
-		sendResponse(w, reqUID, true, "Allowing deletion of self-webhook components.")
+		emitAuditRecord(review.Request, auditDecisionAllowed, bypassReason, auditPolicySelfPreservation, false, "")
+		sendResponse(w, reqUID, true, bypassReason)
 		return
 	}
 
@@ -669,12 +770,34 @@ func main() {
 	if err := loadConfig(*configFile); err != nil {
 		klog.Fatalf("Failed to load config from %s: %v", *configFile, err)
 	}
+	applyNotificationDefaults()
+	applyLifecycleDefaults()
 
 	auditor, err := newAuditManager(config.Audit)
 	if err != nil {
 		klog.Fatalf("Failed to initialize audit manager: %v", err)
 	}
 	admissionAuditor = auditor
+
+	lifecycleMgr, err := newLifecycleManager(config.Lifecycle)
+	if err != nil {
+		klog.Fatalf("Failed to initialize lifecycle manager: %v", err)
+	}
+	serviceLifecycle = lifecycleMgr
+
+	notificationMgr, err := newNotificationManager(config.Notifications)
+	if err != nil {
+		klog.Fatalf("Failed to initialize notification manager: %v", err)
+	}
+	notifier = notificationMgr
+	defer func() {
+		if r := recover(); r != nil {
+			if serviceLifecycle != nil {
+				serviceLifecycle.HandleUnexpectedTermination(fmt.Sprintf("Webhook main process panicked: %v", r))
+			}
+			panic(r)
+		}
+	}()
 
 	klog.Info("=========================================================")
 	klog.Info("Starting Kubernetes Delete Interceptor Admission Webhook")
@@ -733,6 +856,16 @@ func main() {
 	} else {
 		klog.Infof("Audit disabled.")
 	}
+	if config.Lifecycle.Enabled {
+		klog.Infof("Lifecycle notifications enabled. Startup: %v, Shutdown: %v, Detect unclean shutdown: %v, Lifecycle telegram uses global: %v", config.Lifecycle.NotifyStartup, config.Lifecycle.NotifyShutdown, config.Lifecycle.DetectUncleanShutdown, config.Lifecycle.Telegram.UseGlobal || !isTelegramConfigConfigured(TelegramConfig{
+			BotToken:             config.Lifecycle.Telegram.BotToken,
+			ChatIDs:              config.Lifecycle.Telegram.ChatIDs,
+			NotificationTemplate: config.Lifecycle.Telegram.NotificationTemplate,
+		}))
+	} else {
+		klog.Infof("Lifecycle notifications disabled.")
+	}
+	klog.Infof("Notification control enabled. Dedupe window: %ds, Retry failed on startup: %v, Max retry batch: %d", config.Notifications.DedupeWindowSeconds, config.Notifications.RetryFailedOnStartup, config.Notifications.MaxRetryBatch)
 	klog.Info("=========================================================")
 
 	http.HandleFunc("/validate", validate)
@@ -748,8 +881,46 @@ func main() {
 		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
 	}
 
+	listener, err := tls.Listen("tcp", server.Addr, server.TLSConfig)
+	if err != nil {
+		klog.Fatalf("Failed to bind webhook server on %s: %v", server.Addr, err)
+	}
+
 	klog.Info("Webhook server listening on :8443 (HTTPS)...")
-	if err := server.ListenAndServeTLS("", ""); err != nil {
+	serverErrCh := make(chan error, 1)
+	go func() {
+		if err := server.Serve(listener); err != nil {
+			serverErrCh <- err
+		}
+	}()
+
+	if serviceLifecycle != nil {
+		serviceLifecycle.HandleStartup()
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+
+	select {
+	case sig := <-sigCh:
+		shutdownReason := fmt.Sprintf("实例收到退出信号 '%s'，即将停止服务。", sig.String())
+		if serviceLifecycle != nil {
+			serviceLifecycle.HandleGracefulShutdown(shutdownReason)
+		}
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			klog.Errorf("Failed to gracefully shut down webhook server: %v", err)
+		}
+	case err := <-serverErrCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return
+		}
+		if serviceLifecycle != nil {
+			serviceLifecycle.HandleUnexpectedTermination(fmt.Sprintf("Webhook server exited unexpectedly: %v", err))
+		}
 		klog.Fatalf("Failed to start webhook server: %v", err)
 	}
 }

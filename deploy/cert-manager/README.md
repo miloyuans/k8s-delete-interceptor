@@ -35,12 +35,15 @@ Review and update `config/protected.yaml` before installation:
 - `cluster_name`
 - `telegram.bot_token`
 - `telegram.chat_ids`
+- `notifications`
 - `audit`
 - `audit.telegram`
 - `audit.create.notify_users`
 - `audit.create.notify_resources`
 - `audit.update.notify_users`
 - `audit.update.notify_resources`
+- `lifecycle`
+- `lifecycle.telegram`
 - `user_policies`
 - `protected`
 
@@ -103,6 +106,8 @@ kubectl apply -f deploy/cert-manager/50-validatingwebhookconfiguration.yaml
 ```
 
 This webhook registration includes `CREATE`, `UPDATE`, and `DELETE` so the service can audit create and update requests in addition to delete requests.
+The sample configuration is fail-open by default with `failurePolicy: Ignore`.
+It also excludes the `webhook-system` namespace, the `webhook-system` Namespace object itself, and several high-noise or self-referential API groups before the request reaches the webhook server.
 
 Audit notifications can either:
 
@@ -116,6 +121,50 @@ For `CREATE` and `UPDATE`, Telegram notifications are only sent when both of the
 
 Requests that do not match the notification filters are still written to the local audit file and optional MongoDB sink.
 If `notify_resources` is omitted, the webhook falls back to a built-in important-resource list such as Deployment, StatefulSet, Pod, PVC, PV, Service, ConfigMap, Secret, Ingress, Namespace, ServiceAccount, and RBAC resources.
+The `webhook-system` namespace is treated as the webhook's own management namespace and is bypassed both in webhook matching rules and in the application self-preservation logic.
+Audit files are split by event type in the writable log directory, for example `audit-YYYY-MM-DD-create.jsonl`, `audit-YYYY-MM-DD-update.jsonl`, `audit-YYYY-MM-DD-delete.jsonl`, and `audit-YYYY-MM-DD-lifecycle.jsonl`.
+
+Notification control applies to Telegram delivery across delete, audit, and lifecycle messages:
+
+- `dedupe_window_seconds` suppresses duplicate alerts within the same time window
+- suppressed duplicates are summarized into the next alert for the same signature so repeated events are not silently lost
+- failed notifications are persisted locally and retried on the next service startup
+
+Lifecycle notifications can either:
+
+- reuse the global `telegram` config with `lifecycle.telegram.use_global: true`
+- use their own bot, chats, and template with `lifecycle.telegram.use_global: false`
+
+When enabled, the service sends:
+
+- a startup notification after the HTTPS listener is successfully bound
+- a shutdown notification on graceful termination
+- an unexpected-stop notification when the process detects a previous unclean exit in the same pod data directory
+
+The sample Deployment sets `terminationGracePeriodSeconds: 30` so the process has time to send the shutdown notification before the pod is killed.
+For hard kills such as `SIGKILL`, OOM, or sudden node loss, the process cannot send a message at the moment it dies. In that case, the webhook will emit an unexpected-stop notification on the next startup if it can still see the previous lifecycle state file in the same mounted pod directory.
+
+## Emergency recovery
+
+If the cluster is already blocked by webhook timeouts, switch the webhook to fail-open first:
+
+```bash
+kubectl patch validatingwebhookconfiguration delete-interceptor.k8s.io \
+  --type='json' \
+  -p='[{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Ignore"}]'
+```
+
+Then label the webhook namespace so requests in that namespace are skipped:
+
+```bash
+kubectl label namespace webhook-system delete-interceptor.k8s.io/exclude=true --overwrite
+```
+
+After that, re-apply the webhook manifest:
+
+```bash
+kubectl apply -f deploy/cert-manager/50-validatingwebhookconfiguration.yaml
+```
 
 ## 10. Verify the webhook
 

@@ -6,16 +6,15 @@ telegram:
   chat_ids:
     - "-1001234567890"
   notification_template: |
-    🚨 *{{title}}*
-
-    *动作*: `{{action_label}}`
+    *动作*: {{action_icon}} `{{action_label}}`
     *集群*: `{{cluster}}`
     *资源*: `{{resource}}`
     *用户*: `{{user}}`
-    *操作*: `{{operation}}`
+    *操作*: `{{operation_label}}`
     *原因*: {{reason}}
     *请求ID*: `{{request_uid}}`
-    *时间*: `{{time}}`
+
+    {{title_icon}} *{{title}}*   `{{time}}`
 
 notifications:
   dedupe_window_seconds: 300
@@ -31,16 +30,15 @@ audit:
     bot_token: ""
     chat_ids: []
     notification_template: |
-      📝 *{{title}}*
-
-      *动作*: `{{action_label}}`
+      *动作*: {{action_icon}} `{{action_label}}`
       *集群*: `{{cluster}}`
       *资源*: `{{resource}}`
       *用户*: `{{user}}`
-      *操作*: `{{operation}}`
+      *操作*: `{{operation_label}}`
       *原因*: {{reason}}
       *请求ID*: `{{request_uid}}`
-      *时间*: `{{time}}`
+
+      {{title_icon}} *{{title}}*   `{{time}}`
   create:
     enabled: true
     notify_users:
@@ -107,14 +105,13 @@ lifecycle:
     bot_token: ""
     chat_ids: []
     notification_template: |
-      ℹ️ *{{title}}*
-
-      *动作*: `{{action_label}}`
+      *状态*: {{action_icon}} `{{action_label}}`
       *集群*: `{{cluster}}`
-      *资源*: `{{resource}}`
+      *实例*: `{{resource}}`
       *操作*: `{{operation_label}}`
       *原因*: {{reason}}
-      *时间*: `{{time}}`
+
+      {{title_icon}} *{{title}}*   `{{time}}`
 
 user_policies:
   - action: allow

@@ -41,16 +41,14 @@ const (
 	userActionObserve = "observe"
 	userActionDeny    = "deny"
 	defaultNotificationTemplate = "" +
-		"*{{title}}*\n" +
-		"------------------------------\n" +
-		"*Cluster:* `{{cluster}}`\n" +
-		"*Action:* `{{action_label}}`\n" +
-		"*Resource:* `{{resource}}`\n" +
-		"*User:* `{{user}}`\n" +
-		"*Operation:* `{{operation}}`\n" +
-		"*Reason:* {{reason}}\n" +
-		"*Time:* `{{time}}`\n" +
-		"*Request UID:* `{{request_uid}}`"
+		"*动作*: {{action_icon}} `{{action_label}}`\n" +
+		"*集群*: `{{cluster}}`\n" +
+		"*资源*: `{{resource}}`\n" +
+		"*用户*: `{{user}}`\n" +
+		"*操作*: `{{operation_label}}`\n" +
+		"*原因*: {{reason}}\n" +
+		"*请求ID*: `{{request_uid}}`\n\n" +
+		"{{title_icon}} *{{title}}*   `{{time}}`"
 )
 
 type TelegramConfig struct {
@@ -78,7 +76,9 @@ type UserPolicyRule struct {
 
 type NotificationContext struct {
 	Title          string
+	TitleIcon      string
 	Action         string
+	ActionIcon     string
 	ActionLabel    string
 	User           string
 	Operation      string
@@ -248,22 +248,26 @@ func buildNotificationTitle(actionLabel string) string {
 }
 
 func buildNotificationContext(reqUID types.UID, user string, kind string, name string, namespace string, operation string, action string, reason string) NotificationContext {
-	actionLabel := formatNotificationActionLabel(action)
+	actionLabel := displayNotificationActionLabel(action)
 
 	return NotificationContext{
-		Title:      buildNotificationTitle(actionLabel),
-		Action:     action,
-		ActionLabel: actionLabel,
-		User:       user,
-		Operation:  operation,
-		Cluster:    config.ClusterName,
-		Reason:     reason,
-		Timestamp:  time.Now().Format("2006-01-02 15:04:05 MST"),
-		Kind:       kind,
-		Name:       name,
-		Namespace:  formatNamespace(namespace),
-		Resource:   formatResource(kind, name, namespace),
-		RequestUID: string(reqUID),
+		Title:          displayNotificationTitle(operation, action),
+		TitleIcon:      displayNotificationTitleIcon(operation, action),
+		Action:         action,
+		ActionIcon:     displayNotificationActionIcon(action),
+		ActionLabel:    actionLabel,
+		User:           user,
+		Operation:      operation,
+		OperationType:  strings.ToUpper(strings.TrimSpace(operation)),
+		OperationLabel: displayNotificationOperationLabel(operation),
+		Cluster:        config.ClusterName,
+		Reason:         reason,
+		Timestamp:      time.Now().Format("2006-01-02 15:04:05 MST"),
+		Kind:           kind,
+		Name:           name,
+		Namespace:      formatNamespace(namespace),
+		Resource:       formatResource(kind, name, namespace),
+		RequestUID:     string(reqUID),
 	}
 }
 
@@ -321,15 +325,128 @@ func notificationTitle(operation string, action string) string {
 	return fmt.Sprintf("K8s %s操作%s通知", opLabel, titleAction)
 }
 
+func displayNotificationActionLabel(action string) string {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "blocked":
+		return "拦截"
+	case "allowed":
+		return "放行"
+	case "observed":
+		return "观察放行"
+	case lifecycleEventStarted:
+		return "启动"
+	case lifecycleEventStopped:
+		return "停止"
+	case lifecycleEventUnexpectedStop:
+		return "异常停止"
+	default:
+		return action
+	}
+}
+
+func displayNotificationActionIcon(action string) string {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "blocked":
+		return "⛔"
+	case "allowed":
+		return "✅"
+	case "observed":
+		return "👀"
+	case lifecycleEventStarted:
+		return "🟢"
+	case lifecycleEventStopped:
+		return "🔴"
+	case lifecycleEventUnexpectedStop:
+		return "⚠️"
+	default:
+		return "ℹ️"
+	}
+}
+
+func displayNotificationOperationLabel(operation string) string {
+	switch strings.ToUpper(strings.TrimSpace(operation)) {
+	case "CREATE":
+		return "创建"
+	case "UPDATE":
+		return "更新"
+	case "DELETE":
+		return "删除"
+	case lifecycleOperationType:
+		return "生命周期"
+	default:
+		return strings.ToUpper(strings.TrimSpace(operation))
+	}
+}
+
+func displayNotificationTitle(operation string, action string) string {
+	switch strings.ToUpper(strings.TrimSpace(operation)) {
+	case "CREATE":
+		if strings.EqualFold(strings.TrimSpace(action), "blocked") {
+			return "K8s 创建操作拦截通知"
+		}
+		return "K8s 创建操作审计通知"
+	case "UPDATE":
+		if strings.EqualFold(strings.TrimSpace(action), "blocked") {
+			return "K8s 更新操作拦截通知"
+		}
+		return "K8s 更新操作审计通知"
+	case "DELETE":
+		switch strings.ToLower(strings.TrimSpace(action)) {
+		case "blocked":
+			return "K8s 删除操作拦截通知"
+		case "allowed", "observed":
+			return "K8s 删除操作放行通知"
+		default:
+			return "K8s 删除操作通知"
+		}
+	default:
+		if strings.EqualFold(strings.TrimSpace(action), "blocked") {
+			return "K8s 资源操作拦截通知"
+		}
+		return "K8s 资源操作通知"
+	}
+}
+
+func displayNotificationTitleIcon(operation string, action string) string {
+	switch strings.ToUpper(strings.TrimSpace(operation)) {
+	case "CREATE":
+		if strings.EqualFold(strings.TrimSpace(action), "blocked") {
+			return "⛔"
+		}
+		return "🆕"
+	case "UPDATE":
+		if strings.EqualFold(strings.TrimSpace(action), "blocked") {
+			return "⛔"
+		}
+		return "✏️"
+	case "DELETE":
+		switch strings.ToLower(strings.TrimSpace(action)) {
+		case "blocked":
+			return "⛔"
+		case "allowed", "observed":
+			return "✅"
+		default:
+			return "🗑️"
+		}
+	default:
+		if strings.EqualFold(strings.TrimSpace(action), "blocked") {
+			return "⛔"
+		}
+		return "ℹ️"
+	}
+}
+
 func buildSmartNotificationContext(reqUID types.UID, user string, kind string, name string, namespace string, operationType string, operation string, action string, reason string) NotificationContext {
 	return NotificationContext{
-		Title:          notificationTitle(operationType, action),
+		Title:          displayNotificationTitle(operationType, action),
+		TitleIcon:      displayNotificationTitleIcon(operationType, action),
 		Action:         action,
-		ActionLabel:    notificationActionLabel(action),
+		ActionIcon:     displayNotificationActionIcon(action),
+		ActionLabel:    displayNotificationActionLabel(action),
 		User:           user,
 		Operation:      operation,
 		OperationType:  strings.ToUpper(strings.TrimSpace(operationType)),
-		OperationLabel: notificationOperationLabel(operationType),
+		OperationLabel: displayNotificationOperationLabel(operationType),
 		Cluster:        config.ClusterName,
 		Reason:         reason,
 		Timestamp:      time.Now().Format("2006-01-02 15:04:05 MST"),
@@ -348,7 +465,9 @@ func renderNotificationTemplate(template string, ctx NotificationContext) string
 
 	values := map[string]string{
 		"title":        escapeMarkdownV2(ctx.Title),
+		"title_icon":   escapeMarkdownV2(ctx.TitleIcon),
 		"action":       escapeMarkdownV2(ctx.Action),
+		"action_icon":  escapeMarkdownV2(ctx.ActionIcon),
 		"action_label": escapeMarkdownV2(ctx.ActionLabel),
 		"user":         escapeMarkdownV2(ctx.User),
 		"operation":    escapeMarkdownV2(ctx.Operation),
@@ -367,7 +486,9 @@ func renderNotificationTemplate(template string, ctx NotificationContext) string
 	if strings.Contains(template, "{{") {
 		replacerArgs := []string{
 			"{{title}}", values["title"],
+			"{{title_icon}}", values["title_icon"],
 			"{{action}}", values["action"],
+			"{{action_icon}}", values["action_icon"],
 			"{{action_label}}", values["action_label"],
 			"{{user}}", values["user"],
 			"{{operation}}", values["operation"],

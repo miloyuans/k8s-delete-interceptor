@@ -123,6 +123,8 @@ Requests that do not match the notification filters are still written to the loc
 If `notify_resources` is omitted, the webhook falls back to a built-in important-resource list such as Deployment, StatefulSet, Pod, PVC, PV, Service, ConfigMap, Secret, Ingress, Namespace, ServiceAccount, and RBAC resources.
 The `webhook-system` namespace is treated as the webhook's own management namespace and is bypassed both in webhook matching rules and in the application self-preservation logic.
 Audit files are split by event type in the writable log directory, for example `audit-YYYY-MM-DD-create.jsonl`, `audit-YYYY-MM-DD-update.jsonl`, `audit-YYYY-MM-DD-delete.jsonl`, and `audit-YYYY-MM-DD-lifecycle.jsonl`.
+Telegram templates can use `{{title_icon}}` and `{{action_icon}}` so startup, shutdown, intercept, create, update, and allow messages are visually distinct at a glance.
+The sample templates also place the title and timestamp on the last line, for example `{{title_icon}} *{{title}}*   \`{{time}}\``.
 
 Notification control applies to Telegram delivery across delete, audit, and lifecycle messages:
 

@@ -86,6 +86,45 @@ func resolveLifecycleTelegramConfig() TelegramConfig {
 	return customCfg
 }
 
+func displayLifecycleEventLabel(event string) string {
+	switch event {
+	case lifecycleEventStarted:
+		return "启动"
+	case lifecycleEventStopped:
+		return "停止"
+	case lifecycleEventUnexpectedStop:
+		return "异常停止"
+	default:
+		return event
+	}
+}
+
+func displayLifecycleTitle(event string) string {
+	switch event {
+	case lifecycleEventStarted:
+		return "K8s Webhook 服务启动通知"
+	case lifecycleEventStopped:
+		return "K8s Webhook 服务停止通知"
+	case lifecycleEventUnexpectedStop:
+		return "K8s Webhook 服务异常停止通知"
+	default:
+		return "K8s Webhook 服务生命周期通知"
+	}
+}
+
+func displayLifecycleTitleIcon(event string) string {
+	switch event {
+	case lifecycleEventStarted:
+		return "🟢"
+	case lifecycleEventStopped:
+		return "🔴"
+	case lifecycleEventUnexpectedStop:
+		return "⚠️"
+	default:
+		return "ℹ️"
+	}
+}
+
 func lifecycleEventLabel(event string) string {
 	switch event {
 	case lifecycleEventStarted:
@@ -145,13 +184,15 @@ func newLifecycleManager(cfg LifecycleConfig) (*lifecycleManager, error) {
 
 func (m *lifecycleManager) buildNotificationContext(event string, reason string) NotificationContext {
 	return NotificationContext{
-		Title:          lifecycleTitle(event),
+		Title:          displayLifecycleTitle(event),
+		TitleIcon:      displayLifecycleTitleIcon(event),
 		Action:         event,
-		ActionLabel:    lifecycleEventLabel(event),
+		ActionIcon:     displayNotificationActionIcon(event),
+		ActionLabel:    displayLifecycleEventLabel(event),
 		User:           "system",
 		Operation:      fmt.Sprintf("%s %s", lifecycleOperationType, m.instance),
 		OperationType:  lifecycleOperationType,
-		OperationLabel: lifecycleOperationLabel,
+		OperationLabel: displayNotificationOperationLabel(lifecycleOperationType),
 		Cluster:        config.ClusterName,
 		Reason:         reason,
 		Timestamp:      time.Now().Format("2006-01-02 15:04:05 MST"),

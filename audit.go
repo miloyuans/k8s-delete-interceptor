@@ -36,6 +36,28 @@ const (
 	auditSourceWebhook          = "admission-webhook"
 )
 
+var defaultAuditNotifyResources = []string{
+	"deployment",
+	"statefulset",
+	"daemonset",
+	"pod",
+	"pvc",
+	"pv",
+	"service",
+	"svc",
+	"configmap",
+	"secret",
+	"ingress",
+	"namespace",
+	"serviceaccount",
+	"sa",
+	"role",
+	"clusterrole",
+	"rolebinding",
+	"clusterrolebinding",
+	"storageclass",
+}
+
 type AuditConfig struct {
 	Enabled           bool                 `json:"enabled" yaml:"enabled"`
 	Directory         string               `json:"directory" yaml:"directory"`
@@ -47,8 +69,9 @@ type AuditConfig struct {
 }
 
 type AuditOperationConfig struct {
-	Enabled     bool     `json:"enabled" yaml:"enabled"`
-	NotifyUsers []string `json:"notify_users" yaml:"notify_users"`
+	Enabled         bool     `json:"enabled" yaml:"enabled"`
+	NotifyUsers     []string `json:"notify_users" yaml:"notify_users"`
+	NotifyResources []string `json:"notify_resources" yaml:"notify_resources"`
 }
 
 type MongoAuditConfig struct {
@@ -331,22 +354,79 @@ func isAuditOperationEnabled(operation v1.Operation) bool {
 	}
 }
 
-func shouldNotifyMutationAudit(operation v1.Operation, user string) (bool, string, string) {
-	if !config.Audit.Enabled || !isServiceAccountUser(user) {
-		return false, "", ""
-	}
-
-	var patterns []string
+func getAuditOperationConfig(operation v1.Operation) AuditOperationConfig {
 	switch operation {
 	case v1.Create:
-		patterns = config.Audit.Create.NotifyUsers
+		return config.Audit.Create
 	case v1.Update:
-		patterns = config.Audit.Update.NotifyUsers
+		return config.Audit.Update
 	default:
-		return false, "", ""
+		return AuditOperationConfig{}
+	}
+}
+
+func uniqueLowerValues(values ...string) []string {
+	seen := make(map[string]struct{})
+	result := make([]string, 0, len(values))
+
+	for _, value := range values {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
 	}
 
-	for _, pattern := range patterns {
+	return result
+}
+
+func auditResourceCandidates(kind string, resource string) []string {
+	candidates := uniqueLowerValues(kind, resource)
+
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "deployment":
+		candidates = append(candidates, "deploy")
+	case "statefulset":
+		candidates = append(candidates, "sts")
+	case "daemonset":
+		candidates = append(candidates, "ds")
+	case "persistentvolumeclaim":
+		candidates = append(candidates, "pvc")
+	case "persistentvolume":
+		candidates = append(candidates, "pv")
+	case "service":
+		candidates = append(candidates, "svc")
+	case "configmap":
+		candidates = append(candidates, "cm")
+	case "ingress":
+		candidates = append(candidates, "ing")
+	case "namespace":
+		candidates = append(candidates, "ns")
+	case "serviceaccount":
+		candidates = append(candidates, "sa")
+	case "rolebinding":
+		candidates = append(candidates, "rb")
+	case "clusterrolebinding":
+		candidates = append(candidates, "crb")
+	}
+
+	return uniqueLowerValues(candidates...)
+}
+
+func resolveAuditNotifyResources(operation v1.Operation) []string {
+	patterns := getAuditOperationConfig(operation).NotifyResources
+	if len(patterns) == 0 {
+		return defaultAuditNotifyResources
+	}
+	return patterns
+}
+
+func matchAuditNotifyUser(operation v1.Operation, user string) (bool, string, string) {
+	for _, pattern := range getAuditOperationConfig(operation).NotifyUsers {
 		matched, matcher, err := matchPattern(pattern, user)
 		if err != nil {
 			klog.Errorf("Invalid audit notify pattern '%s' for operation '%s': %v. This pattern will be skipped.", pattern, operation, err)
@@ -359,6 +439,45 @@ func shouldNotifyMutationAudit(operation v1.Operation, user string) (bool, strin
 	}
 
 	return false, "", ""
+}
+
+func matchAuditNotifyResource(operation v1.Operation, kind string, resource string) (bool, string, string, string) {
+	patterns := resolveAuditNotifyResources(operation)
+	candidates := auditResourceCandidates(kind, resource)
+
+	for _, pattern := range patterns {
+		for _, candidate := range candidates {
+			matched, matcher, err := matchPattern(pattern, candidate)
+			if err != nil {
+				klog.Errorf("Invalid audit notify resource pattern '%s' for operation '%s': %v. This pattern will be skipped.", pattern, operation, err)
+				break
+			}
+
+			if matched {
+				return true, pattern, matcher, candidate
+			}
+		}
+	}
+
+	return false, "", "", ""
+}
+
+func shouldNotifyMutationAudit(req *v1.AdmissionRequest) (bool, string, string, string, string, string) {
+	if !config.Audit.Enabled || !isServiceAccountUser(req.UserInfo.Username) {
+		return false, "", "", "", "", ""
+	}
+
+	userMatched, userPattern, userMatcher := matchAuditNotifyUser(req.Operation, req.UserInfo.Username)
+	if !userMatched {
+		return false, "", "", "", "", ""
+	}
+
+	resourceMatched, resourcePattern, resourceMatcher, resourceCandidate := matchAuditNotifyResource(req.Operation, req.Kind.Kind, req.Resource.Resource)
+	if !resourceMatched {
+		return false, userPattern, userMatcher, "", "", ""
+	}
+
+	return true, userPattern, userMatcher, resourcePattern, resourceMatcher, resourceCandidate
 }
 
 func cloneRawMessage(raw []byte) json.RawMessage {
@@ -395,7 +514,7 @@ func buildAuditRecord(req *v1.AdmissionRequest, decision string, reason string, 
 		Namespace:          req.Namespace,
 		ResourceDisplay:    formatResource(req.Kind.Kind, req.Name, req.Namespace),
 		Decision:           decision,
-		DecisionLabel:      formatNotificationActionLabel(decision),
+		DecisionLabel:      notificationActionLabel(decision),
 		Reason:             reason,
 		MatchedPolicy:      matchedPolicy,
 		Notified:           notified,
@@ -430,20 +549,21 @@ func handleCreateOrUpdateAudit(req *v1.AdmissionRequest) {
 	notified := false
 	notificationReason := ""
 
-	if shouldNotify, pattern, matcher := shouldNotifyMutationAudit(req.Operation, req.UserInfo.Username); shouldNotify {
-		notificationReason = fmt.Sprintf("%s request for %s matched audit notify whitelist pattern '%s' (%s). Operation allowed and audit recorded.", operationLabel, resourceDesc, pattern, matcher)
-		sendAuditTelegramNotification(buildNotificationContext(
+	if shouldNotify, userPattern, userMatcher, resourcePattern, resourceMatcher, resourceCandidate := shouldNotifyMutationAudit(req); shouldNotify {
+		notificationReason = fmt.Sprintf("服务账号命中审计通知规则，重要资源变更已放行并记录。用户规则: '%s' (%s)，资源规则: '%s' (%s, candidate '%s')。", userPattern, userMatcher, resourcePattern, resourceMatcher, resourceCandidate)
+		sendAuditTelegramNotification(buildSmartNotificationContext(
 			req.UID,
 			req.UserInfo.Username,
 			req.Kind.Kind,
 			req.Name,
 			req.Namespace,
+			string(req.Operation),
 			formatOperation(string(req.Operation), req.Kind.Kind, req.Name, req.Namespace),
 			auditDecisionAllowed,
 			notificationReason,
 		))
 		notified = true
-		matchedPolicy = fmt.Sprintf("%s_notify_whitelist:%s", strings.ToLower(string(req.Operation)), pattern)
+		matchedPolicy = fmt.Sprintf("%s_notify:%s|%s", strings.ToLower(string(req.Operation)), userPattern, resourcePattern)
 	}
 
 	emitAuditRecord(req, auditDecisionAllowed, reason, matchedPolicy, notified, notificationReason)

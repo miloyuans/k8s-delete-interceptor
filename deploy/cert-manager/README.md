@@ -37,6 +37,10 @@ Review and update `config/protected.yaml` before installation:
 - `telegram.chat_ids`
 - `audit`
 - `audit.telegram`
+- `audit.create.notify_users`
+- `audit.create.notify_resources`
+- `audit.update.notify_users`
+- `audit.update.notify_resources`
 - `user_policies`
 - `protected`
 
@@ -104,6 +108,14 @@ Audit notifications can either:
 
 - reuse the global `telegram` config with `audit.telegram.use_global: true`
 - use their own bot, chats, and template with `audit.telegram.use_global: false`
+
+For `CREATE` and `UPDATE`, Telegram notifications are only sent when both of these match:
+
+- the requesting service account matches `notify_users`
+- the resource kind or alias matches `notify_resources`
+
+Requests that do not match the notification filters are still written to the local audit file and optional MongoDB sink.
+If `notify_resources` is omitted, the webhook falls back to a built-in important-resource list such as Deployment, StatefulSet, Pod, PVC, PV, Service, ConfigMap, Secret, Ingress, Namespace, ServiceAccount, and RBAC resources.
 
 ## 10. Verify the webhook
 

@@ -40,10 +40,50 @@ audit:
     enabled: true
     notify_users:
       - "*k8s-cicd-sa*"
+    notify_resources:
+      - "deployment"
+      - "statefulset"
+      - "daemonset"
+      - "pod"
+      - "pvc"
+      - "pv"
+      - "service"
+      - "svc"
+      - "configmap"
+      - "secret"
+      - "ingress"
+      - "namespace"
+      - "serviceaccount"
+      - "sa"
+      - "role"
+      - "clusterrole"
+      - "rolebinding"
+      - "clusterrolebinding"
+      - "storageclass"
   update:
     enabled: true
     notify_users:
       - "*k8s-cicd-sa*"
+    notify_resources:
+      - "deployment"
+      - "statefulset"
+      - "daemonset"
+      - "pod"
+      - "pvc"
+      - "pv"
+      - "service"
+      - "svc"
+      - "configmap"
+      - "secret"
+      - "ingress"
+      - "namespace"
+      - "serviceaccount"
+      - "sa"
+      - "role"
+      - "clusterrole"
+      - "rolebinding"
+      - "clusterrolebinding"
+      - "storageclass"
   mongo:
     enabled: false
     uri: "mongodb://mongodb.mongodb.svc.cluster.local:27017"

@@ -74,19 +74,21 @@ type UserPolicyRule struct {
 }
 
 type NotificationContext struct {
-	Title      string
-	Action     string
-	ActionLabel string
-	User       string
-	Operation  string
-	Cluster    string
-	Reason     string
-	Timestamp  string
-	Kind       string
-	Name       string
-	Namespace  string
-	Resource   string
-	RequestUID string
+	Title          string
+	Action         string
+	ActionLabel    string
+	User           string
+	Operation      string
+	OperationType  string
+	OperationLabel string
+	Cluster        string
+	Reason         string
+	Timestamp      string
+	Kind           string
+	Name           string
+	Namespace      string
+	Resource       string
+	RequestUID     string
 }
 
 type Config struct {
@@ -236,6 +238,80 @@ func buildNotificationContext(reqUID types.UID, user string, kind string, name s
 	}
 }
 
+func notificationActionLabel(action string) string {
+	switch action {
+	case "blocked":
+		return "拦截"
+	case "allowed", "observed":
+		return "放行"
+	default:
+		return action
+	}
+}
+
+func notificationOperationLabel(operation string) string {
+	switch strings.ToUpper(strings.TrimSpace(operation)) {
+	case "CREATE":
+		return "创建"
+	case "UPDATE":
+		return "更新"
+	case "DELETE":
+		return "删除"
+	default:
+		return strings.ToUpper(strings.TrimSpace(operation))
+	}
+}
+
+func notificationTitle(operation string, action string) string {
+	opLabel := notificationOperationLabel(operation)
+	if opLabel == "" {
+		opLabel = "资源"
+	}
+
+	titleAction := "通知"
+	switch strings.ToUpper(strings.TrimSpace(operation)) {
+	case "CREATE", "UPDATE":
+		if action == "blocked" {
+			titleAction = "拦截"
+		} else {
+			titleAction = "审计"
+		}
+	case "DELETE":
+		switch action {
+		case "blocked":
+			titleAction = "拦截"
+		case "allowed", "observed":
+			titleAction = "放行"
+		}
+	default:
+		if action == "blocked" {
+			titleAction = "拦截"
+		}
+	}
+
+	return fmt.Sprintf("K8s %s操作%s通知", opLabel, titleAction)
+}
+
+func buildSmartNotificationContext(reqUID types.UID, user string, kind string, name string, namespace string, operationType string, operation string, action string, reason string) NotificationContext {
+	return NotificationContext{
+		Title:          notificationTitle(operationType, action),
+		Action:         action,
+		ActionLabel:    notificationActionLabel(action),
+		User:           user,
+		Operation:      operation,
+		OperationType:  strings.ToUpper(strings.TrimSpace(operationType)),
+		OperationLabel: notificationOperationLabel(operationType),
+		Cluster:        config.ClusterName,
+		Reason:         reason,
+		Timestamp:      time.Now().Format("2006-01-02 15:04:05 MST"),
+		Kind:           kind,
+		Name:           name,
+		Namespace:      formatNamespace(namespace),
+		Resource:       formatResource(kind, name, namespace),
+		RequestUID:     string(reqUID),
+	}
+}
+
 func renderNotificationTemplate(template string, ctx NotificationContext) string {
 	if template == "" {
 		template = defaultNotificationTemplate
@@ -247,6 +323,8 @@ func renderNotificationTemplate(template string, ctx NotificationContext) string
 		"action_label": escapeMarkdownV2(ctx.ActionLabel),
 		"user":         escapeMarkdownV2(ctx.User),
 		"operation":    escapeMarkdownV2(ctx.Operation),
+		"operation_type":  escapeMarkdownV2(ctx.OperationType),
+		"operation_label": escapeMarkdownV2(ctx.OperationLabel),
 		"cluster":      escapeMarkdownV2(ctx.Cluster),
 		"reason":       escapeMarkdownV2(ctx.Reason),
 		"time":         escapeMarkdownV2(ctx.Timestamp),
@@ -264,6 +342,8 @@ func renderNotificationTemplate(template string, ctx NotificationContext) string
 			"{{action_label}}", values["action_label"],
 			"{{user}}", values["user"],
 			"{{operation}}", values["operation"],
+			"{{operation_type}}", values["operation_type"],
+			"{{operation_label}}", values["operation_label"],
 			"{{cluster}}", values["cluster"],
 			"{{reason}}", values["reason"],
 			"{{time}}", values["time"],
@@ -500,14 +580,14 @@ func validate(w http.ResponseWriter, r *http.Request) {
 		case userActionObserve:
 			reason := fmt.Sprintf("Observed delete request for %s: user '%s' matched user policy pattern '%s' (%s). Operation allowed.", resourceDesc, user, pattern, matcher)
 			klog.Infof("[Request %s] Observed: %s", reqUID, reason)
-			sendTelegramNotification(buildNotificationContext(reqUID, user, kind, name, namespace, opDesc, "observed", reason))
+			sendTelegramNotification(buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "observed", reason))
 			emitAuditRecord(review.Request, auditDecisionAllowed, reason, fmt.Sprintf("delete_user_policy_observe:%s", pattern), true, reason)
 			sendResponse(w, reqUID, true, "")
 			return
 		case userActionDeny:
 			denyReason := fmt.Sprintf("User policy blocked delete for %s: user '%s' matched user policy pattern '%s' (%s).", resourceDesc, user, pattern, matcher)
 			klog.Warningf("[Request %s] DENIED: %s", reqUID, denyReason)
-			sendTelegramNotification(buildNotificationContext(reqUID, user, kind, name, namespace, opDesc, "blocked", denyReason))
+			sendTelegramNotification(buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "blocked", denyReason))
 			emitAuditRecord(review.Request, auditDecisionBlocked, denyReason, fmt.Sprintf("delete_user_policy_deny:%s", pattern), true, denyReason)
 			sendResponse(w, reqUID, false, denyReason)
 			return
@@ -533,7 +613,7 @@ func validate(w http.ResponseWriter, r *http.Request) {
 
 					klog.Warningf("[Request %s] DENIED: %s. User: %s, Resource: %s/%s, NS: %s", reqUID, denyReason, user, kind, name, namespace)
 
-					sendTelegramNotification(buildNotificationContext(reqUID, user, kind, name, namespace, opDesc, "blocked", denyReason))
+					sendTelegramNotification(buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "blocked", denyReason))
 					emitAuditRecord(review.Request, auditDecisionBlocked, denyReason, fmt.Sprintf("protected_rule:%s", pattern), true, denyReason)
 
 					goto respond

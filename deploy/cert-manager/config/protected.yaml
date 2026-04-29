@@ -141,19 +141,6 @@ lifecycle:
 
       {{title_icon}} *{{title}}*   `{{time}}`
 
-user_policies:
-  - action: allow
-    users:
-      - "*k8s-cicd-sa*"
-
-  - action: observe
-    users:
-      - "regex:^system:serviceaccount:monitoring:.*$"
-
-  - action: deny
-    users:
-      - "*dangerous-sa*"
-
 protected:
   - kind: Namespace
     names:

@@ -46,7 +46,6 @@ Review and update `config/protected.yaml` before installation:
 - `global_whitelist`
 - `lifecycle`
 - `lifecycle.telegram`
-- `user_policies`
 - `protected`
 
 For example, `global_whitelist.users: ["*milo*", "regex:^system:serviceaccount:.*:breakglass-.*$"]` will match the full Kubernetes username with the same glob or regex semantics used elsewhere in the config.
@@ -123,6 +122,7 @@ For `CREATE` and `UPDATE`, Telegram notifications are only sent when both of the
 
 - the requesting service account matches `notify_users`
 - the resource kind or alias matches `notify_resources`
+- if the user first matches `global_whitelist.users`, the request is only audited and the mutation notification rules are skipped
 
 Requests that do not match the notification filters are still written to the local audit file and optional MongoDB sink.
 If `notify_resources` is omitted, the webhook falls back to a built-in important-resource list such as Deployment, StatefulSet, Pod, PVC, PV, Service, ConfigMap, Secret, Ingress, Namespace, ServiceAccount, and RBAC resources.
@@ -137,11 +137,12 @@ If the generated update diff is too large for a concise Telegram message, the me
 
 Delete confirmation adds a two-step approval flow for protected resources:
 
+- precedence order is explicit: `global_whitelist.users` > `delete_confirmation.rules.users` > `protected`
 - the first matching delete is denied and queued for Telegram approval
 - delete confirmation user matching is controlled only by `delete_confirmation.rules.users`
 - `global_whitelist.users` uses the same glob and `regex:` matching model as the other user filters
-- global `user_policies` are not used for protected delete confirmation decisions
 - users matched by `global_whitelist.users` bypass delete confirmation, protected delete interception, and audit Telegram notifications; the request is only recorded in the audit log
+- if a user does not match `global_whitelist.users`, the webhook continues into the delete-specific approval list in `delete_confirmation.rules.users`; if that also does not match, the protected delete stays blocked
 - `delete_confirmation.chat_ids` can target one or more approval groups; when omitted, the global `telegram.chat_ids` are used
 - matching requests are grouped for `aggregate_window_seconds` so batch deletes produce one approval message
 - only configured `telegram_ids` can approve or reject the inline buttons

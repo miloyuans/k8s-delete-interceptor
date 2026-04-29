@@ -39,9 +39,6 @@ var httpClient = &http.Client{
 }
 
 const (
-	userActionAllow   = "allow"
-	userActionObserve = "observe"
-	userActionDeny    = "deny"
 	defaultNotificationTemplate = "" +
 		"*动作*: {{action_icon}} `{{action_label}}`\n" +
 		"*集群*: `{{cluster}}`\n" +
@@ -69,11 +66,6 @@ type AuditTelegramConfig struct {
 type ProtectedRule struct {
 	Kind  string   `json:"kind" yaml:"kind"`
 	Names []string `json:"names" yaml:"names"`
-}
-
-type UserPolicyRule struct {
-	Action string   `json:"action" yaml:"action"`
-	Users  []string `json:"users" yaml:"users"`
 }
 
 type GlobalWhitelistConfig struct {
@@ -110,7 +102,6 @@ type Config struct {
 	ClusterName       string                    `json:"cluster_name" yaml:"cluster_name"`
 	Telegram          TelegramConfig            `json:"telegram" yaml:"telegram"`
 	Protected         []ProtectedRule           `json:"protected" yaml:"protected"`
-	UserPolicies      []UserPolicyRule          `json:"user_policies" yaml:"user_policies"`
 	GlobalWhitelist   GlobalWhitelistConfig     `json:"global_whitelist" yaml:"global_whitelist"`
 	Audit             AuditConfig               `json:"audit" yaml:"audit"`
 	Lifecycle         LifecycleConfig           `json:"lifecycle" yaml:"lifecycle"`
@@ -129,15 +120,6 @@ func loadConfig(file string) error {
 		return fmt.Errorf("failed to unmarshal config from '%s': %w", file, err)
 	}
 	return nil
-}
-
-func isValidUserAction(action string) bool {
-	switch action {
-	case userActionAllow, userActionObserve, userActionDeny:
-		return true
-	default:
-		return false
-	}
 }
 
 func matchPattern(pattern string, candidate string) (bool, string, error) {
@@ -165,30 +147,6 @@ func matchPattern(pattern string, candidate string) (bool, string, error) {
 	}
 
 	return g.Match(candidate), "glob", nil
-}
-
-func matchUserPolicy(user string) (bool, string, string, string) {
-	for _, rule := range config.UserPolicies {
-		action := strings.ToLower(strings.TrimSpace(rule.Action))
-		if !isValidUserAction(action) {
-			klog.Errorf("Invalid user policy action '%s'. Supported actions: %s, %s, %s. Rule will be skipped.", rule.Action, userActionAllow, userActionObserve, userActionDeny)
-			continue
-		}
-
-		for _, pattern := range rule.Users {
-			matched, matcher, err := matchPattern(pattern, user)
-			if err != nil {
-				klog.Errorf("Invalid user policy pattern '%s' for action '%s': %v. This pattern will be skipped.", pattern, action, err)
-				continue
-			}
-
-			if matched {
-				return true, action, pattern, matcher
-			}
-		}
-	}
-
-	return false, "", "", ""
 }
 
 func matchGlobalWhitelist(user string) (bool, string, string) {
@@ -900,11 +858,15 @@ func validate(w http.ResponseWriter, r *http.Request) {
 	// Protected DELETE requests first honor the global whitelist, then the delete confirmation rules.
 	if matched, pattern, matcher := matchGlobalWhitelist(user); matched {
 		allowReason := fmt.Sprintf("Delete request bypassed all controls for %s: user '%s' matched global whitelist pattern '%s' (%s). Audit recorded only.", resourceDesc, user, pattern, matcher)
+		if telegramIDs, deletePattern, deleteMatcher := matchDeleteConfirmationRule(user); len(telegramIDs) > 0 {
+			klog.Infof("[Request %s] Global whitelist precedence applied for user '%s': delete confirmation rule '%s' (%s) was skipped.", reqUID, user, deletePattern, deleteMatcher)
+		}
 		klog.Infof("[Request %s] Allowed by global whitelist: %s", reqUID, allowReason)
 		emitAuditRecord(review.Request, auditDecisionAllowed, allowReason, fmt.Sprintf("%s:%s", auditPolicyGlobalWhitelist, pattern), false, "")
 		sendResponse(w, reqUID, true, allowReason)
 		return
-	} else if false {
+	}
+	/* legacy user_policies flow removed
 	if matched, action, pattern, matcher := matchUserPolicy(user); matched {
 		switch action {
 		case userActionAllow:
@@ -930,7 +892,7 @@ func validate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	}
+	*/
 
 	allowed := true
 	var denyReason string
@@ -1089,11 +1051,6 @@ func main() {
 			}
 			return kinds
 		}())
-		if len(config.UserPolicies) > 0 {
-			klog.Infof("Loaded %d user policy rules", len(config.UserPolicies))
-		} else {
-			klog.Infof("No user policy rules configured.")
-		}
 		if len(config.GlobalWhitelist.Users) > 0 {
 			klog.Infof("Loaded %d global whitelist user patterns", len(config.GlobalWhitelist.Users))
 		} else {

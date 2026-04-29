@@ -491,6 +491,7 @@ func (m *deleteConfirmationManager) buildApprovalMessage(group deleteConfirmatio
 		"",
 		"*资源列表*:",
 	}
+	lines = append(lines[:2], append([]string{fmt.Sprintf("*集群*: `%s`", escapeMarkdownV2(config.ClusterName))}, lines[2:]...)...)
 
 	limit := m.maxItems
 	if limit <= 0 {

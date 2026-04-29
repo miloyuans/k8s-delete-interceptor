@@ -29,6 +29,7 @@ const (
 	defaultDeleteConfirmationMaxItems        = 20
 	deleteConfirmationStateFileName          = "delete-confirmation-state.json"
 	deleteConfirmationLockFileName           = "delete-confirmation-state.lock"
+	deleteConfirmationPollLockFileName       = "delete-confirmation-poll.lock"
 	deleteConfirmationStatusPending          = "pending"
 	deleteConfirmationStatusSent             = "sent"
 	deleteConfirmationStatusApproved         = "approved"
@@ -114,6 +115,7 @@ type deleteConfirmationManager struct {
 	directory       string
 	statePath       string
 	lockPath        string
+	pollLockPath    string
 	ttl             time.Duration
 	consumeWindow   time.Duration
 	aggregateWindow time.Duration
@@ -202,6 +204,7 @@ func newDeleteConfirmationManager(cfg DeleteConfirmationConfig) (*deleteConfirma
 		directory:       directory,
 		statePath:       filepath.Join(directory, deleteConfirmationStateFileName),
 		lockPath:        filepath.Join(directory, deleteConfirmationLockFileName),
+		pollLockPath:    filepath.Join(directory, deleteConfirmationPollLockFileName),
 		ttl:             time.Duration(cfg.TTLSeconds) * time.Second,
 		consumeWindow:   time.Duration(cfg.ConsumeWindowSeconds) * time.Second,
 		aggregateWindow: time.Duration(cfg.AggregateWindowSeconds) * time.Second,
@@ -507,6 +510,16 @@ func (m *deleteConfirmationManager) buildApprovalMessage(group deleteConfirmatio
 }
 
 func (m *deleteConfirmationManager) pollTelegramCallbacks() {
+	locked, err := m.acquirePollLock()
+	if err != nil {
+		klog.Errorf("Failed to acquire Telegram poll lock: %v", err)
+		return
+	}
+	if !locked {
+		return
+	}
+	defer os.Remove(m.pollLockPath)
+
 	offset, err := m.telegramOffset()
 	if err != nil {
 		klog.Errorf("Failed to read Telegram update offset: %v", err)
@@ -716,7 +729,7 @@ func (m *deleteConfirmationManager) withStateLock(fn func(*deleteConfirmationSta
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if err := m.acquireLock(); err != nil {
+	if err := acquireFileLock(m.lockPath, 1500*time.Millisecond, 10*time.Second); err != nil {
 		return err
 	}
 	defer os.Remove(m.lockPath)
@@ -731,10 +744,21 @@ func (m *deleteConfirmationManager) withStateLock(fn func(*deleteConfirmationSta
 	return m.saveState(state)
 }
 
-func (m *deleteConfirmationManager) acquireLock() error {
-	deadline := time.Now().Add(1500 * time.Millisecond)
+func (m *deleteConfirmationManager) acquirePollLock() (bool, error) {
+	err := acquireFileLock(m.pollLockPath, 0, 10*time.Second)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func acquireFileLock(path string, wait time.Duration, staleAfter time.Duration) error {
+	deadline := time.Now().Add(wait)
 	for {
-		f, err := os.OpenFile(m.lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
 			_, _ = f.WriteString(time.Now().Format(time.RFC3339Nano))
 			_ = f.Close()
@@ -744,9 +768,12 @@ func (m *deleteConfirmationManager) acquireLock() error {
 			return err
 		}
 
-		if info, statErr := os.Stat(m.lockPath); statErr == nil && time.Since(info.ModTime()) > 10*time.Second {
-			_ = os.Remove(m.lockPath)
+		if info, statErr := os.Stat(path); statErr == nil && staleAfter > 0 && time.Since(info.ModTime()) > staleAfter {
+			_ = os.Remove(path)
 			continue
+		}
+		if wait <= 0 {
+			return err
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out waiting for delete confirmation state lock")

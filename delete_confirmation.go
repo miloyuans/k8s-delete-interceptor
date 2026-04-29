@@ -42,6 +42,7 @@ const (
 type DeleteConfirmationConfig struct {
 	Enabled                bool                     `json:"enabled" yaml:"enabled"`
 	StateDirectory         string                   `json:"state_directory" yaml:"state_directory"`
+	ChatIDs                []string                 `json:"chat_ids" yaml:"chat_ids"`
 	TTLSeconds             int                      `json:"ttl_seconds" yaml:"ttl_seconds"`
 	ConsumeWindowSeconds   int                      `json:"consume_window_seconds" yaml:"consume_window_seconds"`
 	AggregateWindowSeconds int                      `json:"aggregate_window_seconds" yaml:"aggregate_window_seconds"`
@@ -102,6 +103,13 @@ type deleteConfirmationGroup struct {
 	MatchedPattern  string    `json:"matched_pattern"`
 	TelegramIDs     []string  `json:"telegram_ids"`
 	EntryIDs        []string  `json:"entry_ids"`
+	MessageText     string    `json:"message_text,omitempty"`
+	SentMessages    []telegramSentMessage `json:"sent_messages,omitempty"`
+}
+
+type telegramSentMessage struct {
+	ChatID    int64 `json:"chat_id"`
+	MessageID int   `json:"message_id"`
 }
 
 type deleteConfirmationState struct {
@@ -128,6 +136,16 @@ type deleteConfirmationManager struct {
 type telegramUpdateResponse struct {
 	OK     bool             `json:"ok"`
 	Result []telegramUpdate `json:"result"`
+}
+
+type telegramSendMessageResponse struct {
+	OK     bool `json:"ok"`
+	Result struct {
+		MessageID int `json:"message_id"`
+		Chat      struct {
+			ID int64 `json:"id"`
+		} `json:"chat"`
+	} `json:"result"`
 }
 
 type telegramUpdate struct {
@@ -184,8 +202,8 @@ func newDeleteConfirmationManager(cfg DeleteConfirmationConfig) (*deleteConfirma
 	if !cfg.Enabled {
 		return &deleteConfirmationManager{enabled: false}, nil
 	}
-	if !isTelegramConfigConfigured(config.Telegram) {
-		return &deleteConfirmationManager{enabled: false}, fmt.Errorf("delete confirmation requires global telegram.bot_token and chat_ids")
+	if strings.TrimSpace(config.Telegram.BotToken) == "" || len(resolveDeleteConfirmationChatIDs()) == 0 {
+		return &deleteConfirmationManager{enabled: false}, fmt.Errorf("delete confirmation requires global telegram.bot_token and at least one delete_confirmation.chat_ids or global telegram.chat_ids")
 	}
 	if len(cfg.Rules) == 0 {
 		return &deleteConfirmationManager{enabled: false}, fmt.Errorf("delete confirmation enabled but no rules configured")
@@ -459,7 +477,8 @@ func (m *deleteConfirmationManager) sendApprovalMessage(group deleteConfirmation
 	}
 
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", config.Telegram.BotToken)
-	for _, chatID := range config.Telegram.ChatIDs {
+	sentMessages := make([]telegramSentMessage, 0)
+	for _, chatID := range resolveDeleteConfirmationChatIDs() {
 		values := url.Values{}
 		values.Add("chat_id", chatID)
 		values.Add("text", message)
@@ -475,8 +494,31 @@ func (m *deleteConfirmationManager) sendApprovalMessage(group deleteConfirmation
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("telegram sendMessage status %d: %s", resp.StatusCode, string(body))
 		}
+		var sendResult telegramSendMessageResponse
+		if err := json.Unmarshal(body, &sendResult); err != nil {
+			return err
+		}
+		if sendResult.OK {
+			sentMessages = append(sentMessages, telegramSentMessage{
+				ChatID:    sendResult.Result.Chat.ID,
+				MessageID: sendResult.Result.MessageID,
+			})
+		}
 	}
 
+	if len(sentMessages) > 0 {
+		if err := m.withStateLock(func(state *deleteConfirmationState) error {
+			current := state.Groups[group.ID]
+			if current.ID != "" {
+				current.MessageText = message
+				current.SentMessages = append(current.SentMessages, sentMessages...)
+				state.Groups[group.ID] = current
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -553,7 +595,7 @@ func (m *deleteConfirmationManager) pollTelegramCallbacks() {
 }
 
 func fetchTelegramUpdates(offset int) ([]telegramUpdate, error) {
-	if !isTelegramConfigConfigured(config.Telegram) {
+	if strings.TrimSpace(config.Telegram.BotToken) == "" {
 		return nil, nil
 	}
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates", config.Telegram.BotToken)
@@ -596,6 +638,8 @@ func (m *deleteConfirmationManager) handleTelegramCallback(callback telegramCall
 	var answer string
 	var approved bool
 	var rejected bool
+	var messageText string
+	var sentMessages []telegramSentMessage
 
 	err := m.withStateLock(func(state *deleteConfirmationState) error {
 		m.cleanupExpiredLocked(state, time.Now())
@@ -652,6 +696,8 @@ func (m *deleteConfirmationManager) handleTelegramCallback(callback telegramCall
 			answer = "已拒绝，删除继续被拦截。"
 		}
 		state.Groups[groupID] = group
+		messageText = group.MessageText
+		sentMessages = append([]telegramSentMessage(nil), group.SentMessages...)
 		return nil
 	})
 	if err != nil {
@@ -665,7 +711,7 @@ func (m *deleteConfirmationManager) handleTelegramCallback(callback telegramCall
 		if rejected {
 			status = "已拒绝"
 		}
-		_ = editTelegramMessageReplyMarkup(callback.Message.Chat.ID, callback.Message.MessageID, status)
+		m.syncApprovalMessagesAfterCallback(callback.Message.Chat.ID, callback.Message.MessageID, status, messageText, sentMessages)
 	}
 }
 
@@ -678,6 +724,30 @@ func (m *deleteConfirmationManager) telegramOffset() (int, error) {
 	return offset, err
 }
 
+func (m *deleteConfirmationManager) syncApprovalMessagesAfterCallback(clickedChatID int64, clickedMessageID int, status string, messageText string, sentMessages []telegramSentMessage) {
+	for _, sent := range sentMessages {
+		if sent.ChatID == clickedChatID && sent.MessageID == clickedMessageID {
+			if err := editTelegramMessageText(sent.ChatID, sent.MessageID, appendApprovalStatus(messageText, status)); err != nil {
+				klog.Errorf("Failed to update clicked delete confirmation message: %v", err)
+				_ = editTelegramMessageReplyMarkup(sent.ChatID, sent.MessageID, status)
+			}
+			continue
+		}
+
+		if err := deleteTelegramMessage(sent.ChatID, sent.MessageID); err != nil {
+			klog.Errorf("Failed to delete stale delete confirmation message in chat %d message %d: %v", sent.ChatID, sent.MessageID, err)
+		}
+	}
+}
+
+func appendApprovalStatus(messageText string, status string) string {
+	if strings.TrimSpace(messageText) == "" {
+		return fmt.Sprintf("*状态*: `%s`", escapeMarkdownV2(status))
+	}
+
+	return messageText + "\n\n" + fmt.Sprintf("*状态*: `%s`", escapeMarkdownV2(status))
+}
+
 func (m *deleteConfirmationManager) setTelegramOffset(offset int) error {
 	return m.withStateLock(func(state *deleteConfirmationState) error {
 		if offset > state.TelegramOffset {
@@ -688,7 +758,7 @@ func (m *deleteConfirmationManager) setTelegramOffset(offset int) error {
 }
 
 func answerTelegramCallback(callbackID string, text string) {
-	if strings.TrimSpace(callbackID) == "" || !isTelegramConfigConfigured(config.Telegram) {
+	if strings.TrimSpace(callbackID) == "" || strings.TrimSpace(config.Telegram.BotToken) == "" {
 		return
 	}
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/answerCallbackQuery", config.Telegram.BotToken)
@@ -706,7 +776,7 @@ func answerTelegramCallback(callbackID string, text string) {
 }
 
 func editTelegramMessageReplyMarkup(chatID int64, messageID int, status string) error {
-	if !isTelegramConfigConfigured(config.Telegram) {
+	if strings.TrimSpace(config.Telegram.BotToken) == "" {
 		return nil
 	}
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/editMessageReplyMarkup", config.Telegram.BotToken)
@@ -722,6 +792,49 @@ func editTelegramMessageReplyMarkup(chatID int64, messageID int, status string) 
 	body, _ := ioutil.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("editMessageReplyMarkup %s status %d: %s", status, resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+func editTelegramMessageText(chatID int64, messageID int, text string) error {
+	if strings.TrimSpace(config.Telegram.BotToken) == "" {
+		return nil
+	}
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/editMessageText", config.Telegram.BotToken)
+	values := url.Values{}
+	values.Add("chat_id", strconv.FormatInt(chatID, 10))
+	values.Add("message_id", strconv.Itoa(messageID))
+	values.Add("text", text)
+	values.Add("parse_mode", "MarkdownV2")
+	values.Add("reply_markup", `{"inline_keyboard":[]}`)
+	resp, err := httpClient.PostForm(apiURL, values)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := ioutil.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("editMessageText status %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+func deleteTelegramMessage(chatID int64, messageID int) error {
+	if strings.TrimSpace(config.Telegram.BotToken) == "" {
+		return nil
+	}
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/deleteMessage", config.Telegram.BotToken)
+	values := url.Values{}
+	values.Add("chat_id", strconv.FormatInt(chatID, 10))
+	values.Add("message_id", strconv.Itoa(messageID))
+	resp, err := httpClient.PostForm(apiURL, values)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := ioutil.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("deleteMessage status %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
 }
@@ -926,6 +1039,13 @@ func normalizeTelegramIDs(ids []string) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+func resolveDeleteConfirmationChatIDs() []string {
+	if len(config.DeleteConfirmation.ChatIDs) > 0 {
+		return normalizeTelegramIDs(config.DeleteConfirmation.ChatIDs)
+	}
+	return normalizeTelegramIDs(config.Telegram.ChatIDs)
 }
 
 func stringSliceContains(values []string, target string) bool {

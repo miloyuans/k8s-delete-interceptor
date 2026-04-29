@@ -135,8 +135,10 @@ If the generated update diff is too large for a concise Telegram message, the me
 Delete confirmation adds a two-step approval flow for protected resources:
 
 - the first matching delete is denied and queued for Telegram approval
+- `delete_confirmation.chat_ids` can target one or more approval groups; when omitted, the global `telegram.chat_ids` are used
 - matching requests are grouped for `aggregate_window_seconds` so batch deletes produce one approval message
 - only configured `telegram_ids` can approve or reject the inline buttons
+- when one group confirms or rejects, that group's message is updated with the result and the same pending approval messages in other groups are deleted
 - after approval, the same Kubernetes user must retry the delete
 - every approved resource is allowed once, consumed immediately, and expires after `consume_window_seconds`
 - extra resources in a later retry trigger a new approval, while already approved resources are consumed one by one

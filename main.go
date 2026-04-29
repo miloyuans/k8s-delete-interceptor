@@ -76,6 +76,10 @@ type UserPolicyRule struct {
 	Users  []string `json:"users" yaml:"users"`
 }
 
+type GlobalWhitelistConfig struct {
+	Users []string `json:"users" yaml:"users"`
+}
+
 type NotificationContext struct {
 	Title          string
 	TitleIcon      string
@@ -102,14 +106,15 @@ type NotificationContext struct {
 }
 
 type Config struct {
-	Enabled      bool             `json:"enabled" yaml:"enabled"`
-	ClusterName  string           `json:"cluster_name" yaml:"cluster_name"`
-	Telegram     TelegramConfig   `json:"telegram" yaml:"telegram"`
-	Protected    []ProtectedRule  `json:"protected" yaml:"protected"`
-	UserPolicies []UserPolicyRule `json:"user_policies" yaml:"user_policies"`
-	Audit        AuditConfig      `json:"audit" yaml:"audit"`
-	Lifecycle    LifecycleConfig  `json:"lifecycle" yaml:"lifecycle"`
-	Notifications NotificationControlConfig `json:"notifications" yaml:"notifications"`
+	Enabled           bool                      `json:"enabled" yaml:"enabled"`
+	ClusterName       string                    `json:"cluster_name" yaml:"cluster_name"`
+	Telegram          TelegramConfig            `json:"telegram" yaml:"telegram"`
+	Protected         []ProtectedRule           `json:"protected" yaml:"protected"`
+	UserPolicies      []UserPolicyRule          `json:"user_policies" yaml:"user_policies"`
+	GlobalWhitelist   GlobalWhitelistConfig     `json:"global_whitelist" yaml:"global_whitelist"`
+	Audit             AuditConfig               `json:"audit" yaml:"audit"`
+	Lifecycle         LifecycleConfig           `json:"lifecycle" yaml:"lifecycle"`
+	Notifications     NotificationControlConfig `json:"notifications" yaml:"notifications"`
 	DeleteConfirmation DeleteConfirmationConfig `json:"delete_confirmation" yaml:"delete_confirmation"`
 }
 
@@ -184,6 +189,22 @@ func matchUserPolicy(user string) (bool, string, string, string) {
 	}
 
 	return false, "", "", ""
+}
+
+func matchGlobalWhitelist(user string) (bool, string, string) {
+	for _, pattern := range config.GlobalWhitelist.Users {
+		matched, matcher, err := matchPattern(pattern, user)
+		if err != nil {
+			klog.Errorf("Invalid global whitelist pattern '%s': %v. This pattern will be skipped.", pattern, err)
+			continue
+		}
+
+		if matched {
+			return true, pattern, matcher
+		}
+	}
+
+	return false, "", ""
 }
 
 func formatResource(kind string, name string, namespace string) string {
@@ -876,6 +897,14 @@ func validate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Protected DELETE requests first honor the global whitelist, then the delete confirmation rules.
+	if matched, pattern, matcher := matchGlobalWhitelist(user); matched {
+		allowReason := fmt.Sprintf("Delete request bypassed all controls for %s: user '%s' matched global whitelist pattern '%s' (%s). Audit recorded only.", resourceDesc, user, pattern, matcher)
+		klog.Infof("[Request %s] Allowed by global whitelist: %s", reqUID, allowReason)
+		emitAuditRecord(review.Request, auditDecisionAllowed, allowReason, fmt.Sprintf("%s:%s", auditPolicyGlobalWhitelist, pattern), false, "")
+		sendResponse(w, reqUID, true, allowReason)
+		return
+	} else if false {
 	if matched, action, pattern, matcher := matchUserPolicy(user); matched {
 		switch action {
 		case userActionAllow:
@@ -900,6 +929,7 @@ func validate(w http.ResponseWriter, r *http.Request) {
 			sendResponse(w, reqUID, false, denyReason)
 			return
 		}
+	}
 	}
 
 	allowed := true
@@ -1063,6 +1093,11 @@ func main() {
 			klog.Infof("Loaded %d user policy rules", len(config.UserPolicies))
 		} else {
 			klog.Infof("No user policy rules configured.")
+		}
+		if len(config.GlobalWhitelist.Users) > 0 {
+			klog.Infof("Loaded %d global whitelist user patterns", len(config.GlobalWhitelist.Users))
+		} else {
+			klog.Infof("No global whitelist user patterns configured.")
 		}
 	} else {
 		klog.Warning("Global interceptor is DISABLED. All deletion requests will be allowed.")

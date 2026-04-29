@@ -180,6 +180,13 @@ func safeFileNamePart(value string) string {
 }
 
 func handleCreateOrUpdateAuditV2(req *v1.AdmissionRequest) {
+	if matched, pattern, matcher := matchGlobalWhitelist(req.UserInfo.Username); matched {
+		resourceDesc := formatResource(req.Kind.Kind, req.Name, req.Namespace)
+		reason := fmt.Sprintf("%s request bypassed all controls for %s: user '%s' matched global whitelist pattern '%s' (%s). Audit recorded only.", strings.ToUpper(string(req.Operation)), resourceDesc, req.UserInfo.Username, pattern, matcher)
+		emitAuditRecord(req, auditDecisionAllowed, reason, fmt.Sprintf("%s:%s", auditPolicyGlobalWhitelist, pattern), false, "")
+		return
+	}
+
 	if !isAuditOperationEnabled(req.Operation) {
 		return
 	}

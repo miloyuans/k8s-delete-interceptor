@@ -31,6 +31,7 @@ const (
 	auditPolicyCreateAudit      = "create_audit"
 	auditPolicyUpdateAudit      = "update_audit"
 	auditPolicyDeleteAudit      = "delete_audit"
+	auditPolicyGlobalWhitelist  = "global_whitelist"
 	auditPolicyInterceptorOff   = "interceptor_disabled"
 	auditPolicySelfPreservation = "self_preservation"
 	auditSourceWebhook          = "admission-webhook"
@@ -616,6 +617,13 @@ func emitLifecycleAuditRecord(event string, reason string, notified bool, notifi
 }
 
 func handleCreateOrUpdateAudit(req *v1.AdmissionRequest) {
+	if matched, pattern, matcher := matchGlobalWhitelist(req.UserInfo.Username); matched {
+		resourceDesc := formatResource(req.Kind.Kind, req.Name, req.Namespace)
+		reason := fmt.Sprintf("%s request bypassed all controls for %s: user '%s' matched global whitelist pattern '%s' (%s). Audit recorded only.", strings.ToUpper(string(req.Operation)), resourceDesc, req.UserInfo.Username, pattern, matcher)
+		emitAuditRecord(req, auditDecisionAllowed, reason, fmt.Sprintf("%s:%s", auditPolicyGlobalWhitelist, pattern), false, "")
+		return
+	}
+
 	if !isAuditOperationEnabled(req.Operation) {
 		return
 	}

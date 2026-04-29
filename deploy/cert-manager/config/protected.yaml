@@ -40,6 +40,11 @@ delete_confirmation:
       telegram_ids:
         - "123456789"
 
+global_whitelist:
+  users:
+    - "*breakglass*"
+    - "*admin-*"
+
 audit:
   enabled: true
   directory: /var/log/k8s-delete-interceptor

@@ -41,18 +41,14 @@ spec:
             - name: https
               containerPort: 8443
           livenessProbe:
-            httpGet:
-              path: /healthz
+            tcpSocket:
               port: https
-              scheme: HTTPS
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 2
           readinessProbe:
-            httpGet:
-              path: /healthz
+            tcpSocket:
               port: https
-              scheme: HTTPS
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 2

@@ -43,10 +43,13 @@ Review and update `config/protected.yaml` before installation:
 - `audit.update.notify_users`
 - `audit.update.notify_resources`
 - `delete_confirmation`
+- `global_whitelist`
 - `lifecycle`
 - `lifecycle.telegram`
 - `user_policies`
 - `protected`
+
+For example, `global_whitelist.users: ["*milo*", "regex:^system:serviceaccount:.*:breakglass-.*$"]` will match the full Kubernetes username with the same glob or regex semantics used elsewhere in the config.
 
 If you do not want Telegram, leave `bot_token` empty and keep `chat_ids` empty.
 The sample Deployment mounts `audit.directory` from a PVC.
@@ -135,6 +138,10 @@ If the generated update diff is too large for a concise Telegram message, the me
 Delete confirmation adds a two-step approval flow for protected resources:
 
 - the first matching delete is denied and queued for Telegram approval
+- delete confirmation user matching is controlled only by `delete_confirmation.rules.users`
+- `global_whitelist.users` uses the same glob and `regex:` matching model as the other user filters
+- global `user_policies` are not used for protected delete confirmation decisions
+- users matched by `global_whitelist.users` bypass delete confirmation, protected delete interception, and audit Telegram notifications; the request is only recorded in the audit log
 - `delete_confirmation.chat_ids` can target one or more approval groups; when omitted, the global `telegram.chat_ids` are used
 - matching requests are grouped for `aggregate_window_seconds` so batch deletes produce one approval message
 - only configured `telegram_ids` can approve or reject the inline buttons
@@ -222,9 +229,8 @@ Create a protected object name in `config/protected.yaml`, then try to delete it
 Expected behavior:
 
 - normal users still follow the `protected` rules
-- `allow` users are allowed without notification
-- `observe` users are allowed and notified
-- `deny` users are blocked and notified
+- `global_whitelist.users` bypass all control logic and only leave audit records
+- users matched by `delete_confirmation.rules.users` enter the Telegram approval flow when they delete protected resources
 
 ## Uninstall
 

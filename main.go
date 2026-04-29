@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -91,6 +93,11 @@ type NotificationContext struct {
 	Name           string
 	Namespace      string
 	Resource       string
+	ResourceType   string
+	ResourceName   string
+	ChangeDetails string
+	AttachmentName string
+	AttachmentContent string
 	RequestUID     string
 }
 
@@ -103,6 +110,7 @@ type Config struct {
 	Audit        AuditConfig      `json:"audit" yaml:"audit"`
 	Lifecycle    LifecycleConfig  `json:"lifecycle" yaml:"lifecycle"`
 	Notifications NotificationControlConfig `json:"notifications" yaml:"notifications"`
+	DeleteConfirmation DeleteConfirmationConfig `json:"delete_confirmation" yaml:"delete_confirmation"`
 }
 
 var config Config
@@ -202,6 +210,15 @@ func formatNamespace(namespace string) string {
 	return namespace
 }
 
+func formatNotificationUser(user string) string {
+	parts := strings.Split(user, ":")
+	if len(parts) == 4 && parts[0] == "system" && parts[1] == "serviceaccount" {
+		return parts[3]
+	}
+
+	return user
+}
+
 func isSelfManagedAdmissionResource(kind string, name string) bool {
 	return strings.EqualFold(kind, "ValidatingWebhookConfiguration") && name == "delete-interceptor.k8s.io"
 }
@@ -256,7 +273,7 @@ func buildNotificationContext(reqUID types.UID, user string, kind string, name s
 		Action:         action,
 		ActionIcon:     displayNotificationActionIcon(action),
 		ActionLabel:    actionLabel,
-		User:           user,
+		User:           formatNotificationUser(user),
 		Operation:      operation,
 		OperationType:  strings.ToUpper(strings.TrimSpace(operation)),
 		OperationLabel: displayNotificationOperationLabel(operation),
@@ -267,6 +284,9 @@ func buildNotificationContext(reqUID types.UID, user string, kind string, name s
 		Name:           name,
 		Namespace:      formatNamespace(namespace),
 		Resource:       formatResource(kind, name, namespace),
+		ResourceType:   kind,
+		ResourceName:   name,
+		ChangeDetails: reason,
 		RequestUID:     string(reqUID),
 	}
 }
@@ -443,7 +463,7 @@ func buildSmartNotificationContext(reqUID types.UID, user string, kind string, n
 		Action:         action,
 		ActionIcon:     displayNotificationActionIcon(action),
 		ActionLabel:    displayNotificationActionLabel(action),
-		User:           user,
+		User:           formatNotificationUser(user),
 		Operation:      operation,
 		OperationType:  strings.ToUpper(strings.TrimSpace(operationType)),
 		OperationLabel: displayNotificationOperationLabel(operationType),
@@ -454,6 +474,9 @@ func buildSmartNotificationContext(reqUID types.UID, user string, kind string, n
 		Name:           name,
 		Namespace:      formatNamespace(namespace),
 		Resource:       formatResource(kind, name, namespace),
+		ResourceType:   kind,
+		ResourceName:   name,
+		ChangeDetails: reason,
 		RequestUID:     string(reqUID),
 	}
 }
@@ -480,6 +503,9 @@ func renderNotificationTemplate(template string, ctx NotificationContext) string
 		"name":         escapeMarkdownV2(ctx.Name),
 		"namespace":    escapeMarkdownV2(ctx.Namespace),
 		"resource":     escapeMarkdownV2(ctx.Resource),
+		"resource_type": escapeMarkdownV2(ctx.ResourceType),
+		"resource_name": escapeMarkdownV2(ctx.ResourceName),
+		"change_details": escapeMarkdownV2(ctx.ChangeDetails),
 		"request_uid":  escapeMarkdownV2(ctx.RequestUID),
 	}
 
@@ -501,6 +527,9 @@ func renderNotificationTemplate(template string, ctx NotificationContext) string
 			"{{name}}", values["name"],
 			"{{namespace}}", values["namespace"],
 			"{{resource}}", values["resource"],
+			"{{resource_type}}", values["resource_type"],
+			"{{resource_name}}", values["resource_name"],
+			"{{change_details}}", values["change_details"],
 			"{{request_uid}}", values["request_uid"],
 		}
 		return strings.NewReplacer(replacerArgs...).Replace(template)
@@ -671,6 +700,11 @@ func sendTelegramNotificationWithConfigMode(channel string, telegramCfg Telegram
 				klog.Errorf("Telegram API error for chatID %s. Status: %d, Response: %s", chatID, resp.StatusCode, string(body))
 			} else {
 				klog.Infof("Telegram notification successfully sent to chatID %s", chatID)
+				if ctx.AttachmentContent != "" {
+					if err := sendTelegramDocument(telegramCfg.BotToken, chatID, ctx.AttachmentName, ctx.AttachmentContent); err != nil {
+						klog.Errorf("Failed to send Telegram attachment to chatID %s: %v", chatID, err)
+					}
+				}
 			}
 		}
 	}
@@ -724,10 +758,61 @@ func deliverTelegramNotification(telegramCfg TelegramConfig, ctx NotificationCon
 
 		successCount++
 		klog.Infof("Telegram notification successfully sent to chatID %s", chatID)
+		if ctx.AttachmentContent != "" {
+			if err := sendTelegramDocument(telegramCfg.BotToken, chatID, ctx.AttachmentName, ctx.AttachmentContent); err != nil {
+				klog.Errorf("Failed to send Telegram attachment to chatID %s: %v", chatID, err)
+				failures = append(failures, fmt.Sprintf("chatID %s document failed: %v", chatID, err))
+				continue
+			}
+		}
 	}
 
-	if successCount == 0 && len(failures) > 0 {
+	if (successCount == 0 || ctx.AttachmentContent != "") && len(failures) > 0 {
 		return fmt.Errorf(strings.Join(failures, "; "))
+	}
+
+	return nil
+}
+
+func sendTelegramDocument(botToken string, chatID string, fileName string, content string) error {
+	if strings.TrimSpace(fileName) == "" {
+		fileName = "k8s-change-details.txt"
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+
+	if err := writer.WriteField("chat_id", chatID); err != nil {
+		return err
+	}
+
+	part, err := writer.CreateFormFile("document", fileName)
+	if err != nil {
+		return err
+	}
+	if _, err := part.Write([]byte(content)); err != nil {
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", botToken)
+	req, err := http.NewRequest(http.MethodPost, apiURL, &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := ioutil.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("telegram document api status %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	return nil
@@ -766,7 +851,7 @@ func validate(w http.ResponseWriter, r *http.Request) {
 	klog.V(4).Infof("[Request %s] Received: User=%s, Op=%s, Resource=%s/%s, NS=%s", reqUID, user, operation, kind, name, namespace)
 
 	if review.Request.Operation == v1.Create || review.Request.Operation == v1.Update {
-		handleCreateOrUpdateAudit(review.Request)
+		handleCreateOrUpdateAuditV2(review.Request)
 		sendResponse(w, reqUID, true, "")
 		return
 	}
@@ -800,17 +885,18 @@ func validate(w http.ResponseWriter, r *http.Request) {
 			sendResponse(w, reqUID, true, "")
 			return
 		case userActionObserve:
-			reason := fmt.Sprintf("Observed delete request for %s: user '%s' matched user policy pattern '%s' (%s). Operation allowed.", resourceDesc, user, pattern, matcher)
+			reason := fmt.Sprintf("触发删除观察策略，操作已放行。资源: %s。", resourceDesc)
 			klog.Infof("[Request %s] Observed: %s", reqUID, reason)
 			sendTelegramNotification(buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "observed", reason))
-			emitAuditRecord(review.Request, auditDecisionAllowed, reason, fmt.Sprintf("delete_user_policy_observe:%s", pattern), true, reason)
+			emitAuditRecord(review.Request, auditDecisionAllowed, fmt.Sprintf("Observed delete request for %s: user '%s' matched user policy pattern '%s' (%s). Operation allowed.", resourceDesc, user, pattern, matcher), fmt.Sprintf("delete_user_policy_observe:%s", pattern), true, reason)
 			sendResponse(w, reqUID, true, "")
 			return
 		case userActionDeny:
 			denyReason := fmt.Sprintf("User policy blocked delete for %s: user '%s' matched user policy pattern '%s' (%s).", resourceDesc, user, pattern, matcher)
+			notificationReason := fmt.Sprintf("触发用户删除策略拦截。资源: %s。", resourceDesc)
 			klog.Warningf("[Request %s] DENIED: %s", reqUID, denyReason)
-			sendTelegramNotification(buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "blocked", denyReason))
-			emitAuditRecord(review.Request, auditDecisionBlocked, denyReason, fmt.Sprintf("delete_user_policy_deny:%s", pattern), true, denyReason)
+			sendTelegramNotification(buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "blocked", notificationReason))
+			emitAuditRecord(review.Request, auditDecisionBlocked, denyReason, fmt.Sprintf("delete_user_policy_deny:%s", pattern), true, notificationReason)
 			sendResponse(w, reqUID, false, denyReason)
 			return
 		}
@@ -832,11 +918,26 @@ func validate(w http.ResponseWriter, r *http.Request) {
 				if g.Match(target) {
 					allowed = false
 					denyReason = fmt.Sprintf("Protected resource: Cannot delete %s '%s' (matched pattern: '%s').", kind, target, pattern)
+					notificationReason := fmt.Sprintf("触发重要资源删除拦截：%s。", resourceDesc)
 
 					klog.Warningf("[Request %s] DENIED: %s. User: %s, Resource: %s/%s, NS: %s", reqUID, denyReason, user, kind, name, namespace)
 
-					sendTelegramNotification(buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "blocked", denyReason))
-					emitAuditRecord(review.Request, auditDecisionBlocked, denyReason, fmt.Sprintf("protected_rule:%s", pattern), true, denyReason)
+					if approved, approvalReason := deleteConfirmer.ConsumeApproval(review.Request); approved {
+						klog.Infof("[Request %s] Allowed by Telegram delete confirmation: %s", reqUID, approvalReason)
+						emitAuditRecord(review.Request, auditDecisionAllowed, approvalReason, fmt.Sprintf("delete_confirmation_approved:%s", pattern), false, "")
+						sendResponse(w, reqUID, true, "")
+						return
+					}
+
+					if pending, pendingReason, pendingPolicy := deleteConfirmer.RequestApproval(review.Request, pattern); pending {
+						klog.Infof("[Request %s] Delete requires Telegram confirmation: %s", reqUID, pendingReason)
+						emitAuditRecord(review.Request, auditDecisionBlocked, pendingReason, pendingPolicy, true, pendingReason)
+						sendResponse(w, reqUID, false, pendingReason)
+						return
+					}
+
+					sendTelegramNotification(buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "blocked", notificationReason))
+					emitAuditRecord(review.Request, auditDecisionBlocked, denyReason, fmt.Sprintf("protected_rule:%s", pattern), true, notificationReason)
 
 					goto respond
 				}
@@ -893,6 +994,7 @@ func main() {
 	}
 	applyNotificationDefaults()
 	applyLifecycleDefaults()
+	applyDeleteConfirmationDefaults()
 
 	auditor, err := newAuditManager(config.Audit)
 	if err != nil {
@@ -911,6 +1013,13 @@ func main() {
 		klog.Fatalf("Failed to initialize notification manager: %v", err)
 	}
 	notifier = notificationMgr
+
+	deleteConfirmationMgr, err := newDeleteConfirmationManager(config.DeleteConfirmation)
+	if err != nil {
+		klog.Fatalf("Failed to initialize delete confirmation manager: %v", err)
+	}
+	deleteConfirmer = deleteConfirmationMgr
+	defer deleteConfirmer.Stop()
 	defer func() {
 		if r := recover(); r != nil {
 			if serviceLifecycle != nil {
@@ -985,6 +1094,11 @@ func main() {
 		}))
 	} else {
 		klog.Infof("Lifecycle notifications disabled.")
+	}
+	if config.DeleteConfirmation.Enabled {
+		klog.Infof("Delete confirmation enabled. State directory: %s, TTL: %ds, Consume window: %ds, Aggregate window: %ds, Rules: %d", config.DeleteConfirmation.StateDirectory, config.DeleteConfirmation.TTLSeconds, config.DeleteConfirmation.ConsumeWindowSeconds, config.DeleteConfirmation.AggregateWindowSeconds, len(config.DeleteConfirmation.Rules))
+	} else {
+		klog.Infof("Delete confirmation disabled.")
 	}
 	klog.Infof("Notification control enabled. Dedupe window: %ds, Retry failed on startup: %v, Max retry batch: %d", config.Notifications.DedupeWindowSeconds, config.Notifications.RetryFailedOnStartup, config.Notifications.MaxRetryBatch)
 	klog.Info("=========================================================")

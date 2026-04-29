@@ -82,6 +82,9 @@ spec:
             - name: audit
               mountPath: /var/log/k8s-delete-interceptor
               subPathExpr: $(POD_NAME)
+            - name: audit
+              mountPath: /var/lib/k8s-delete-interceptor
+              subPath: shared
       volumes:
         - name: config
           configMap:

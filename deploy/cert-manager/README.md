@@ -42,6 +42,7 @@ Review and update `config/protected.yaml` before installation:
 - `audit.create.notify_resources`
 - `audit.update.notify_users`
 - `audit.update.notify_resources`
+- `delete_confirmation`
 - `lifecycle`
 - `lifecycle.telegram`
 - `user_policies`
@@ -51,6 +52,7 @@ If you do not want Telegram, leave `bot_token` empty and keep `chat_ids` empty.
 The sample Deployment mounts `audit.directory` from a PVC.
 With `replicas: 2`, use a RWX-capable storage class.
 The sample mounts the same PVC into a pod-specific subdirectory, so each replica keeps its own audit files and does not append into the same log file.
+Delete confirmation state is mounted from the same PVC into `/var/lib/k8s-delete-interceptor` using the shared `subPath: shared`, so both replicas can see the same pending approval and one-time authorization pool.
 
 ## 3. Apply the namespace
 
@@ -125,6 +127,19 @@ The `webhook-system` namespace is treated as the webhook's own management namesp
 Audit files are split by event type in the writable log directory, for example `audit-YYYY-MM-DD-create.jsonl`, `audit-YYYY-MM-DD-update.jsonl`, `audit-YYYY-MM-DD-delete.jsonl`, and `audit-YYYY-MM-DD-lifecycle.jsonl`.
 Telegram templates can use `{{title_icon}}` and `{{action_icon}}` so startup, shutdown, intercept, create, update, and allow messages are visually distinct at a glance.
 The sample templates also place the title and timestamp on the last line, for example `{{title_icon}} *{{title}}*   \`{{time}}\``.
+The notification context also exposes `{{resource_type}}`, `{{resource_name}}`, `{{namespace}}`, and `{{change_details}}`.
+For update audit notifications, the webhook compares `oldObject` and `object` from the AdmissionReview and only lists changed fields.
+Common Kubernetes metadata noise such as `managedFields`, `resourceVersion`, and `last-applied-configuration` is omitted from the diff.
+If the generated update diff is too large for a concise Telegram message, the message states that details were attached and sends the full diff as a text document.
+
+Delete confirmation adds a two-step approval flow for protected resources:
+
+- the first matching delete is denied and queued for Telegram approval
+- matching requests are grouped for `aggregate_window_seconds` so batch deletes produce one approval message
+- only configured `telegram_ids` can approve or reject the inline buttons
+- after approval, the same Kubernetes user must retry the delete
+- every approved resource is allowed once, consumed immediately, and expires after `consume_window_seconds`
+- extra resources in a later retry trigger a new approval, while already approved resources are consumed one by one
 
 Notification control applies to Telegram delivery across delete, audit, and lifecycle messages:
 

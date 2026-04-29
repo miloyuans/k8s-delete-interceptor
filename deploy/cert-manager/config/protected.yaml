@@ -8,10 +8,13 @@ telegram:
   notification_template: |
     *动作*: {{action_icon}} `{{action_label}}`
     *集群*: `{{cluster}}`
-    *资源*: `{{resource}}`
+    *资源类型*: `{{resource_type}}`
+    *资源名称*: `{{resource_name}}`
+    *命名空间*: `{{namespace}}`
     *用户*: `{{user}}`
     *操作*: `{{operation_label}}`
-    *原因*: {{reason}}
+    *变更详情*:
+    {{change_details}}
     *请求ID*: `{{request_uid}}`
 
     {{title_icon}} *{{title}}*   `{{time}}`
@@ -20,6 +23,20 @@ notifications:
   dedupe_window_seconds: 300
   retry_failed_on_startup: true
   max_retry_batch: 50
+
+delete_confirmation:
+  enabled: true
+  state_directory: /var/lib/k8s-delete-interceptor
+  ttl_seconds: 300
+  consume_window_seconds: 60
+  aggregate_window_seconds: 2
+  poll_interval_seconds: 2
+  max_items_per_message: 20
+  rules:
+    - users:
+        - "*k8s-cicd-sa*"
+      telegram_ids:
+        - "123456789"
 
 audit:
   enabled: true
@@ -32,10 +49,13 @@ audit:
     notification_template: |
       *动作*: {{action_icon}} `{{action_label}}`
       *集群*: `{{cluster}}`
-      *资源*: `{{resource}}`
+      *资源类型*: `{{resource_type}}`
+      *资源名称*: `{{resource_name}}`
+      *命名空间*: `{{namespace}}`
       *用户*: `{{user}}`
       *操作*: `{{operation_label}}`
-      *原因*: {{reason}}
+      *变更详情*:
+      {{change_details}}
       *请求ID*: `{{request_uid}}`
 
       {{title_icon}} *{{title}}*   `{{time}}`
@@ -109,7 +129,8 @@ lifecycle:
       *集群*: `{{cluster}}`
       *实例*: `{{resource}}`
       *操作*: `{{operation_label}}`
-      *原因*: {{reason}}
+      *变更详情*:
+      {{change_details}}
 
       {{title_icon}} *{{title}}*   `{{time}}`
 

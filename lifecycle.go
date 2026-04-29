@@ -200,6 +200,9 @@ func (m *lifecycleManager) buildNotificationContext(event string, reason string)
 		Name:           lifecycleComponentName,
 		Namespace:      formatNamespace(webhookNs),
 		Resource:       formatResource(lifecycleComponentKind, lifecycleComponentName, webhookNs),
+		ResourceType:   lifecycleComponentKind,
+		ResourceName:   lifecycleComponentName,
+		ChangeDetails:  reason,
 		RequestUID:     "",
 	}
 }

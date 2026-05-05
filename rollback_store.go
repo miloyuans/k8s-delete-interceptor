@@ -146,7 +146,10 @@ func rollbackStoreErrorForNoMatch(id string, current RollbackRecord, loadErr err
 	return fmt.Errorf("rollback record %s cannot be updated from status %q", id, current.ExecutionStatus)
 }
 
-func isRollbackRunningStale(record RollbackRecord, now time.Time, timeout time.Duration) bool {
+func isRollbackRunningStale(record *RollbackRecord, now time.Time, timeout time.Duration) bool {
+	if record == nil {
+		return false
+	}
 	if record.ExecutionStatus != rollbackStatusRunning {
 		return false
 	}

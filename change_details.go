@@ -179,7 +179,7 @@ func safeFileNamePart(value string) string {
 	return replacer.Replace(value)
 }
 
-func handleCreateOrUpdateAuditV2(req *v1.AdmissionRequest) {
+func handleCreateOrUpdateAuditV2(req *v1.AdmissionRequest, rollbackID string) {
 	if matched, pattern, matcher := matchGlobalWhitelist(req.UserInfo.Username); matched {
 		resourceDesc := formatResource(req.Kind.Kind, req.Name, req.Namespace)
 		reason := fmt.Sprintf("%s request bypassed all controls for %s: user '%s' matched global whitelist pattern '%s' (%s). Audit recorded only.", strings.ToUpper(string(req.Operation)), resourceDesc, req.UserInfo.Username, pattern, matcher)
@@ -219,6 +219,7 @@ func handleCreateOrUpdateAuditV2(req *v1.AdmissionRequest) {
 		ctx.ChangeDetails = changeDetails
 		ctx.AttachmentName = attachmentName
 		ctx.AttachmentContent = attachmentContent
+		ctx.RollbackID = rollbackID
 		sendAuditTelegramNotification(ctx)
 		notified = true
 		matchedPolicy = fmt.Sprintf("%s_notify:%s|%s", strings.ToLower(string(req.Operation)), userPattern, resourcePattern)

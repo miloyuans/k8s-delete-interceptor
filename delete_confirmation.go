@@ -85,6 +85,7 @@ type deleteConfirmationEntry struct {
 	Namespace        string                        `json:"namespace"`
 	ResourceDisplay  string                        `json:"resource_display"`
 	MatchedPattern   string                        `json:"matched_pattern"`
+	RollbackID       string                        `json:"rollback_id,omitempty"`
 }
 
 type deleteConfirmationGroup struct {
@@ -307,7 +308,7 @@ func (m *deleteConfirmationManager) ConsumeApproval(req *v1.AdmissionRequest) (b
 	return consumed, reason
 }
 
-func (m *deleteConfirmationManager) RequestApproval(req *v1.AdmissionRequest, matchedPattern string) (bool, string, string) {
+func (m *deleteConfirmationManager) RequestApproval(req *v1.AdmissionRequest, matchedPattern string, rollbackID string) (bool, string, string) {
 	if m == nil || !m.enabled || req == nil {
 		return false, "", ""
 	}
@@ -333,6 +334,7 @@ func (m *deleteConfirmationManager) RequestApproval(req *v1.AdmissionRequest, ma
 		Namespace:        formatNamespace(req.Namespace),
 		ResourceDisplay:  formatResource(req.Kind.Kind, req.Name, req.Namespace),
 		MatchedPattern:   matchedPattern,
+		RollbackID:       rollbackID,
 	}
 	groupID := deleteConfirmationGroupID(req, matchedPattern, userPattern, now.Truncate(m.aggregateWindow))
 	entry.GroupID = groupID
@@ -464,12 +466,7 @@ func (m *deleteConfirmationManager) sendApprovalMessage(group deleteConfirmation
 
 	message := m.buildApprovalMessage(group, entries)
 	replyMarkup := map[string]interface{}{
-		"inline_keyboard": [][]map[string]string{
-			{
-				{"text": "确认删除", "callback_data": deleteConfirmationCallbackData("approve", group.ID)},
-				{"text": "拒绝", "callback_data": deleteConfirmationCallbackData("reject", group.ID)},
-			},
-		},
+		"inline_keyboard": m.buildApprovalKeyboard(group, entries),
 	}
 	replyPayload, err := json.Marshal(replyMarkup)
 	if err != nil {
@@ -520,6 +517,41 @@ func (m *deleteConfirmationManager) sendApprovalMessage(group deleteConfirmation
 		}
 	}
 	return nil
+}
+
+func (m *deleteConfirmationManager) buildApprovalKeyboard(group deleteConfirmationGroup, entries []deleteConfirmationEntry) [][]map[string]string {
+	keyboard := [][]map[string]string{
+		{
+			{"text": "确认删除", "callback_data": deleteConfirmationCallbackData("approve", group.ID)},
+			{"text": "拒绝", "callback_data": deleteConfirmationCallbackData("reject", group.ID)},
+		},
+	}
+
+	limit := m.maxItems
+	if limit <= 0 {
+		limit = defaultDeleteConfirmationMaxItems
+	}
+	for i, entry := range entries {
+		if i >= limit {
+			break
+		}
+		if strings.TrimSpace(entry.RollbackID) == "" {
+			continue
+		}
+		keyboard = append(keyboard, []map[string]string{
+			{"text": "Rollback " + limitButtonText(entry.Name), "callback_data": rollbackCallbackData(entry.RollbackID)},
+		})
+	}
+
+	return keyboard
+}
+
+func limitButtonText(value string) string {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) <= 28 {
+		return string(runes)
+	}
+	return string(runes[:25]) + "..."
 }
 
 func (m *deleteConfirmationManager) buildApprovalMessage(group deleteConfirmationGroup, entries []deleteConfirmationEntry) string {
@@ -586,7 +618,12 @@ func (m *deleteConfirmationManager) pollTelegramCallbacks() {
 		if update.CallbackQuery == nil {
 			continue
 		}
-		m.handleTelegramCallback(*update.CallbackQuery)
+		if m.handleTelegramCallback(*update.CallbackQuery) {
+			continue
+		}
+		if rollbacker != nil {
+			rollbacker.HandleTelegramCallback(*update.CallbackQuery)
+		}
 	}
 
 	if err := m.setTelegramOffset(maxUpdateID + 1); err != nil {
@@ -628,10 +665,10 @@ func fetchTelegramUpdates(offset int) ([]telegramUpdate, error) {
 	return result.Result, nil
 }
 
-func (m *deleteConfirmationManager) handleTelegramCallback(callback telegramCallbackQuery) {
+func (m *deleteConfirmationManager) handleTelegramCallback(callback telegramCallbackQuery) bool {
 	action, groupID, ok := parseDeleteConfirmationCallbackData(callback.Data)
 	if !ok {
-		return
+		return false
 	}
 
 	telegramID := strconv.FormatInt(callback.From.ID, 10)
@@ -713,6 +750,7 @@ func (m *deleteConfirmationManager) handleTelegramCallback(callback telegramCall
 		}
 		m.syncApprovalMessagesAfterCallback(callback.Message.Chat.ID, callback.Message.MessageID, status, messageText, sentMessages)
 	}
+	return true
 }
 
 func (m *deleteConfirmationManager) telegramOffset() (int, error) {

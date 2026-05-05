@@ -152,6 +152,9 @@ func buildNotificationSignature(channel string, ctx NotificationContext) string 
 		strings.ToLower(strings.TrimSpace(ctx.User)),
 		strings.ToLower(strings.TrimSpace(ctx.Cluster)),
 	}
+	if strings.TrimSpace(ctx.RollbackID) != "" {
+		parts = append(parts, strings.ToLower(strings.TrimSpace(ctx.RollbackID)))
+	}
 
 	return strings.Join(parts, "|")
 }

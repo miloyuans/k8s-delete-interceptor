@@ -92,9 +92,10 @@ type NotificationContext struct {
 	ResourceType   string
 	ResourceName   string
 	ChangeDetails string
-	AttachmentName string
+	AttachmentName    string
 	AttachmentContent string
-	RequestUID     string
+	RequestUID        string
+	RollbackID        string
 }
 
 type Config struct {
@@ -105,8 +106,9 @@ type Config struct {
 	GlobalWhitelist   GlobalWhitelistConfig     `json:"global_whitelist" yaml:"global_whitelist"`
 	Audit             AuditConfig               `json:"audit" yaml:"audit"`
 	Lifecycle         LifecycleConfig           `json:"lifecycle" yaml:"lifecycle"`
-	Notifications     NotificationControlConfig `json:"notifications" yaml:"notifications"`
-	DeleteConfirmation DeleteConfirmationConfig `json:"delete_confirmation" yaml:"delete_confirmation"`
+	Notifications      NotificationControlConfig `json:"notifications" yaml:"notifications"`
+	DeleteConfirmation DeleteConfirmationConfig   `json:"delete_confirmation" yaml:"delete_confirmation"`
+	Rollback           RollbackConfig             `json:"rollback" yaml:"rollback"`
 }
 
 var config Config
@@ -486,6 +488,7 @@ func renderNotificationTemplate(template string, ctx NotificationContext) string
 		"resource_name": escapeMarkdownV2(ctx.ResourceName),
 		"change_details": escapeMarkdownV2(ctx.ChangeDetails),
 		"request_uid":  escapeMarkdownV2(ctx.RequestUID),
+		"rollback_id":  escapeMarkdownV2(ctx.RollbackID),
 	}
 
 	if strings.Contains(template, "{{") {
@@ -510,6 +513,7 @@ func renderNotificationTemplate(template string, ctx NotificationContext) string
 			"{{resource_name}}", values["resource_name"],
 			"{{change_details}}", values["change_details"],
 			"{{request_uid}}", values["request_uid"],
+			"{{rollback_id}}", values["rollback_id"],
 		}
 		return strings.NewReplacer(replacerArgs...).Replace(template)
 	}
@@ -665,6 +669,9 @@ func sendTelegramNotificationWithConfigMode(channel string, telegramCfg Telegram
 			values.Add("chat_id", chatID)
 			values.Add("text", message)
 			values.Add("parse_mode", "MarkdownV2") // 明确指定 MarkdownV2
+			if replyMarkup := buildRollbackReplyMarkup(ctx.RollbackID); replyMarkup != "" {
+				values.Add("reply_markup", replyMarkup)
+			}
 
 			resp, err := httpClient.PostForm(apiURL, values)
 			if err != nil {
@@ -718,6 +725,9 @@ func deliverTelegramNotification(telegramCfg TelegramConfig, ctx NotificationCon
 		values.Add("chat_id", chatID)
 		values.Add("text", message)
 		values.Add("parse_mode", "MarkdownV2")
+		if replyMarkup := buildRollbackReplyMarkup(ctx.RollbackID); replyMarkup != "" {
+			values.Add("reply_markup", replyMarkup)
+		}
 
 		resp, err := httpClient.PostForm(apiURL, values)
 		if err != nil {
@@ -830,7 +840,8 @@ func validate(w http.ResponseWriter, r *http.Request) {
 	klog.V(4).Infof("[Request %s] Received: User=%s, Op=%s, Resource=%s/%s, NS=%s", reqUID, user, operation, kind, name, namespace)
 
 	if review.Request.Operation == v1.Create || review.Request.Operation == v1.Update {
-		handleCreateOrUpdateAuditV2(review.Request)
+		rollbackID := recordRollbackBackupForAdmission(review.Request)
+		handleCreateOrUpdateAuditV2(review.Request, rollbackID)
 		sendResponse(w, reqUID, true, "")
 		return
 	}
@@ -847,6 +858,8 @@ func validate(w http.ResponseWriter, r *http.Request) {
 		sendResponse(w, reqUID, true, fmt.Sprintf("Operation %s is not subject to deletion interception.", operation))
 		return
 	}
+
+	rollbackID := recordRollbackBackupForAdmission(review.Request)
 
 	if bypass, bypassReason := shouldBypassForSelfPreservation(review.Request); bypass {
 		klog.Infof("[Request %s] Allowed: Self-preservation rule matched for %s '%s' in namespace '%s'", reqUID, kind, name, namespace)
@@ -921,14 +934,16 @@ func validate(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 
-					if pending, pendingReason, pendingPolicy := deleteConfirmer.RequestApproval(review.Request, pattern); pending {
+					if pending, pendingReason, pendingPolicy := deleteConfirmer.RequestApproval(review.Request, pattern, rollbackID); pending {
 						klog.Infof("[Request %s] Delete requires Telegram confirmation: %s", reqUID, pendingReason)
 						emitAuditRecord(review.Request, auditDecisionBlocked, pendingReason, pendingPolicy, true, pendingReason)
 						sendResponse(w, reqUID, false, pendingReason)
 						return
 					}
 
-					sendTelegramNotification(buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "blocked", notificationReason))
+					ctx := buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "blocked", notificationReason)
+					ctx.RollbackID = rollbackID
+					sendTelegramNotification(ctx)
 					emitAuditRecord(review.Request, auditDecisionBlocked, denyReason, fmt.Sprintf("protected_rule:%s", pattern), true, notificationReason)
 
 					goto respond
@@ -987,6 +1002,7 @@ func main() {
 	applyNotificationDefaults()
 	applyLifecycleDefaults()
 	applyDeleteConfirmationDefaults()
+	applyRollbackDefaults()
 
 	auditor, err := newAuditManager(config.Audit)
 	if err != nil {
@@ -1006,12 +1022,22 @@ func main() {
 	}
 	notifier = notificationMgr
 
+	rollbackMgr, err := newRollbackManager(config.Rollback)
+	if err != nil {
+		klog.Fatalf("Failed to initialize rollback manager: %v", err)
+	}
+	rollbacker = rollbackMgr
+	defer rollbacker.Stop()
+
 	deleteConfirmationMgr, err := newDeleteConfirmationManager(config.DeleteConfirmation)
 	if err != nil {
 		klog.Fatalf("Failed to initialize delete confirmation manager: %v", err)
 	}
 	deleteConfirmer = deleteConfirmationMgr
 	defer deleteConfirmer.Stop()
+	if rollbacker != nil && rollbacker.enabled && (deleteConfirmer == nil || !deleteConfirmer.enabled) {
+		rollbacker.Start()
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			if serviceLifecycle != nil {
@@ -1091,6 +1117,16 @@ func main() {
 		klog.Infof("Delete confirmation enabled. State directory: %s, TTL: %ds, Consume window: %ds, Aggregate window: %ds, Rules: %d", config.DeleteConfirmation.StateDirectory, config.DeleteConfirmation.TTLSeconds, config.DeleteConfirmation.ConsumeWindowSeconds, config.DeleteConfirmation.AggregateWindowSeconds, len(config.DeleteConfirmation.Rules))
 	} else {
 		klog.Infof("Delete confirmation disabled.")
+	}
+	if rollbacker != nil && rollbacker.enabled {
+		klog.Infof("Rollback enabled. Retention: %dh, Authorized Telegram IDs: %d, Mongo enabled: %v", config.Rollback.RetentionHours, len(config.Rollback.AuthorizedTelegramIDs), config.Rollback.Mongo.Enabled || config.Audit.Mongo.Enabled)
+		if len(config.Rollback.AuthorizedTelegramIDs) == 0 {
+			klog.Infof("Rollback buttons are visible, but no Telegram user IDs are authorized to execute rollback.")
+		}
+	} else if config.Rollback.Enabled {
+		klog.Infof("Rollback configured but unavailable; check MongoDB configuration and startup logs.")
+	} else {
+		klog.Infof("Rollback disabled.")
 	}
 	klog.Infof("Notification control enabled. Dedupe window: %ds, Retry failed on startup: %v, Max retry batch: %d", config.Notifications.DedupeWindowSeconds, config.Notifications.RetryFailedOnStartup, config.Notifications.MaxRetryBatch)
 	klog.Info("=========================================================")

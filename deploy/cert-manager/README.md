@@ -5,7 +5,7 @@ This directory contains a cert-manager based deployment for `k8s-delete-intercep
 ## Files
 
 - `00-namespace.yaml`: installs the `webhook-system` namespace
-- `10-serviceaccount.yaml`: dedicated service account
+- `10-serviceaccount.yaml`: dedicated service account plus rollback RBAC
 - `20-cert-manager.yaml`: cert-manager issuers and serving certificate
 - `30-service.yaml`: internal HTTPS service
 - `35-audit-pvc.yaml`: shared RWX PVC for audit log storage
@@ -42,6 +42,7 @@ Review and update `config/protected.yaml` before installation:
 - `audit.create.notify_resources`
 - `audit.update.notify_users`
 - `audit.update.notify_resources`
+- `rollback`
 - `delete_confirmation`
 - `global_whitelist`
 - `lifecycle`
@@ -134,6 +135,8 @@ The notification context also exposes `{{resource_type}}`, `{{resource_name}}`, 
 For update audit notifications, the webhook compares `oldObject` and `object` from the AdmissionReview and only lists changed fields.
 Common Kubernetes metadata noise such as `managedFields`, `resourceVersion`, and `last-applied-configuration` is omitted from the diff.
 If the generated update diff is too large for a concise Telegram message, the message states that details were attached and sends the full diff as a text document.
+
+Rollback stores executable old-object YAML for update and delete AdmissionReview events in MongoDB for 24 hours by default. Notifications that have a rollback backup include an inline rollback button. Clicking the button immediately applies that stored YAML back to the cluster with server-side apply, and only Telegram user IDs listed in `rollback.authorized_telegram_ids` are allowed to execute it. If the list is empty or omitted, the button is visible but nobody can execute rollback. MongoDB cleanup is handled by the `expires_at` TTL index in `rollback.mongo.collection`.
 
 Delete confirmation adds a two-step approval flow for protected resources:
 

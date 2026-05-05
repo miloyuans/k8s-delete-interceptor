@@ -24,6 +24,21 @@ notifications:
   retry_failed_on_startup: true
   max_retry_batch: 50
 
+rollback:
+  enabled: true
+  state_directory: /var/lib/k8s-delete-interceptor
+  retention_hours: 24
+  poll_interval_seconds: 2
+  field_manager: k8s-delete-interceptor-rollback
+  authorized_telegram_ids:
+    - "123456789"
+  mongo:
+    enabled: true
+    uri: "mongodb://mongodb.mongodb.svc.cluster.local:27017"
+    database: "k8s_delete_interceptor"
+    collection: "rollback_backups"
+    connect_timeout_seconds: 5
+
 delete_confirmation:
   enabled: true
   state_directory: /var/lib/k8s-delete-interceptor

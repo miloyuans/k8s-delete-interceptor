@@ -17,7 +17,7 @@ spec:
     spec:
       terminationGracePeriodSeconds: 30
       serviceAccountName: delete-interceptor
-      automountServiceAccountToken: false
+      automountServiceAccountToken: true
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

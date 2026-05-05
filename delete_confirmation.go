@@ -527,23 +527,10 @@ func (m *deleteConfirmationManager) buildApprovalKeyboard(group deleteConfirmati
 		},
 	}
 
-	limit := m.maxItems
-	if limit <= 0 {
-		limit = defaultDeleteConfirmationMaxItems
-	}
-	for i, entry := range entries {
-		if i >= limit {
-			break
-		}
-		if strings.TrimSpace(entry.RollbackID) == "" {
-			continue
-		}
-		keyboard = append(keyboard, []map[string]string{
-			{"text": "回滚 " + limitButtonText(entry.Name), "callback_data": rollbackCallbackDataWithAction(rollbackActionApply, entry.RollbackID)},
-			{"text": "下载 YAML", "callback_data": rollbackCallbackDataWithAction(rollbackActionDownload, entry.RollbackID)},
-		})
-	}
-
+	// The delete approval message represents a request that has been blocked and
+	// not yet executed. Showing rollback/download buttons here is misleading because
+	// there is nothing to restore while the delete is still denied. Rollback buttons
+	// are reserved for allowed mutation/delete notifications after the operation is actually permitted.
 	return keyboard
 }
 

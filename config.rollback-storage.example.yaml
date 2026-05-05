@@ -61,3 +61,10 @@ audit:
     - cm
     - secret
     - secrets
+
+# 删除策略：
+# default_block=false 保持原有行为：只拦截 protected 里显式配置的资源。
+# default_block=true 表示所有 DELETE 默认拦截；global_whitelist 直接放行，
+# delete_confirmation.rules 里的用户可 Telegram 确认后放行，其他用户默认拒绝。
+delete_policy:
+  default_block: true

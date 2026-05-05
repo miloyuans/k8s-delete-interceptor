@@ -10,6 +10,13 @@ Rollback buttons now contain two actions:
 - `执行回滚`: applies the saved manifest back to Kubernetes.
 - `下载 YAML`: sends the executable rollback YAML to the clicking Telegram user by private chat.
 
+Button visibility rules:
+
+- blocked / denied delete notifications do not show rollback buttons, because the delete did not happen.
+- approved delete notifications show rollback buttons after the user retries the delete and the admission request is allowed.
+- global-whitelist direct allow delete notifications show rollback buttons, because the delete is actually allowed.
+- create/update audit notifications still show rollback buttons when a rollback backup is available.
+
 The Telegram group message is updated after clicks and shows:
 
 - rollback execution status: pending / running / applied / failed / expired
@@ -135,3 +142,46 @@ The complete diff is stored in audit records under:
   "change_details": "full field-level diff stored for audit"
 }
 ```
+
+
+## v5 删除拦截策略说明
+
+### 回滚按钮展示策略
+
+拦截成功的 DELETE 通知不再附带回滚或下载 YAML 按钮。原因是 Admission Webhook 已经拒绝了删除请求，资源并未被删除，此时展示回滚按钮容易造成误判。
+
+删除审批消息也只保留“确认删除 / 拒绝”按钮，不再展示“回滚 / 下载 YAML”。回滚按钮只保留在允许执行的 CREATE / UPDATE 审计通知中，用于恢复变更前版本。
+
+### 白名单与默认拦截
+
+当前删除策略顺序为：
+
+1. 自保护资源直接放行，例如 webhook 自己的 namespace 和 ValidatingWebhookConfiguration。
+2. `global_whitelist.users` 命中的用户直接放行，不需要审批。
+3. 命中 `protected` 规则的 DELETE 默认拦截。
+4. 如果用户命中 `delete_confirmation.rules`，则发送 Telegram 交互审批；审批后用户需要重试同一个删除命令，授权只消费一次。
+5. 未命中交互审批小名单的用户默认拒绝。
+6. 如果开启 `delete_policy.default_block: true`，即使资源没有命中 `protected`，所有 DELETE 也会按上述小名单审批或默认拒绝。
+
+如果要实现“全局大白名单直接放行，小名单交互确认放行，其他默认全拦截删除”，请配置：
+
+```yaml
+delete_policy:
+  default_block: true
+
+global_whitelist:
+  users:
+    - system:admin
+    - regex:^admin-.*
+
+delete_confirmation:
+  enabled: true
+  rules:
+    - users:
+        - system:serviceaccount:prod:deploy-bot
+        - alice@example.com
+      telegram_ids:
+        - "123456789"
+```
+
+如果 `delete_policy.default_block` 不配置或为 `false`，则保持旧行为：未命中 `protected` 的删除请求会放行。

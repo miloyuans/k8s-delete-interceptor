@@ -108,8 +108,20 @@ type Config struct {
 	Audit              AuditConfig               `json:"audit" yaml:"audit"`
 	Lifecycle          LifecycleConfig           `json:"lifecycle" yaml:"lifecycle"`
 	Notifications      NotificationControlConfig `json:"notifications" yaml:"notifications"`
+	DeletePolicy       DeletePolicyConfig        `json:"delete_policy" yaml:"delete_policy"`
 	DeleteConfirmation DeleteConfirmationConfig  `json:"delete_confirmation" yaml:"delete_confirmation"`
 	Rollback           RollbackConfig            `json:"rollback" yaml:"rollback"`
+}
+
+type DeletePolicyConfig struct {
+	// DefaultBlock controls whether DELETE requests that do not match any explicit
+	// protected rule should still be denied by default.
+	//
+	// false keeps the original behavior: only configured protected resources are intercepted.
+	// true enables a deny-by-default posture for all DELETE requests after self-preservation
+	// and global whitelist checks. Users that match delete_confirmation.rules can use
+	// Telegram interactive approval; all other users are denied.
+	DefaultBlock bool `json:"default_block" yaml:"default_block"`
 }
 
 var config Config
@@ -579,6 +591,24 @@ func escapeMarkdownV2(text string) string {
 	return replacer.Replace(text)
 }
 
+func buildRollbackReplyMarkupForNotification(ctx NotificationContext) string {
+	// A blocked admission notification means the destructive operation did not happen,
+	// so showing rollback/download YAML buttons is misleading. Keep rollback actions
+	// only for allowed mutation/delete notifications that carry a rollback backup.
+	if strings.EqualFold(strings.TrimSpace(ctx.Action), "blocked") {
+		return ""
+	}
+	return buildRollbackReplyMarkup(ctx.RollbackID)
+}
+
+func sendAllowedDeleteNotificationWithRollback(req *v1.AdmissionRequest, reqUID types.UID, user string, kind string, name string, namespace string, operation string, opDesc string, reason string) string {
+	rollbackID := recordRollbackBackupForAdmission(req)
+	ctx := buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "allowed", reason)
+	ctx.RollbackID = rollbackID
+	sendTelegramNotification(ctx)
+	return rollbackID
+}
+
 func sendTelegramNotification(ctx NotificationContext) {
 	sendTelegramNotificationWithConfigMode(notificationChannelDefault, config.Telegram, ctx, true)
 }
@@ -669,7 +699,7 @@ func sendTelegramNotificationWithConfigMode(channel string, telegramCfg Telegram
 			values.Add("chat_id", chatID)
 			values.Add("text", message)
 			values.Add("parse_mode", "MarkdownV2") // 明确指定 MarkdownV2
-			if replyMarkup := buildRollbackReplyMarkup(ctx.RollbackID); replyMarkup != "" {
+			if replyMarkup := buildRollbackReplyMarkupForNotification(ctx); replyMarkup != "" {
 				values.Add("reply_markup", replyMarkup)
 			}
 
@@ -725,7 +755,7 @@ func deliverTelegramNotification(telegramCfg TelegramConfig, ctx NotificationCon
 		values.Add("chat_id", chatID)
 		values.Add("text", message)
 		values.Add("parse_mode", "MarkdownV2")
-		if replyMarkup := buildRollbackReplyMarkup(ctx.RollbackID); replyMarkup != "" {
+		if replyMarkup := buildRollbackReplyMarkupForNotification(ctx); replyMarkup != "" {
 			values.Add("reply_markup", replyMarkup)
 		}
 
@@ -859,8 +889,6 @@ func validate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rollbackID := recordRollbackBackupForAdmission(review.Request)
-
 	if bypass, bypassReason := shouldBypassForSelfPreservation(review.Request); bypass {
 		klog.Infof("[Request %s] Allowed: Self-preservation rule matched for %s '%s' in namespace '%s'", reqUID, kind, name, namespace)
 		emitAuditRecord(review.Request, auditDecisionAllowed, bypassReason, auditPolicySelfPreservation, false, "")
@@ -874,8 +902,10 @@ func validate(w http.ResponseWriter, r *http.Request) {
 		if telegramIDs, deletePattern, deleteMatcher := matchDeleteConfirmationRule(user); len(telegramIDs) > 0 {
 			klog.Infof("[Request %s] Global whitelist precedence applied for user '%s': delete confirmation rule '%s' (%s) was skipped.", reqUID, user, deletePattern, deleteMatcher)
 		}
+		notificationReason := fmt.Sprintf("删除操作已由全局白名单直接放行：%s。", resourceDesc)
 		klog.Infof("[Request %s] Allowed by global whitelist: %s", reqUID, allowReason)
-		emitAuditRecord(review.Request, auditDecisionAllowed, allowReason, fmt.Sprintf("%s:%s", auditPolicyGlobalWhitelist, pattern), false, "")
+		sendAllowedDeleteNotificationWithRollback(review.Request, reqUID, user, kind, name, namespace, operation, opDesc, notificationReason)
+		emitAuditRecord(review.Request, auditDecisionAllowed, allowReason, fmt.Sprintf("%s:%s", auditPolicyGlobalWhitelist, pattern), true, notificationReason)
 		sendResponse(w, reqUID, true, allowReason)
 		return
 	}
@@ -928,13 +958,15 @@ func validate(w http.ResponseWriter, r *http.Request) {
 					klog.Warningf("[Request %s] DENIED: %s. User: %s, Resource: %s/%s, NS: %s", reqUID, denyReason, user, kind, name, namespace)
 
 					if approved, approvalReason := deleteConfirmer.ConsumeApproval(review.Request); approved {
+						notificationReason := fmt.Sprintf("删除审批已通过，删除操作已放行：%s。", resourceDesc)
 						klog.Infof("[Request %s] Allowed by Telegram delete confirmation: %s", reqUID, approvalReason)
-						emitAuditRecord(review.Request, auditDecisionAllowed, approvalReason, fmt.Sprintf("delete_confirmation_approved:%s", pattern), false, "")
+						sendAllowedDeleteNotificationWithRollback(review.Request, reqUID, user, kind, name, namespace, operation, opDesc, notificationReason)
+						emitAuditRecord(review.Request, auditDecisionAllowed, approvalReason, fmt.Sprintf("delete_confirmation_approved:%s", pattern), true, notificationReason)
 						sendResponse(w, reqUID, true, "")
 						return
 					}
 
-					if pending, pendingReason, pendingPolicy := deleteConfirmer.RequestApproval(review.Request, pattern, rollbackID); pending {
+					if pending, pendingReason, pendingPolicy := deleteConfirmer.RequestApproval(review.Request, pattern, ""); pending {
 						klog.Infof("[Request %s] Delete requires Telegram confirmation: %s", reqUID, pendingReason)
 						emitAuditRecord(review.Request, auditDecisionBlocked, pendingReason, pendingPolicy, true, pendingReason)
 						sendResponse(w, reqUID, false, pendingReason)
@@ -942,7 +974,6 @@ func validate(w http.ResponseWriter, r *http.Request) {
 					}
 
 					ctx := buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "blocked", notificationReason)
-					ctx.RollbackID = rollbackID
 					sendTelegramNotification(ctx)
 					emitAuditRecord(review.Request, auditDecisionBlocked, denyReason, fmt.Sprintf("protected_rule:%s", pattern), true, notificationReason)
 
@@ -950,6 +981,35 @@ func validate(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	}
+
+	if allowed && config.DeletePolicy.DefaultBlock {
+		allowed = false
+		denyReason = fmt.Sprintf("Default delete policy blocks deletion of %s.", resourceDesc)
+		notificationReason := fmt.Sprintf("触发默认删除拦截策略：%s。", resourceDesc)
+		policyName := "default_block_all_deletes"
+
+		klog.Warningf("[Request %s] DENIED by default delete policy: %s. User: %s, Resource: %s/%s, NS: %s", reqUID, denyReason, user, kind, name, namespace)
+
+		if approved, approvalReason := deleteConfirmer.ConsumeApproval(review.Request); approved {
+			notificationReason := fmt.Sprintf("删除审批已通过，删除操作已放行：%s。", resourceDesc)
+			klog.Infof("[Request %s] Allowed by Telegram delete confirmation under default delete policy: %s", reqUID, approvalReason)
+			sendAllowedDeleteNotificationWithRollback(review.Request, reqUID, user, kind, name, namespace, operation, opDesc, notificationReason)
+			emitAuditRecord(review.Request, auditDecisionAllowed, approvalReason, "delete_confirmation_approved:"+policyName, true, notificationReason)
+			sendResponse(w, reqUID, true, "")
+			return
+		}
+
+		if pending, pendingReason, pendingPolicy := deleteConfirmer.RequestApproval(review.Request, policyName, ""); pending {
+			klog.Infof("[Request %s] Delete requires Telegram confirmation under default delete policy: %s", reqUID, pendingReason)
+			emitAuditRecord(review.Request, auditDecisionBlocked, pendingReason, pendingPolicy, true, pendingReason)
+			sendResponse(w, reqUID, false, pendingReason)
+			return
+		}
+
+		ctx := buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "blocked", notificationReason)
+		sendTelegramNotification(ctx)
+		emitAuditRecord(review.Request, auditDecisionBlocked, denyReason, policyName, true, notificationReason)
 	}
 
 respond:

@@ -2,13 +2,13 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -19,9 +19,6 @@ import (
 	"sync"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 	"gopkg.in/yaml.v3"
 	v1 "k8s.io/api/admission/v1"
 	"k8s.io/klog/v2"
@@ -40,13 +37,16 @@ const (
 )
 
 type RollbackConfig struct {
-	Enabled                bool             `json:"enabled" yaml:"enabled"`
-	AuthorizedTelegramIDs  []string         `json:"authorized_telegram_ids" yaml:"authorized_telegram_ids"`
-	RetentionHours         int              `json:"retention_hours" yaml:"retention_hours"`
-	StateDirectory         string           `json:"state_directory" yaml:"state_directory"`
-	PollIntervalSeconds    int              `json:"poll_interval_seconds" yaml:"poll_interval_seconds"`
-	FieldManager           string           `json:"field_manager" yaml:"field_manager"`
-	Mongo                  MongoAuditConfig `json:"mongo" yaml:"mongo"`
+	Enabled               bool                  `json:"enabled" yaml:"enabled"`
+	AuthorizedTelegramIDs []string              `json:"authorized_telegram_ids" yaml:"authorized_telegram_ids"`
+	RetentionHours        int                   `json:"retention_hours" yaml:"retention_hours"`
+	StateDirectory        string                `json:"state_directory" yaml:"state_directory"`
+	PollIntervalSeconds   int                   `json:"poll_interval_seconds" yaml:"poll_interval_seconds"`
+	FieldManager          string                `json:"field_manager" yaml:"field_manager"`
+	AllowReapply          bool                  `json:"allow_reapply" yaml:"allow_reapply"`
+	RunningTimeoutSeconds int                   `json:"running_timeout_seconds" yaml:"running_timeout_seconds"`
+	Storage               RollbackStorageConfig `json:"storage" yaml:"storage"`
+	Mongo                 MongoAuditConfig      `json:"mongo" yaml:"mongo"`
 }
 
 type RollbackRecord struct {
@@ -64,24 +64,38 @@ type RollbackRecord struct {
 	Name            string    `json:"name" bson:"name"`
 	Namespace       string    `json:"namespace,omitempty" bson:"namespace,omitempty"`
 	ResourceDisplay string    `json:"resource_display" bson:"resource_display"`
-	ManifestYAML    string    `json:"manifest_yaml" bson:"manifest_yaml"`
-	ManifestJSON    string    `json:"manifest_json" bson:"manifest_json"`
+
+	ManifestYAML   string `json:"manifest_yaml,omitempty" bson:"manifest_yaml,omitempty"`
+	ManifestJSON   string `json:"manifest_json" bson:"manifest_json"`
+	ManifestFile   string `json:"manifest_file,omitempty" bson:"manifest_file,omitempty"`
+	ManifestSHA256 string `json:"manifest_sha256,omitempty" bson:"manifest_sha256,omitempty"`
+
 	ExecutedAt      time.Time `json:"executed_at,omitempty" bson:"executed_at,omitempty"`
 	ExecutedBy      string    `json:"executed_by,omitempty" bson:"executed_by,omitempty"`
 	ExecutionStatus string    `json:"execution_status,omitempty" bson:"execution_status,omitempty"`
 	ExecutionError  string    `json:"execution_error,omitempty" bson:"execution_error,omitempty"`
+
+	RollbackClickCount int       `json:"rollback_click_count" bson:"rollback_click_count"`
+	DownloadClickCount int       `json:"download_click_count" bson:"download_click_count"`
+	LastClickedAt      time.Time `json:"last_clicked_at,omitempty" bson:"last_clicked_at,omitempty"`
+	LastClickedBy      string    `json:"last_clicked_by,omitempty" bson:"last_clicked_by,omitempty"`
+	LastAction         string    `json:"last_action,omitempty" bson:"last_action,omitempty"`
+
+	TelegramMessages []RollbackTelegramMessage `json:"telegram_messages,omitempty" bson:"telegram_messages,omitempty"`
+	History          []RollbackHistoryItem     `json:"history,omitempty" bson:"history,omitempty"`
 }
 
 type rollbackManager struct {
 	enabled       bool
 	authorizedIDs []string
 	retention     time.Duration
-	collection    *mongo.Collection
-	mongoTimeout  time.Duration
+	store         RollbackStore
+	storageName   string
 	fieldManager  string
 	statePath     string
 	pollLockPath  string
 	pollInterval  time.Duration
+	allowReapply  bool
 	stopCh        chan struct{}
 	mu            sync.Mutex
 
@@ -102,11 +116,24 @@ func applyRollbackDefaults() {
 	if strings.TrimSpace(config.Rollback.StateDirectory) == "" {
 		config.Rollback.StateDirectory = defaultDeleteConfirmationDirectory
 	}
+	if strings.TrimSpace(config.Rollback.Storage.DataDirectory) == "" {
+		config.Rollback.Storage.DataDirectory = config.Rollback.StateDirectory
+	}
+	if config.Rollback.Storage.LockTTLSeconds <= 0 {
+		config.Rollback.Storage.LockTTLSeconds = 60
+	}
+	config.Rollback.Storage.WriteFsync = !config.Rollback.Storage.DisableFsync
+	if strings.TrimSpace(config.Rollback.Storage.Type) == "" {
+		config.Rollback.Storage.Type = rollbackStorageTypeAuto
+	}
 	if config.Rollback.PollIntervalSeconds <= 0 {
 		config.Rollback.PollIntervalSeconds = defaultDeleteConfirmationPollSeconds
 	}
 	if strings.TrimSpace(config.Rollback.FieldManager) == "" {
 		config.Rollback.FieldManager = defaultRollbackFieldManager
+	}
+	if config.Rollback.RunningTimeoutSeconds <= 0 {
+		config.Rollback.RunningTimeoutSeconds = 300
 	}
 }
 
@@ -115,17 +142,14 @@ func newRollbackManager(cfg RollbackConfig) (*rollbackManager, error) {
 		return &rollbackManager{enabled: false}, nil
 	}
 
-	mongoCfg, ok := resolveRollbackMongoConfig(cfg)
-	if !ok {
-		klog.Warning("Rollback is enabled, but no rollback MongoDB configuration is available. Rollback backups and buttons are disabled.")
-		return &rollbackManager{enabled: false}, nil
+	directory := strings.TrimSpace(cfg.Storage.DataDirectory)
+	if directory == "" {
+		directory = strings.TrimSpace(cfg.StateDirectory)
 	}
-
-	directory := strings.TrimSpace(cfg.StateDirectory)
 	if directory == "" {
 		directory = defaultDeleteConfirmationDirectory
 	}
-	if err := os.MkdirAll(directory, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(directory, "rollback"), 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create rollback state directory '%s': %w", directory, err)
 	}
 
@@ -133,28 +157,53 @@ func newRollbackManager(cfg RollbackConfig) (*rollbackManager, error) {
 	if retentionHours <= 0 {
 		retentionHours = defaultRollbackRetentionHours
 	}
-	connectTimeoutSeconds := mongoCfg.ConnectTimeoutSeconds
-	if connectTimeoutSeconds <= 0 {
-		connectTimeoutSeconds = defaultMongoConnectTimeout
-	}
-	timeout := time.Duration(connectTimeoutSeconds) * time.Second
+	connectTimeoutSeconds := defaultMongoConnectTimeout
+	runningTimeout := time.Duration(cfg.RunningTimeoutSeconds) * time.Second
 
-	coll, err := initRollbackMongoCollection(mongoCfg, timeout)
-	if err != nil {
-		klog.Errorf("Rollback backups disabled: %v", err)
-		return &rollbackManager{enabled: false}, nil
+	storageType := normalizeRollbackStorageType(cfg.Storage.Type)
+	var store RollbackStore
+	var storeErr error
+
+	if storageType == rollbackStorageTypeMongo || storageType == rollbackStorageTypeAuto {
+		if mongoCfg, ok := resolveRollbackMongoConfig(cfg); ok {
+			if mongoCfg.ConnectTimeoutSeconds > 0 {
+				connectTimeoutSeconds = mongoCfg.ConnectTimeoutSeconds
+			}
+			timeout := time.Duration(connectTimeoutSeconds) * time.Second
+			store, storeErr = newMongoRollbackStore(mongoCfg, timeout, cfg.AllowReapply, runningTimeout)
+			if storeErr != nil {
+				if storageType == rollbackStorageTypeMongo {
+					return nil, fmt.Errorf("rollback mongo storage requested but unavailable: %w", storeErr)
+				}
+				klog.Warningf("Rollback MongoDB storage unavailable, falling back to PVC/file storage: %v", storeErr)
+			} else {
+				klog.Infof("Rollback storage backend selected: mongo")
+			}
+		} else if storageType == rollbackStorageTypeMongo {
+			return nil, fmt.Errorf("rollback mongo storage requested but no mongo configuration is available")
+		}
+	}
+
+	if store == nil {
+		lockTTL := time.Duration(cfg.Storage.LockTTLSeconds) * time.Second
+		store, storeErr = newFileRollbackStore(directory, lockTTL, cfg.Storage.WriteFsync, cfg.AllowReapply, runningTimeout)
+		if storeErr != nil {
+			return nil, fmt.Errorf("failed to initialize rollback file storage: %w", storeErr)
+		}
+		klog.Infof("Rollback storage backend selected: file, directory=%s", filepath.Join(directory, "rollback"))
 	}
 
 	manager := &rollbackManager{
 		enabled:       true,
 		authorizedIDs: normalizeTelegramIDs(cfg.AuthorizedTelegramIDs),
 		retention:     time.Duration(retentionHours) * time.Hour,
-		collection:    coll,
-		mongoTimeout:  timeout,
+		store:         store,
+		storageName:   store.BackendName(),
 		fieldManager:  strings.TrimSpace(cfg.FieldManager),
-		statePath:     filepath.Join(directory, rollbackOffsetFileName),
-		pollLockPath:  filepath.Join(directory, rollbackPollLockFileName),
+		statePath:     filepath.Join(directory, "rollback", rollbackOffsetFileName),
+		pollLockPath:  filepath.Join(directory, "rollback", rollbackPollLockFileName),
 		pollInterval:  time.Duration(cfg.PollIntervalSeconds) * time.Second,
+		allowReapply:  cfg.AllowReapply,
 		stopCh:        make(chan struct{}),
 	}
 	if manager.fieldManager == "" {
@@ -162,6 +211,9 @@ func newRollbackManager(cfg RollbackConfig) (*rollbackManager, error) {
 	}
 	if manager.pollInterval <= 0 {
 		manager.pollInterval = time.Duration(defaultDeleteConfirmationPollSeconds) * time.Second
+	}
+	if err := manager.store.CleanupExpired(time.Now()); err != nil {
+		klog.Errorf("Rollback storage cleanup failed during startup: %v", err)
 	}
 
 	return manager, nil
@@ -181,58 +233,6 @@ func resolveRollbackMongoConfig(cfg RollbackConfig) (MongoAuditConfig, bool) {
 		return mongoCfg, true
 	}
 	return MongoAuditConfig{}, false
-}
-
-func initRollbackMongoCollection(cfg MongoAuditConfig, timeout time.Duration) (*mongo.Collection, error) {
-	uri := strings.TrimSpace(cfg.URI)
-	if uri == "" {
-		uri = strings.TrimSpace(os.Getenv("MONGODB_URI"))
-	}
-	if uri == "" {
-		return nil, fmt.Errorf("rollback mongo enabled but no uri configured")
-	}
-
-	database := strings.TrimSpace(cfg.Database)
-	if database == "" {
-		database = defaultMongoDatabase
-	}
-
-	collection := strings.TrimSpace(cfg.Collection)
-	if collection == "" {
-		collection = defaultRollbackCollection
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to rollback mongodb: %w", err)
-	}
-	if err := client.Ping(ctx, nil); err != nil {
-		return nil, fmt.Errorf("failed to ping rollback mongodb: %w", err)
-	}
-
-	coll := client.Database(database).Collection(collection)
-	ttlIndex := mongo.IndexModel{
-		Keys: bson.D{{Key: "expires_at", Value: 1}},
-		Options: options.Index().
-			SetName("rollback_expires_at_ttl").
-			SetExpireAfterSeconds(0),
-	}
-	if _, err := coll.Indexes().CreateOne(ctx, ttlIndex); err != nil {
-		return nil, fmt.Errorf("failed to create rollback ttl index: %w", err)
-	}
-
-	requestIndex := mongo.IndexModel{
-		Keys:    bson.D{{Key: "request_uid", Value: 1}},
-		Options: options.Index().SetName("rollback_request_uid"),
-	}
-	if _, err := coll.Indexes().CreateOne(ctx, requestIndex); err != nil {
-		klog.Errorf("Failed to create rollback request_uid index: %v", err)
-	}
-
-	return coll, nil
 }
 
 func (m *rollbackManager) Start() {
@@ -257,6 +257,9 @@ func (m *rollbackManager) run() {
 		select {
 		case <-ticker.C:
 			m.pollTelegramCallbacks()
+			if err := m.store.CleanupExpired(time.Now()); err != nil {
+				klog.Errorf("Rollback cleanup failed: %v", err)
+			}
 		case <-m.stopCh:
 			return
 		}
@@ -310,18 +313,12 @@ func (m *rollbackManager) RecordAdmission(req *v1.AdmissionRequest) (string, err
 		ResourceDisplay: formatResource(req.Kind.Kind, req.Name, req.Namespace),
 		ManifestYAML:    manifestYAML,
 		ManifestJSON:    manifestJSON,
+		ExecutionStatus: rollbackStatusPending,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), m.mongoTimeout)
-	defer cancel()
-
-	_, err = m.collection.UpdateByID(ctx, id, bson.M{
-		"$setOnInsert": record,
-	}, options.Update().SetUpsert(true))
-	if err != nil {
-		return "", fmt.Errorf("failed to persist rollback record: %w", err)
+	if err := m.store.SaveRecord(record, manifestYAML); err != nil {
+		return "", err
 	}
-
 	return id, nil
 }
 
@@ -444,6 +441,10 @@ func removeMapKeys(values map[string]interface{}, keys ...string) {
 }
 
 func buildRollbackReplyMarkup(rollbackID string) string {
+	return buildRollbackReplyMarkupForRecord(rollbackID)
+}
+
+func buildRollbackReplyMarkupForRecord(rollbackID string) string {
 	rollbackID = strings.TrimSpace(rollbackID)
 	if rollbackID == "" {
 		return ""
@@ -452,7 +453,8 @@ func buildRollbackReplyMarkup(rollbackID string) string {
 	payload := map[string]interface{}{
 		"inline_keyboard": [][]map[string]string{
 			{
-				{"text": "Rollback to this version", "callback_data": rollbackCallbackData(rollbackID)},
+				{"text": "执行回滚", "callback_data": rollbackCallbackDataWithAction(rollbackActionApply, rollbackID)},
+				{"text": "下载 YAML", "callback_data": rollbackCallbackDataWithAction(rollbackActionDownload, rollbackID)},
 			},
 		},
 	}
@@ -465,19 +467,39 @@ func buildRollbackReplyMarkup(rollbackID string) string {
 }
 
 func rollbackCallbackData(rollbackID string) string {
-	return fmt.Sprintf("%s:%s", rollbackCallbackPrefix, rollbackID)
+	return rollbackCallbackDataWithAction(rollbackActionApply, rollbackID)
 }
 
-func parseRollbackCallbackData(data string) (string, bool) {
-	parts := strings.SplitN(data, ":", 2)
-	if len(parts) != 2 || parts[0] != rollbackCallbackPrefix || strings.TrimSpace(parts[1]) == "" {
-		return "", false
+func rollbackCallbackDataWithAction(action string, rollbackID string) string {
+	action = strings.TrimSpace(action)
+	rollbackID = strings.TrimSpace(rollbackID)
+	if action == "" {
+		action = rollbackActionApply
 	}
-	return parts[1], true
+	return fmt.Sprintf("%s:%s:%s", rollbackCallbackPrefix, action, rollbackID)
+}
+
+func parseRollbackCallbackData(data string) (string, string, bool) {
+	parts := strings.Split(data, ":")
+	if len(parts) == 2 && parts[0] == rollbackCallbackPrefix && strings.TrimSpace(parts[1]) != "" {
+		return rollbackActionApply, strings.TrimSpace(parts[1]), true
+	}
+	if len(parts) != 3 || parts[0] != rollbackCallbackPrefix {
+		return "", "", false
+	}
+	action := strings.TrimSpace(parts[1])
+	rollbackID := strings.TrimSpace(parts[2])
+	if rollbackID == "" {
+		return "", "", false
+	}
+	if action != rollbackActionApply && action != rollbackActionDownload {
+		return "", "", false
+	}
+	return action, rollbackID, true
 }
 
 func (m *rollbackManager) HandleTelegramCallback(callback telegramCallbackQuery) bool {
-	rollbackID, ok := parseRollbackCallbackData(callback.Data)
+	action, rollbackID, ok := parseRollbackCallbackData(callback.Data)
 	if !ok {
 		return false
 	}
@@ -493,27 +515,120 @@ func (m *rollbackManager) HandleTelegramCallback(callback telegramCallbackQuery)
 		return true
 	}
 
-	record, err := m.loadRecord(rollbackID)
-	if err != nil {
-		klog.Errorf("Failed to load rollback record %s: %v", rollbackID, err)
-		answerTelegramCallback(callback.ID, "Rollback backup does not exist or has expired.")
-		return true
+	switch action {
+	case rollbackActionDownload:
+		m.handleRollbackYAMLDownload(callback, rollbackID, telegramID)
+	case rollbackActionApply:
+		m.handleRollbackApply(callback, rollbackID, telegramID)
 	}
-	if time.Now().After(record.ExpiresAt) {
-		answerTelegramCallback(callback.ID, "Rollback backup has expired.")
-		return true
-	}
-
-	if err := m.applyRecord(record); err != nil {
-		klog.Errorf("Failed to apply rollback record %s: %v", rollbackID, err)
-		m.recordExecution(rollbackID, telegramID, "failed", err.Error())
-		answerTelegramCallback(callback.ID, "Rollback failed. Check service logs.")
-		return true
-	}
-
-	m.recordExecution(rollbackID, telegramID, "applied", "")
-	answerTelegramCallback(callback.ID, "Rollback applied.")
 	return true
+}
+
+func (m *rollbackManager) handleRollbackYAMLDownload(callback telegramCallbackQuery, rollbackID string, telegramID string) {
+	loaded, err := m.store.IncrementDownload(rollbackID, telegramID)
+	if err != nil {
+		m.answerRollbackStoreError(callback.ID, err)
+		return
+	}
+	if strings.TrimSpace(loaded.ManifestYAML) == "" {
+		answerTelegramCallback(callback.ID, "Rollback YAML is empty.")
+		return
+	}
+
+	if callback.Message != nil {
+		if err := editTelegramMessageTextWithMarkup(callback.Message.Chat.ID, callback.Message.MessageID, buildRollbackStatusMessage(loaded.Record), buildRollbackReplyMarkupForRecord(rollbackID)); err != nil {
+			klog.Errorf("Failed to update rollback message after YAML download click: %v", err)
+		}
+	}
+
+	if err := sendRollbackYAMLDocumentToUser(config.Telegram.BotToken, callback.From.ID, loaded.Record, loaded.ManifestYAML); err != nil {
+		klog.Errorf("Failed to send rollback YAML %s to Telegram user %s: %v", rollbackID, telegramID, err)
+		answerTelegramCallback(callback.ID, "私聊发送失败，请先私聊机器人发送 /start。")
+		if callback.Message != nil {
+			sendStartBotReminderToGroup(callback.Message.Chat.ID, callback.From)
+		}
+		return
+	}
+	answerTelegramCallback(callback.ID, "YAML 已发送到你的私聊。")
+}
+
+func (m *rollbackManager) handleRollbackApply(callback telegramCallbackQuery, rollbackID string, telegramID string) {
+	loaded, err := m.store.LoadRecordWithManifest(rollbackID)
+	if err != nil {
+		m.answerRollbackStoreError(callback.ID, err)
+		return
+	}
+	if strings.TrimSpace(loaded.ManifestYAML) == "" {
+		answerTelegramCallback(callback.ID, "Rollback manifest is empty.")
+		return
+	}
+
+	runningRecord, err := m.store.MarkRunning(rollbackID, telegramID)
+	if err != nil {
+		m.answerRollbackStoreError(callback.ID, err)
+		if callback.Message != nil {
+			if current, loadErr := m.store.LoadRecord(rollbackID); loadErr == nil {
+				_ = editTelegramMessageTextWithMarkup(callback.Message.Chat.ID, callback.Message.MessageID, buildRollbackStatusMessage(current), buildRollbackReplyMarkupForRecord(rollbackID))
+			}
+		}
+		return
+	}
+	if callback.Message != nil {
+		if err := editTelegramMessageTextWithMarkup(callback.Message.Chat.ID, callback.Message.MessageID, buildRollbackStatusMessage(runningRecord), buildRollbackReplyMarkupForRecord(rollbackID)); err != nil {
+			klog.Errorf("Failed to update rollback message to running: %v", err)
+		}
+	}
+
+	applyRecord := loaded.Record
+	applyRecord.ManifestYAML = loaded.ManifestYAML
+	if err := m.applyRecord(applyRecord, loaded.ManifestYAML); err != nil {
+		klog.Errorf("Failed to apply rollback record %s: %v", rollbackID, err)
+		failedRecord, updateErr := m.store.MarkFailed(rollbackID, telegramID, err.Error())
+		if updateErr != nil {
+			klog.Errorf("Failed to persist rollback failed state %s: %v", rollbackID, updateErr)
+			failedRecord = runningRecord
+			failedRecord.ExecutionStatus = rollbackStatusFailed
+			failedRecord.ExecutionError = err.Error()
+		}
+		if callback.Message != nil {
+			_ = editTelegramMessageTextWithMarkup(callback.Message.Chat.ID, callback.Message.MessageID, buildRollbackStatusMessage(failedRecord), buildRollbackReplyMarkupForRecord(rollbackID))
+		}
+		answerTelegramCallback(callback.ID, "Rollback failed. Check service logs.")
+		return
+	}
+
+	appliedRecord, err := m.store.MarkApplied(rollbackID, telegramID)
+	if err != nil {
+		klog.Errorf("Failed to persist rollback applied state %s: %v", rollbackID, err)
+		appliedRecord = runningRecord
+		appliedRecord.ExecutionStatus = rollbackStatusApplied
+		appliedRecord.ExecutedAt = time.Now()
+		appliedRecord.ExecutedBy = telegramID
+	}
+	if callback.Message != nil {
+		_ = editTelegramMessageTextWithMarkup(callback.Message.Chat.ID, callback.Message.MessageID, buildRollbackStatusMessage(appliedRecord), buildRollbackReplyMarkupForRecord(rollbackID))
+	}
+	answerTelegramCallback(callback.ID, "Rollback applied.")
+}
+
+func (m *rollbackManager) answerRollbackStoreError(callbackID string, err error) {
+	switch err {
+	case errRollbackExpired:
+		answerTelegramCallback(callbackID, "Rollback backup has expired.")
+	case errRollbackAlreadyApplied:
+		answerTelegramCallback(callbackID, "该备份已经回滚成功，默认不允许重复执行。")
+	case errRollbackAlreadyRunning:
+		answerTelegramCallback(callbackID, "该备份正在执行回滚，请不要重复点击。")
+	case errRollbackNotFound:
+		answerTelegramCallback(callbackID, "Rollback backup does not exist or has expired.")
+	default:
+		if strings.Contains(err.Error(), errRollbackNotFound.Error()) {
+			answerTelegramCallback(callbackID, "Rollback backup does not exist or has expired.")
+			return
+		}
+		klog.Errorf("Rollback operation failed: %v", err)
+		answerTelegramCallback(callbackID, "Rollback operation failed. Check service logs.")
+	}
 }
 
 func (m *rollbackManager) isAuthorized(telegramID string) bool {
@@ -523,37 +638,11 @@ func (m *rollbackManager) isAuthorized(telegramID string) bool {
 	return stringSliceContains(m.authorizedIDs, telegramID)
 }
 
-func (m *rollbackManager) loadRecord(id string) (RollbackRecord, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), m.mongoTimeout)
-	defer cancel()
-
-	var record RollbackRecord
-	err := m.collection.FindOne(ctx, bson.M{
-		"_id":        id,
-		"expires_at": bson.M{"$gt": time.Now()},
-	}).Decode(&record)
-	return record, err
-}
-
-func (m *rollbackManager) recordExecution(id string, telegramID string, status string, message string) {
-	ctx, cancel := context.WithTimeout(context.Background(), m.mongoTimeout)
-	defer cancel()
-
-	update := bson.M{
-		"$set": bson.M{
-			"executed_at":      time.Now(),
-			"executed_by":      telegramID,
-			"execution_status": status,
-			"execution_error":  message,
-		},
+func (m *rollbackManager) applyRecord(record RollbackRecord, manifestYAML string) error {
+	if strings.TrimSpace(manifestYAML) == "" {
+		manifestYAML = record.ManifestYAML
 	}
-	if _, err := m.collection.UpdateByID(ctx, id, update); err != nil {
-		klog.Errorf("Failed to record rollback execution for %s: %v", id, err)
-	}
-}
-
-func (m *rollbackManager) applyRecord(record RollbackRecord) error {
-	if strings.TrimSpace(record.ManifestYAML) == "" {
+	if strings.TrimSpace(manifestYAML) == "" {
 		return fmt.Errorf("rollback manifest is empty")
 	}
 	if err := m.ensureKubernetesClient(); err != nil {
@@ -565,7 +654,7 @@ func (m *rollbackManager) applyRecord(record RollbackRecord) error {
 		return err
 	}
 
-	req, err := http.NewRequest(http.MethodPatch, apiURL, bytes.NewBufferString(record.ManifestYAML))
+	req, err := http.NewRequest(http.MethodPatch, apiURL, bytes.NewBufferString(manifestYAML))
 	if err != nil {
 		return err
 	}
@@ -736,9 +825,122 @@ func (m *rollbackManager) setTelegramOffset(offset int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	tempPath := m.statePath + ".tmp"
-	if err := os.WriteFile(tempPath, []byte(strconv.Itoa(offset)), 0o600); err != nil {
+	return atomicWriteFile(m.statePath, []byte(strconv.Itoa(offset)), 0o600, true)
+}
+
+func sendRollbackYAMLDocumentToUser(botToken string, userID int64, record RollbackRecord, manifestYAML string) error {
+	fileName := fmt.Sprintf("rollback-%s-%s-%s.yaml", strings.ToLower(record.Kind), safeFileNamePart(record.Name), record.ID)
+	return sendTelegramDocument(botToken, strconv.FormatInt(userID, 10), fileName, manifestYAML)
+}
+
+func sendStartBotReminderToGroup(chatID int64, user telegramUser) {
+	if strings.TrimSpace(config.Telegram.BotToken) == "" {
+		return
+	}
+	displayName := strings.TrimSpace(strings.Join([]string{user.FirstName, user.LastName}, " "))
+	if displayName == "" {
+		displayName = strings.TrimSpace(user.Username)
+	}
+	if displayName == "" {
+		displayName = strconv.FormatInt(user.ID, 10)
+	}
+	mention := fmt.Sprintf(`<a href="tg://user?id=%d">%s</a>`, user.ID, html.EscapeString(displayName))
+	text := fmt.Sprintf(`%s YAML 文件私聊发送失败。请先私聊机器人并发送 /start，然后再点击“下载 YAML”。`, mention)
+
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", config.Telegram.BotToken)
+	values := url.Values{}
+	values.Add("chat_id", strconv.FormatInt(chatID, 10))
+	values.Add("text", text)
+	values.Add("parse_mode", "HTML")
+	resp, err := httpClient.PostForm(apiURL, values)
+	if err != nil {
+		klog.Errorf("Failed to send Telegram private chat reminder: %v", err)
+		return
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+}
+
+func buildRollbackStatusMessage(record RollbackRecord) string {
+	statusLabel := rollbackTerminalStatusLabel(record.ExecutionStatus)
+	lastAction := rollbackActionLabel(record.LastAction)
+	lastBy := strings.TrimSpace(record.LastClickedBy)
+	if lastBy == "" {
+		lastBy = "-"
+	}
+	lastAt := "-"
+	if !record.LastClickedAt.IsZero() {
+		lastAt = record.LastClickedAt.Format("2006-01-02 15:04:05 MST")
+	}
+	executedAt := "-"
+	if !record.ExecutedAt.IsZero() {
+		executedAt = record.ExecutedAt.Format("2006-01-02 15:04:05 MST")
+	}
+	executedBy := strings.TrimSpace(record.ExecutedBy)
+	if executedBy == "" {
+		executedBy = "-"
+	}
+	errorLine := ""
+	if strings.TrimSpace(record.ExecutionError) != "" {
+		errorLine = fmt.Sprintf("\n*错误*: `%s`", escapeMarkdownV2(limitTelegramText(record.ExecutionError, 500)))
+	}
+	return fmt.Sprintf(
+		"🔁 *K8s 回滚状态*\n\n"+
+			"*集群*: `%s`\n"+
+			"*资源*: `%s`\n"+
+			"*状态*: `%s`\n"+
+			"*执行回滚点击次数*: `%d`\n"+
+			"*下载 YAML 点击次数*: `%d`\n"+
+			"*最后操作*: `%s`\n"+
+			"*最后点击人*: `%s`\n"+
+			"*最后点击时间*: `%s`\n"+
+			"*执行人*: `%s`\n"+
+			"*执行时间*: `%s`\n"+
+			"*回滚ID*: `%s`%s",
+		escapeMarkdownV2(record.ClusterName),
+		escapeMarkdownV2(record.ResourceDisplay),
+		escapeMarkdownV2(statusLabel),
+		record.RollbackClickCount,
+		record.DownloadClickCount,
+		escapeMarkdownV2(lastAction),
+		escapeMarkdownV2(lastBy),
+		escapeMarkdownV2(lastAt),
+		escapeMarkdownV2(executedBy),
+		escapeMarkdownV2(executedAt),
+		escapeMarkdownV2(record.ID),
+		errorLine,
+	)
+}
+
+func editTelegramMessageTextWithMarkup(chatID int64, messageID int, text string, replyMarkup string) error {
+	if strings.TrimSpace(config.Telegram.BotToken) == "" {
+		return nil
+	}
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/editMessageText", config.Telegram.BotToken)
+	values := url.Values{}
+	values.Add("chat_id", strconv.FormatInt(chatID, 10))
+	values.Add("message_id", strconv.Itoa(messageID))
+	values.Add("text", text)
+	values.Add("parse_mode", "MarkdownV2")
+	if strings.TrimSpace(replyMarkup) != "" {
+		values.Add("reply_markup", replyMarkup)
+	}
+	resp, err := httpClient.PostForm(apiURL, values)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tempPath, m.statePath)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("editMessageText status %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+func limitTelegramText(value string, maxRunes int) string {
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return string(runes[:maxRunes]) + "...(truncated)"
 }

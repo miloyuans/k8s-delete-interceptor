@@ -1,0 +1,52 @@
+# Rollback storage configuration example.
+# Merge this block into your protected.yaml under the existing top-level config.
+rollback:
+  enabled: true
+
+  # Users allowed to click "执行回滚" and "下载 YAML" buttons.
+  # Telegram user IDs, not usernames.
+  authorized_telegram_ids:
+    - "123456789"
+
+  # Default false. When false, a record that has already been applied cannot be applied again.
+  allow_reapply: false
+
+  retention_hours: 24
+
+  # If a pod crashes after marking a rollback as running, another click can retry after this timeout.
+  running_timeout_seconds: 300
+
+  poll_interval_seconds: 2
+  field_manager: k8s-delete-interceptor-rollback
+
+  # Storage backend:
+  # - auto: try rollback.mongo first, then audit.mongo, then PVC/file backend
+  # - mongo: require MongoDB, fail startup if unavailable
+  # - file: use PVC/local file backend directly
+  storage:
+    type: auto
+    data_directory: /var/lib/k8s-delete-interceptor
+    lock_ttl_seconds: 60
+
+    # Strong consistency default: fsync is enabled unless disable_fsync=true.
+    # Keep fsync enabled for multi-pod PVC usage.
+    disable_fsync: false
+
+  # Optional dedicated rollback MongoDB config.
+  # If disabled, auto mode can reuse audit.mongo when audit.mongo.enabled=true.
+  mongo:
+    enabled: false
+    uri: ""
+    database: k8s_delete_interceptor
+    collection: rollback_backups
+    retention_days: 30
+    connect_timeout_seconds: 5
+
+# PVC example:
+# volumeMounts:
+#   - name: rollback-data
+#     mountPath: /var/lib/k8s-delete-interceptor
+# volumes:
+#   - name: rollback-data
+#     persistentVolumeClaim:
+#       claimName: k8s-delete-interceptor-rwx

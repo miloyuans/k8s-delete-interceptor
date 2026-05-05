@@ -57,15 +57,15 @@ type DeleteConfirmationRule struct {
 }
 
 type deleteConfirmationResourceKey struct {
-	Cluster    string `json:"cluster"`
-	User       string `json:"user"`
-	Operation  string `json:"operation"`
-	Group      string `json:"group"`
-	Resource   string `json:"resource"`
-	Kind       string `json:"kind"`
-	Namespace  string `json:"namespace"`
-	Name       string `json:"name"`
-	ObjectUID  string `json:"object_uid,omitempty"`
+	Cluster   string `json:"cluster"`
+	User      string `json:"user"`
+	Operation string `json:"operation"`
+	Group     string `json:"group"`
+	Resource  string `json:"resource"`
+	Kind      string `json:"kind"`
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	ObjectUID string `json:"object_uid,omitempty"`
 }
 
 type deleteConfirmationEntry struct {
@@ -89,23 +89,23 @@ type deleteConfirmationEntry struct {
 }
 
 type deleteConfirmationGroup struct {
-	ID              string    `json:"id"`
-	Status          string    `json:"status"`
-	CreatedAt       time.Time `json:"created_at"`
-	SendAfter        time.Time `json:"send_after"`
-	ExpiresAt        time.Time `json:"expires_at"`
-	ApprovedAt       time.Time `json:"approved_at,omitempty"`
-	RespondedAt      time.Time `json:"responded_at,omitempty"`
-	RespondedBy      string    `json:"responded_by,omitempty"`
-	RequestedBy      string    `json:"requested_by"`
-	RequestedByShort string    `json:"requested_by_short"`
-	Kind            string    `json:"kind"`
-	Namespace       string    `json:"namespace"`
-	MatchedPattern  string    `json:"matched_pattern"`
-	TelegramIDs     []string  `json:"telegram_ids"`
-	EntryIDs        []string  `json:"entry_ids"`
-	MessageText     string    `json:"message_text,omitempty"`
-	SentMessages    []telegramSentMessage `json:"sent_messages,omitempty"`
+	ID               string                `json:"id"`
+	Status           string                `json:"status"`
+	CreatedAt        time.Time             `json:"created_at"`
+	SendAfter        time.Time             `json:"send_after"`
+	ExpiresAt        time.Time             `json:"expires_at"`
+	ApprovedAt       time.Time             `json:"approved_at,omitempty"`
+	RespondedAt      time.Time             `json:"responded_at,omitempty"`
+	RespondedBy      string                `json:"responded_by,omitempty"`
+	RequestedBy      string                `json:"requested_by"`
+	RequestedByShort string                `json:"requested_by_short"`
+	Kind             string                `json:"kind"`
+	Namespace        string                `json:"namespace"`
+	MatchedPattern   string                `json:"matched_pattern"`
+	TelegramIDs      []string              `json:"telegram_ids"`
+	EntryIDs         []string              `json:"entry_ids"`
+	MessageText      string                `json:"message_text,omitempty"`
+	SentMessages     []telegramSentMessage `json:"sent_messages,omitempty"`
 }
 
 type telegramSentMessage struct {
@@ -129,9 +129,9 @@ type deleteConfirmationManager struct {
 	consumeWindow   time.Duration
 	aggregateWindow time.Duration
 	pollInterval    time.Duration
-	maxItems         int
-	mu               sync.Mutex
-	stopCh           chan struct{}
+	maxItems        int
+	mu              sync.Mutex
+	stopCh          chan struct{}
 }
 
 type telegramUpdateResponse struct {
@@ -228,8 +228,8 @@ func newDeleteConfirmationManager(cfg DeleteConfirmationConfig) (*deleteConfirma
 		consumeWindow:   time.Duration(cfg.ConsumeWindowSeconds) * time.Second,
 		aggregateWindow: time.Duration(cfg.AggregateWindowSeconds) * time.Second,
 		pollInterval:    time.Duration(cfg.PollIntervalSeconds) * time.Second,
-		maxItems:         cfg.MaxItemsPerMessage,
-		stopCh:           make(chan struct{}),
+		maxItems:        cfg.MaxItemsPerMessage,
+		stopCh:          make(chan struct{}),
 	}
 
 	if err := manager.withStateLock(func(state *deleteConfirmationState) error {
@@ -353,18 +353,18 @@ func (m *deleteConfirmationManager) RequestApproval(req *v1.AdmissionRequest, ma
 		group := state.Groups[groupID]
 		if group.ID == "" {
 			group = deleteConfirmationGroup{
-				ID:              groupID,
-				Status:          deleteConfirmationStatusPending,
-				CreatedAt:       now,
-				SendAfter:       now.Add(m.aggregateWindow),
-				ExpiresAt:       now.Add(m.ttl),
-				RequestedBy:     req.UserInfo.Username,
+				ID:               groupID,
+				Status:           deleteConfirmationStatusPending,
+				CreatedAt:        now,
+				SendAfter:        now.Add(m.aggregateWindow),
+				ExpiresAt:        now.Add(m.ttl),
+				RequestedBy:      req.UserInfo.Username,
 				RequestedByShort: formatNotificationUser(req.UserInfo.Username),
-				Kind:            req.Kind.Kind,
-				Namespace:       formatNamespace(req.Namespace),
-				MatchedPattern:  matchedPattern,
-				TelegramIDs:     normalizeTelegramIDs(telegramIDs),
-				EntryIDs:        []string{},
+				Kind:             req.Kind.Kind,
+				Namespace:        formatNamespace(req.Namespace),
+				MatchedPattern:   matchedPattern,
+				TelegramIDs:      normalizeTelegramIDs(telegramIDs),
+				EntryIDs:         []string{},
 			}
 		}
 		if !stringSliceContains(group.EntryIDs, keyID) {
@@ -539,7 +539,8 @@ func (m *deleteConfirmationManager) buildApprovalKeyboard(group deleteConfirmati
 			continue
 		}
 		keyboard = append(keyboard, []map[string]string{
-			{"text": "Rollback " + limitButtonText(entry.Name), "callback_data": rollbackCallbackData(entry.RollbackID)},
+			{"text": "回滚 " + limitButtonText(entry.Name), "callback_data": rollbackCallbackDataWithAction(rollbackActionApply, entry.RollbackID)},
+			{"text": "下载 YAML", "callback_data": rollbackCallbackDataWithAction(rollbackActionDownload, entry.RollbackID)},
 		})
 	}
 

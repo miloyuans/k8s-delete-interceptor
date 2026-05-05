@@ -14,24 +14,25 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gobwas/glob"
+	"gopkg.in/yaml.v3"
 	v1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	types "k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
-	"gopkg.in/yaml.v3"
 )
 
 var (
-	tlsCert       = flag.String("tlscert", "/etc/certs/tls.crt", "TLS certificate file")
-	tlsKey        = flag.String("tlskey", "/etc/certs/tls.key", "TLS key file")
-	configFile    = flag.String("config", "/etc/config/protected.yaml", "Path to protected config file")
-	webhookNs     = "webhook-system"
+	tlsCert    = flag.String("tlscert", "/etc/certs/tls.crt", "TLS certificate file")
+	tlsKey     = flag.String("tlskey", "/etc/certs/tls.key", "TLS key file")
+	configFile = flag.String("config", "/etc/config/protected.yaml", "Path to protected config file")
+	webhookNs  = "webhook-system"
 )
 
 var httpClient = &http.Client{
@@ -51,8 +52,8 @@ const (
 )
 
 type TelegramConfig struct {
-	BotToken           string   `json:"bot_token" yaml:"bot_token"`
-	ChatIDs            []string `json:"chat_ids" yaml:"chat_ids"`
+	BotToken             string   `json:"bot_token" yaml:"bot_token"`
+	ChatIDs              []string `json:"chat_ids" yaml:"chat_ids"`
 	NotificationTemplate string   `json:"notification_template" yaml:"notification_template"` // 新增模板字段
 }
 
@@ -73,25 +74,25 @@ type GlobalWhitelistConfig struct {
 }
 
 type NotificationContext struct {
-	Title          string
-	TitleIcon      string
-	Action         string
-	ActionIcon     string
-	ActionLabel    string
-	User           string
-	Operation      string
-	OperationType  string
-	OperationLabel string
-	Cluster        string
-	Reason         string
-	Timestamp      string
-	Kind           string
-	Name           string
-	Namespace      string
-	Resource       string
-	ResourceType   string
-	ResourceName   string
-	ChangeDetails string
+	Title             string
+	TitleIcon         string
+	Action            string
+	ActionIcon        string
+	ActionLabel       string
+	User              string
+	Operation         string
+	OperationType     string
+	OperationLabel    string
+	Cluster           string
+	Reason            string
+	Timestamp         string
+	Kind              string
+	Name              string
+	Namespace         string
+	Resource          string
+	ResourceType      string
+	ResourceName      string
+	ChangeDetails     string
 	AttachmentName    string
 	AttachmentContent string
 	RequestUID        string
@@ -99,16 +100,16 @@ type NotificationContext struct {
 }
 
 type Config struct {
-	Enabled           bool                      `json:"enabled" yaml:"enabled"`
-	ClusterName       string                    `json:"cluster_name" yaml:"cluster_name"`
-	Telegram          TelegramConfig            `json:"telegram" yaml:"telegram"`
-	Protected         []ProtectedRule           `json:"protected" yaml:"protected"`
-	GlobalWhitelist   GlobalWhitelistConfig     `json:"global_whitelist" yaml:"global_whitelist"`
-	Audit             AuditConfig               `json:"audit" yaml:"audit"`
-	Lifecycle         LifecycleConfig           `json:"lifecycle" yaml:"lifecycle"`
+	Enabled            bool                      `json:"enabled" yaml:"enabled"`
+	ClusterName        string                    `json:"cluster_name" yaml:"cluster_name"`
+	Telegram           TelegramConfig            `json:"telegram" yaml:"telegram"`
+	Protected          []ProtectedRule           `json:"protected" yaml:"protected"`
+	GlobalWhitelist    GlobalWhitelistConfig     `json:"global_whitelist" yaml:"global_whitelist"`
+	Audit              AuditConfig               `json:"audit" yaml:"audit"`
+	Lifecycle          LifecycleConfig           `json:"lifecycle" yaml:"lifecycle"`
 	Notifications      NotificationControlConfig `json:"notifications" yaml:"notifications"`
-	DeleteConfirmation DeleteConfirmationConfig   `json:"delete_confirmation" yaml:"delete_confirmation"`
-	Rollback           RollbackConfig             `json:"rollback" yaml:"rollback"`
+	DeleteConfirmation DeleteConfirmationConfig  `json:"delete_confirmation" yaml:"delete_confirmation"`
+	Rollback           RollbackConfig            `json:"rollback" yaml:"rollback"`
 }
 
 var config Config
@@ -267,7 +268,7 @@ func buildNotificationContext(reqUID types.UID, user string, kind string, name s
 		Resource:       formatResource(kind, name, namespace),
 		ResourceType:   kind,
 		ResourceName:   name,
-		ChangeDetails: reason,
+		ChangeDetails:  reason,
 		RequestUID:     string(reqUID),
 	}
 }
@@ -457,7 +458,7 @@ func buildSmartNotificationContext(reqUID types.UID, user string, kind string, n
 		Resource:       formatResource(kind, name, namespace),
 		ResourceType:   kind,
 		ResourceName:   name,
-		ChangeDetails: reason,
+		ChangeDetails:  reason,
 		RequestUID:     string(reqUID),
 	}
 }
@@ -468,27 +469,27 @@ func renderNotificationTemplate(template string, ctx NotificationContext) string
 	}
 
 	values := map[string]string{
-		"title":        escapeMarkdownV2(ctx.Title),
-		"title_icon":   escapeMarkdownV2(ctx.TitleIcon),
-		"action":       escapeMarkdownV2(ctx.Action),
-		"action_icon":  escapeMarkdownV2(ctx.ActionIcon),
-		"action_label": escapeMarkdownV2(ctx.ActionLabel),
-		"user":         escapeMarkdownV2(ctx.User),
-		"operation":    escapeMarkdownV2(ctx.Operation),
+		"title":           escapeMarkdownV2(ctx.Title),
+		"title_icon":      escapeMarkdownV2(ctx.TitleIcon),
+		"action":          escapeMarkdownV2(ctx.Action),
+		"action_icon":     escapeMarkdownV2(ctx.ActionIcon),
+		"action_label":    escapeMarkdownV2(ctx.ActionLabel),
+		"user":            escapeMarkdownV2(ctx.User),
+		"operation":       escapeMarkdownV2(ctx.Operation),
 		"operation_type":  escapeMarkdownV2(ctx.OperationType),
 		"operation_label": escapeMarkdownV2(ctx.OperationLabel),
-		"cluster":      escapeMarkdownV2(ctx.Cluster),
-		"reason":       escapeMarkdownV2(ctx.Reason),
-		"time":         escapeMarkdownV2(ctx.Timestamp),
-		"kind":         escapeMarkdownV2(ctx.Kind),
-		"name":         escapeMarkdownV2(ctx.Name),
-		"namespace":    escapeMarkdownV2(ctx.Namespace),
-		"resource":     escapeMarkdownV2(ctx.Resource),
-		"resource_type": escapeMarkdownV2(ctx.ResourceType),
-		"resource_name": escapeMarkdownV2(ctx.ResourceName),
-		"change_details": escapeMarkdownV2(ctx.ChangeDetails),
-		"request_uid":  escapeMarkdownV2(ctx.RequestUID),
-		"rollback_id":  escapeMarkdownV2(ctx.RollbackID),
+		"cluster":         escapeMarkdownV2(ctx.Cluster),
+		"reason":          escapeMarkdownV2(ctx.Reason),
+		"time":            escapeMarkdownV2(ctx.Timestamp),
+		"kind":            escapeMarkdownV2(ctx.Kind),
+		"name":            escapeMarkdownV2(ctx.Name),
+		"namespace":       escapeMarkdownV2(ctx.Namespace),
+		"resource":        escapeMarkdownV2(ctx.Resource),
+		"resource_type":   escapeMarkdownV2(ctx.ResourceType),
+		"resource_name":   escapeMarkdownV2(ctx.ResourceName),
+		"change_details":  escapeMarkdownV2(ctx.ChangeDetails),
+		"request_uid":     escapeMarkdownV2(ctx.RequestUID),
+		"rollback_id":     escapeMarkdownV2(ctx.RollbackID),
 	}
 
 	if strings.Contains(template, "{{") {
@@ -618,7 +619,6 @@ func sendTelegramNotificationWithConfigMode(channel string, telegramCfg Telegram
 	if timestamp == "" {
 		timestamp = time.Now().Format("2006-01-02 15:04:05 MST")
 	}
-
 
 	// 转义所有可能包含特殊 Markdown 字符的变量，确保它们不会破坏模板的 Markdown 格式
 	escapedUser := escapeMarkdownV2(user)
@@ -1119,12 +1119,15 @@ func main() {
 		klog.Infof("Delete confirmation disabled.")
 	}
 	if rollbacker != nil && rollbacker.enabled {
-		klog.Infof("Rollback enabled. Retention: %dh, Authorized Telegram IDs: %d, Mongo enabled: %v", config.Rollback.RetentionHours, len(config.Rollback.AuthorizedTelegramIDs), config.Rollback.Mongo.Enabled || config.Audit.Mongo.Enabled)
+		klog.Infof("Rollback enabled. Retention: %dh, Authorized Telegram IDs: %d, Storage: %s, Allow reapply: %v", config.Rollback.RetentionHours, len(config.Rollback.AuthorizedTelegramIDs), rollbacker.storageName, config.Rollback.AllowReapply)
+		if rollbacker.storageName == rollbackStorageTypeFile {
+			klog.Infof("Rollback file storage directory: %s", filepath.Join(config.Rollback.Storage.DataDirectory, "rollback"))
+		}
 		if len(config.Rollback.AuthorizedTelegramIDs) == 0 {
 			klog.Infof("Rollback buttons are visible, but no Telegram user IDs are authorized to execute rollback.")
 		}
 	} else if config.Rollback.Enabled {
-		klog.Infof("Rollback configured but unavailable; check MongoDB configuration and startup logs.")
+		klog.Infof("Rollback configured but unavailable; check storage configuration and startup logs.")
 	} else {
 		klog.Infof("Rollback disabled.")
 	}

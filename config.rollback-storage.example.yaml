@@ -1,0 +1,70 @@
+# 仅展示与本次改造相关的配置块，可合并进 /etc/config/protected.yaml
+
+rollback:
+  enabled: true
+
+  # 默认 false：同一条 rollback 成功后，后续再次点击“执行回滚”只提示已执行，不再重复 apply。
+  # 如确实需要允许重复 server-side apply，可改为 true。
+  allow_reapply: false
+
+  # 有效期。过期后不允许执行回滚或下载 YAML。
+  retention_hours: 24
+
+  # Telegram 回滚按钮和下载 YAML 按钮的授权用户 ID。
+  # 这里必须是 Telegram numeric user id，不是 username。
+  authorized_telegram_ids:
+    - "123456789"
+    - "987654321"
+
+  # 回滚 apply 使用的 fieldManager。
+  field_manager: k8s-delete-interceptor-rollback
+
+  # 没有 delete_confirmation 模块时，rollback 自己轮询 Telegram callback 的间隔。
+  # 如果 delete_confirmation 开启，rollback 不单独轮询，由 delete_confirmation 统一消费 callback 并转发给 rollback。
+  poll_interval_seconds: 2
+
+  storage:
+    # auto: Mongo 可用则用 Mongo，否则降级为 file。
+    # mongo: 强制 Mongo，不可用则 rollback 禁用。
+    # file: 强制本地/PVC 文件存储。
+    type: auto
+
+    # PVC 挂载目录。多 Pod 模式必须是 ReadWriteMany。
+    data_directory: /var/lib/k8s-delete-interceptor
+
+    # 文件锁 TTL。Pod 异常退出后，超过 TTL 的锁可被其他 Pod 接管。
+    lock_ttl_seconds: 60
+
+    # 默认 true。开启后写 JSON/YAML 使用 temp + fsync + rename，保证尽量不产生半截文件。
+    write_fsync: true
+
+  # 可选。使用 storage.type=mongo 或 auto 且 Mongo 可用时生效。
+  # 不配置或不可用时，auto 会降级到 PVC 文件存储。
+  mongo:
+    enabled: false
+    uri: mongodb://mongo:27017
+    database: k8s_delete_interceptor
+    collection: rollback_backups
+    retention_days: 1
+    connect_timeout_seconds: 5
+
+delete_confirmation:
+  enabled: true
+  state_directory: /var/lib/k8s-delete-interceptor/delete-confirmation
+  ttl_seconds: 300
+  consume_window_seconds: 60
+  aggregate_window_seconds: 2
+  poll_interval_seconds: 2
+  max_items_per_message: 20
+  chat_ids:
+    - "-100123456789"
+  rules:
+    - users:
+        - "system:serviceaccount:*:*"
+      telegram_ids:
+        - "123456789"
+
+telegram:
+  bot_token: "<your-bot-token>"
+  chat_ids:
+    - "-100123456789"

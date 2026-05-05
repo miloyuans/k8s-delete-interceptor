@@ -152,7 +152,7 @@ func (s *fileRollbackStore) LoadRecordWithManifest(id string) (rollbackLoadedRec
 	return rollbackLoadedRecord{Record: record, ManifestYAML: manifest}, nil
 }
 
-func (s *fileRollbackStore) MarkRunning(id string, telegramID string) (RollbackRecord, error) {
+func (s *fileRollbackStore) MarkRunning(id string, actor RollbackActor) (RollbackRecord, error) {
 	return s.mutateRecord(id, func(record *RollbackRecord, now time.Time) error {
 		if now.After(record.ExpiresAt) || record.ExecutionStatus == rollbackStatusExpired {
 			record.ExecutionStatus = rollbackStatusExpired
@@ -166,44 +166,54 @@ func (s *fileRollbackStore) MarkRunning(id string, telegramID string) (RollbackR
 		}
 		record.RollbackClickCount++
 		record.LastClickedAt = now
-		record.LastClickedBy = telegramID
+		record.LastClickedBy = actor.ID
+		record.LastClickedByUsername = actor.Username
+		record.LastClickedByDisplayName = actor.DisplayName
 		record.LastAction = rollbackActionApply
 		record.ExecutionStatus = rollbackStatusRunning
 		record.ExecutionError = ""
-		record.History = appendRollbackHistory(record.History, RollbackHistoryItem{At: now, Action: rollbackActionApply, By: telegramID, Status: rollbackStatusRunning, Message: "rollback apply clicked"})
+		record.History = appendRollbackHistory(record.History, RollbackHistoryItem{At: now, Action: rollbackActionApply, By: actor.Identifier(), Status: rollbackStatusRunning, Message: "rollback apply clicked"})
 		return nil
 	})
 }
 
-func (s *fileRollbackStore) MarkApplied(id string, telegramID string) (RollbackRecord, error) {
+func (s *fileRollbackStore) MarkApplied(id string, actor RollbackActor) (RollbackRecord, error) {
 	return s.mutateRecord(id, func(record *RollbackRecord, now time.Time) error {
 		record.ExecutedAt = now
-		record.ExecutedBy = telegramID
+		record.ExecutedBy = actor.ID
+		record.ExecutedByUsername = actor.Username
+		record.ExecutedByDisplayName = actor.DisplayName
 		record.ExecutionStatus = rollbackStatusApplied
 		record.ExecutionError = ""
 		record.LastClickedAt = now
-		record.LastClickedBy = telegramID
+		record.LastClickedBy = actor.ID
+		record.LastClickedByUsername = actor.Username
+		record.LastClickedByDisplayName = actor.DisplayName
 		record.LastAction = rollbackActionApply
-		record.History = appendRollbackHistory(record.History, RollbackHistoryItem{At: now, Action: rollbackActionApply, By: telegramID, Status: rollbackStatusApplied, Message: "rollback applied"})
+		record.History = appendRollbackHistory(record.History, RollbackHistoryItem{At: now, Action: rollbackActionApply, By: actor.Identifier(), Status: rollbackStatusApplied, Message: "rollback applied"})
 		return nil
 	})
 }
 
-func (s *fileRollbackStore) MarkFailed(id string, telegramID string, message string) (RollbackRecord, error) {
+func (s *fileRollbackStore) MarkFailed(id string, actor RollbackActor, message string) (RollbackRecord, error) {
 	return s.mutateRecord(id, func(record *RollbackRecord, now time.Time) error {
 		record.ExecutedAt = now
-		record.ExecutedBy = telegramID
+		record.ExecutedBy = actor.ID
+		record.ExecutedByUsername = actor.Username
+		record.ExecutedByDisplayName = actor.DisplayName
 		record.ExecutionStatus = rollbackStatusFailed
 		record.ExecutionError = message
 		record.LastClickedAt = now
-		record.LastClickedBy = telegramID
+		record.LastClickedBy = actor.ID
+		record.LastClickedByUsername = actor.Username
+		record.LastClickedByDisplayName = actor.DisplayName
 		record.LastAction = rollbackActionApply
-		record.History = appendRollbackHistory(record.History, RollbackHistoryItem{At: now, Action: rollbackActionApply, By: telegramID, Status: rollbackStatusFailed, Message: message})
+		record.History = appendRollbackHistory(record.History, RollbackHistoryItem{At: now, Action: rollbackActionApply, By: actor.Identifier(), Status: rollbackStatusFailed, Message: message})
 		return nil
 	})
 }
 
-func (s *fileRollbackStore) IncrementDownload(id string, telegramID string) (rollbackLoadedRecord, error) {
+func (s *fileRollbackStore) IncrementDownload(id string, actor RollbackActor) (rollbackLoadedRecord, error) {
 	record, err := s.mutateRecord(id, func(record *RollbackRecord, now time.Time) error {
 		if now.After(record.ExpiresAt) || record.ExecutionStatus == rollbackStatusExpired {
 			record.ExecutionStatus = rollbackStatusExpired
@@ -211,9 +221,11 @@ func (s *fileRollbackStore) IncrementDownload(id string, telegramID string) (rol
 		}
 		record.DownloadClickCount++
 		record.LastClickedAt = now
-		record.LastClickedBy = telegramID
+		record.LastClickedBy = actor.ID
+		record.LastClickedByUsername = actor.Username
+		record.LastClickedByDisplayName = actor.DisplayName
 		record.LastAction = rollbackActionDownload
-		record.History = appendRollbackHistory(record.History, RollbackHistoryItem{At: now, Action: rollbackActionDownload, By: telegramID, Status: record.ExecutionStatus, Message: "rollback yaml requested"})
+		record.History = appendRollbackHistory(record.History, RollbackHistoryItem{At: now, Action: rollbackActionDownload, By: actor.Identifier(), Status: record.ExecutionStatus, Message: "rollback yaml requested"})
 		return nil
 	})
 	if err != nil {

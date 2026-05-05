@@ -15,23 +15,23 @@ import (
 const (
 	defaultNotificationDedupeWindowSeconds = 300
 	defaultNotificationRetryBatch          = 50
-	notificationChannelDefault            = "default"
-	notificationChannelAudit              = "audit"
-	notificationChannelLifecycle          = "lifecycle"
-	notificationStateFileName             = ".notification-state.json"
+	notificationChannelDefault             = "default"
+	notificationChannelAudit               = "audit"
+	notificationChannelLifecycle           = "lifecycle"
+	notificationStateFileName              = ".notification-state.json"
 )
 
 type NotificationControlConfig struct {
-	DedupeWindowSeconds int  `json:"dedupe_window_seconds" yaml:"dedupe_window_seconds"`
+	DedupeWindowSeconds  int  `json:"dedupe_window_seconds" yaml:"dedupe_window_seconds"`
 	RetryFailedOnStartup bool `json:"retry_failed_on_startup" yaml:"retry_failed_on_startup"`
-	MaxRetryBatch       int  `json:"max_retry_batch" yaml:"max_retry_batch"`
+	MaxRetryBatch        int  `json:"max_retry_batch" yaml:"max_retry_batch"`
 }
 
 type notificationSignatureState struct {
-	LastDispatchedAt time.Time `json:"last_dispatched_at"`
-	SuppressedCount  int       `json:"suppressed_count"`
+	LastDispatchedAt  time.Time `json:"last_dispatched_at"`
+	SuppressedCount   int       `json:"suppressed_count"`
 	FirstSuppressedAt time.Time `json:"first_suppressed_at,omitempty"`
-	LastSuppressedAt time.Time `json:"last_suppressed_at,omitempty"`
+	LastSuppressedAt  time.Time `json:"last_suppressed_at,omitempty"`
 }
 
 type pendingNotification struct {
@@ -49,12 +49,12 @@ type notificationState struct {
 }
 
 type notificationManager struct {
-	statePath       string
-	dedupeWindow    time.Duration
-	retryOnStartup  bool
-	maxRetryBatch   int
-	mu              sync.Mutex
-	state           notificationState
+	statePath      string
+	dedupeWindow   time.Duration
+	retryOnStartup bool
+	maxRetryBatch  int
+	mu             sync.Mutex
+	state          notificationState
 }
 
 var notifier *notificationManager

@@ -38,6 +38,22 @@ type RollbackStorageConfig struct {
 	DisableFsync   bool   `json:"disable_fsync" yaml:"disable_fsync"`
 }
 
+type RollbackActor struct {
+	ID          string `json:"id" bson:"id"`
+	Username    string `json:"username,omitempty" bson:"username,omitempty"`
+	DisplayName string `json:"display_name,omitempty" bson:"display_name,omitempty"`
+}
+
+func (a RollbackActor) Identifier() string {
+	if strings.TrimSpace(a.ID) != "" {
+		return strings.TrimSpace(a.ID)
+	}
+	if strings.TrimSpace(a.Username) != "" {
+		return strings.TrimSpace(a.Username)
+	}
+	return strings.TrimSpace(a.DisplayName)
+}
+
 type RollbackTelegramMessage struct {
 	ChatID    int64     `json:"chat_id" bson:"chat_id"`
 	MessageID int       `json:"message_id" bson:"message_id"`
@@ -63,10 +79,10 @@ type RollbackStore interface {
 	SaveRecord(record RollbackRecord, manifestYAML string) error
 	LoadRecord(id string) (RollbackRecord, error)
 	LoadRecordWithManifest(id string) (rollbackLoadedRecord, error)
-	MarkRunning(id string, telegramID string) (RollbackRecord, error)
-	MarkApplied(id string, telegramID string) (RollbackRecord, error)
-	MarkFailed(id string, telegramID string, message string) (RollbackRecord, error)
-	IncrementDownload(id string, telegramID string) (rollbackLoadedRecord, error)
+	MarkRunning(id string, actor RollbackActor) (RollbackRecord, error)
+	MarkApplied(id string, actor RollbackActor) (RollbackRecord, error)
+	MarkFailed(id string, actor RollbackActor, message string) (RollbackRecord, error)
+	IncrementDownload(id string, actor RollbackActor) (rollbackLoadedRecord, error)
 	AddTelegramMessage(id string, msg RollbackTelegramMessage) error
 	CleanupExpired(now time.Time) error
 }

@@ -70,16 +70,20 @@ type RollbackRecord struct {
 	ManifestFile   string `json:"manifest_file,omitempty" bson:"manifest_file,omitempty"`
 	ManifestSHA256 string `json:"manifest_sha256,omitempty" bson:"manifest_sha256,omitempty"`
 
-	ExecutedAt      time.Time `json:"executed_at,omitempty" bson:"executed_at,omitempty"`
-	ExecutedBy      string    `json:"executed_by,omitempty" bson:"executed_by,omitempty"`
-	ExecutionStatus string    `json:"execution_status,omitempty" bson:"execution_status,omitempty"`
-	ExecutionError  string    `json:"execution_error,omitempty" bson:"execution_error,omitempty"`
+	ExecutedAt            time.Time `json:"executed_at,omitempty" bson:"executed_at,omitempty"`
+	ExecutedBy            string    `json:"executed_by,omitempty" bson:"executed_by,omitempty"`
+	ExecutedByUsername    string    `json:"executed_by_username,omitempty" bson:"executed_by_username,omitempty"`
+	ExecutedByDisplayName string    `json:"executed_by_display_name,omitempty" bson:"executed_by_display_name,omitempty"`
+	ExecutionStatus       string    `json:"execution_status,omitempty" bson:"execution_status,omitempty"`
+	ExecutionError        string    `json:"execution_error,omitempty" bson:"execution_error,omitempty"`
 
-	RollbackClickCount int       `json:"rollback_click_count" bson:"rollback_click_count"`
-	DownloadClickCount int       `json:"download_click_count" bson:"download_click_count"`
-	LastClickedAt      time.Time `json:"last_clicked_at,omitempty" bson:"last_clicked_at,omitempty"`
-	LastClickedBy      string    `json:"last_clicked_by,omitempty" bson:"last_clicked_by,omitempty"`
-	LastAction         string    `json:"last_action,omitempty" bson:"last_action,omitempty"`
+	RollbackClickCount       int       `json:"rollback_click_count" bson:"rollback_click_count"`
+	DownloadClickCount       int       `json:"download_click_count" bson:"download_click_count"`
+	LastClickedAt            time.Time `json:"last_clicked_at,omitempty" bson:"last_clicked_at,omitempty"`
+	LastClickedBy            string    `json:"last_clicked_by,omitempty" bson:"last_clicked_by,omitempty"`
+	LastClickedByUsername    string    `json:"last_clicked_by_username,omitempty" bson:"last_clicked_by_username,omitempty"`
+	LastClickedByDisplayName string    `json:"last_clicked_by_display_name,omitempty" bson:"last_clicked_by_display_name,omitempty"`
+	LastAction               string    `json:"last_action,omitempty" bson:"last_action,omitempty"`
 
 	TelegramMessages []RollbackTelegramMessage `json:"telegram_messages,omitempty" bson:"telegram_messages,omitempty"`
 	History          []RollbackHistoryItem     `json:"history,omitempty" bson:"history,omitempty"`
@@ -509,7 +513,8 @@ func (m *rollbackManager) HandleTelegramCallback(callback telegramCallbackQuery)
 		return true
 	}
 
-	telegramID := strconv.FormatInt(callback.From.ID, 10)
+	actor := rollbackActorFromTelegramUser(callback.From)
+	telegramID := actor.ID
 	if !m.isAuthorized(telegramID) {
 		answerTelegramCallback(callback.ID, "You are not allowed to execute rollback.")
 		return true
@@ -517,15 +522,15 @@ func (m *rollbackManager) HandleTelegramCallback(callback telegramCallbackQuery)
 
 	switch action {
 	case rollbackActionDownload:
-		m.handleRollbackYAMLDownload(callback, rollbackID, telegramID)
+		m.handleRollbackYAMLDownload(callback, rollbackID, actor)
 	case rollbackActionApply:
-		m.handleRollbackApply(callback, rollbackID, telegramID)
+		m.handleRollbackApply(callback, rollbackID, actor)
 	}
 	return true
 }
 
-func (m *rollbackManager) handleRollbackYAMLDownload(callback telegramCallbackQuery, rollbackID string, telegramID string) {
-	loaded, err := m.store.IncrementDownload(rollbackID, telegramID)
+func (m *rollbackManager) handleRollbackYAMLDownload(callback telegramCallbackQuery, rollbackID string, actor RollbackActor) {
+	loaded, err := m.store.IncrementDownload(rollbackID, actor)
 	if err != nil {
 		m.answerRollbackStoreError(callback.ID, err)
 		return
@@ -542,7 +547,7 @@ func (m *rollbackManager) handleRollbackYAMLDownload(callback telegramCallbackQu
 	}
 
 	if err := sendRollbackYAMLDocumentToUser(config.Telegram.BotToken, callback.From.ID, loaded.Record, loaded.ManifestYAML); err != nil {
-		klog.Errorf("Failed to send rollback YAML %s to Telegram user %s: %v", rollbackID, telegramID, err)
+		klog.Errorf("Failed to send rollback YAML %s to Telegram user %s: %v", rollbackID, actor.Identifier(), err)
 		answerTelegramCallback(callback.ID, "私聊发送失败，请先私聊机器人发送 /start。")
 		if callback.Message != nil {
 			sendStartBotReminderToGroup(callback.Message.Chat.ID, callback.From)
@@ -552,7 +557,7 @@ func (m *rollbackManager) handleRollbackYAMLDownload(callback telegramCallbackQu
 	answerTelegramCallback(callback.ID, "YAML 已发送到你的私聊。")
 }
 
-func (m *rollbackManager) handleRollbackApply(callback telegramCallbackQuery, rollbackID string, telegramID string) {
+func (m *rollbackManager) handleRollbackApply(callback telegramCallbackQuery, rollbackID string, actor RollbackActor) {
 	loaded, err := m.store.LoadRecordWithManifest(rollbackID)
 	if err != nil {
 		m.answerRollbackStoreError(callback.ID, err)
@@ -563,7 +568,7 @@ func (m *rollbackManager) handleRollbackApply(callback telegramCallbackQuery, ro
 		return
 	}
 
-	runningRecord, err := m.store.MarkRunning(rollbackID, telegramID)
+	runningRecord, err := m.store.MarkRunning(rollbackID, actor)
 	if err != nil {
 		m.answerRollbackStoreError(callback.ID, err)
 		if callback.Message != nil {
@@ -583,7 +588,7 @@ func (m *rollbackManager) handleRollbackApply(callback telegramCallbackQuery, ro
 	applyRecord.ManifestYAML = loaded.ManifestYAML
 	if err := m.applyRecord(applyRecord, loaded.ManifestYAML); err != nil {
 		klog.Errorf("Failed to apply rollback record %s: %v", rollbackID, err)
-		failedRecord, updateErr := m.store.MarkFailed(rollbackID, telegramID, err.Error())
+		failedRecord, updateErr := m.store.MarkFailed(rollbackID, actor, err.Error())
 		if updateErr != nil {
 			klog.Errorf("Failed to persist rollback failed state %s: %v", rollbackID, updateErr)
 			failedRecord = runningRecord
@@ -597,13 +602,15 @@ func (m *rollbackManager) handleRollbackApply(callback telegramCallbackQuery, ro
 		return
 	}
 
-	appliedRecord, err := m.store.MarkApplied(rollbackID, telegramID)
+	appliedRecord, err := m.store.MarkApplied(rollbackID, actor)
 	if err != nil {
 		klog.Errorf("Failed to persist rollback applied state %s: %v", rollbackID, err)
 		appliedRecord = runningRecord
 		appliedRecord.ExecutionStatus = rollbackStatusApplied
 		appliedRecord.ExecutedAt = time.Now()
-		appliedRecord.ExecutedBy = telegramID
+		appliedRecord.ExecutedBy = actor.ID
+		appliedRecord.ExecutedByUsername = actor.Username
+		appliedRecord.ExecutedByDisplayName = actor.DisplayName
 	}
 	if callback.Message != nil {
 		_ = editTelegramMessageTextWithMarkup(callback.Message.Chat.ID, callback.Message.MessageID, buildRollbackStatusMessage(appliedRecord), buildRollbackReplyMarkupForRecord(rollbackID))
@@ -828,6 +835,42 @@ func (m *rollbackManager) setTelegramOffset(offset int) error {
 	return atomicWriteFile(m.statePath, []byte(strconv.Itoa(offset)), 0o600, true)
 }
 
+func rollbackActorFromTelegramUser(user telegramUser) RollbackActor {
+	displayName := strings.TrimSpace(strings.Join([]string{user.FirstName, user.LastName}, " "))
+	if displayName == "" {
+		displayName = strings.TrimSpace(user.Username)
+	}
+	return RollbackActor{
+		ID:          strconv.FormatInt(user.ID, 10),
+		Username:    strings.TrimSpace(user.Username),
+		DisplayName: displayName,
+	}
+}
+
+func rollbackActorMarkdown(id string, username string, displayName string) string {
+	id = strings.TrimSpace(id)
+	username = strings.TrimSpace(username)
+	displayName = strings.TrimSpace(displayName)
+	if id == "" {
+		if username != "" {
+			return "@" + escapeMarkdownV2(username)
+		}
+		if displayName != "" {
+			return escapeMarkdownV2(displayName)
+		}
+		return "`-`"
+	}
+
+	label := displayName
+	if username != "" {
+		label = "@" + username
+	}
+	if strings.TrimSpace(label) == "" {
+		label = "用户 " + id
+	}
+	return fmt.Sprintf("[%s](tg://user?id=%s)", escapeMarkdownV2(label), escapeMarkdownV2(id))
+}
+
 func sendRollbackYAMLDocumentToUser(botToken string, userID int64, record RollbackRecord, manifestYAML string) error {
 	fileName := fmt.Sprintf("rollback-%s-%s-%s.yaml", strings.ToLower(record.Kind), safeFileNamePart(record.Name), record.ID)
 	return sendTelegramDocument(botToken, strconv.FormatInt(userID, 10), fileName, manifestYAML)
@@ -864,10 +907,7 @@ func sendStartBotReminderToGroup(chatID int64, user telegramUser) {
 func buildRollbackStatusMessage(record RollbackRecord) string {
 	statusLabel := rollbackTerminalStatusLabel(record.ExecutionStatus)
 	lastAction := rollbackActionLabel(record.LastAction)
-	lastBy := strings.TrimSpace(record.LastClickedBy)
-	if lastBy == "" {
-		lastBy = "-"
-	}
+	lastBy := rollbackActorMarkdown(record.LastClickedBy, record.LastClickedByUsername, record.LastClickedByDisplayName)
 	lastAt := "-"
 	if !record.LastClickedAt.IsZero() {
 		lastAt = record.LastClickedAt.Format("2006-01-02 15:04:05 MST")
@@ -876,10 +916,7 @@ func buildRollbackStatusMessage(record RollbackRecord) string {
 	if !record.ExecutedAt.IsZero() {
 		executedAt = record.ExecutedAt.Format("2006-01-02 15:04:05 MST")
 	}
-	executedBy := strings.TrimSpace(record.ExecutedBy)
-	if executedBy == "" {
-		executedBy = "-"
-	}
+	executedBy := rollbackActorMarkdown(record.ExecutedBy, record.ExecutedByUsername, record.ExecutedByDisplayName)
 	errorLine := ""
 	if strings.TrimSpace(record.ExecutionError) != "" {
 		errorLine = fmt.Sprintf("\n*错误*: `%s`", escapeMarkdownV2(limitTelegramText(record.ExecutionError, 500)))
@@ -892,9 +929,9 @@ func buildRollbackStatusMessage(record RollbackRecord) string {
 			"*执行回滚点击次数*: `%d`\n"+
 			"*下载 YAML 点击次数*: `%d`\n"+
 			"*最后操作*: `%s`\n"+
-			"*最后点击人*: `%s`\n"+
+			"*最后点击人*: %s\n"+
 			"*最后点击时间*: `%s`\n"+
-			"*执行人*: `%s`\n"+
+			"*执行人*: %s\n"+
 			"*执行时间*: `%s`\n"+
 			"*回滚ID*: `%s`%s",
 		escapeMarkdownV2(record.ClusterName),
@@ -903,9 +940,9 @@ func buildRollbackStatusMessage(record RollbackRecord) string {
 		record.RollbackClickCount,
 		record.DownloadClickCount,
 		escapeMarkdownV2(lastAction),
-		escapeMarkdownV2(lastBy),
+		lastBy,
 		escapeMarkdownV2(lastAt),
-		escapeMarkdownV2(executedBy),
+		executedBy,
 		escapeMarkdownV2(executedAt),
 		escapeMarkdownV2(record.ID),
 		errorLine,

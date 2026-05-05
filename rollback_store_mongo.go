@@ -82,7 +82,7 @@ func (s *mongoRollbackStore) LoadRecordWithManifest(id string) (rollbackLoadedRe
 	return rollbackLoadedRecord{Record: record, ManifestYAML: record.ManifestYAML}, nil
 }
 
-func (s *mongoRollbackStore) MarkRunning(id string, telegramID string) (RollbackRecord, error) {
+func (s *mongoRollbackStore) MarkRunning(id string, actor RollbackActor) (RollbackRecord, error) {
 	now := time.Now()
 	filter := bson.M{
 		"_id":        id,
@@ -106,62 +106,74 @@ func (s *mongoRollbackStore) MarkRunning(id string, telegramID string) (Rollback
 	update := bson.M{
 		"$inc": bson.M{"rollback_click_count": 1},
 		"$set": bson.M{
-			"last_clicked_at":  now,
-			"last_clicked_by":  telegramID,
-			"last_action":      rollbackActionApply,
-			"execution_status": rollbackStatusRunning,
-			"execution_error":  "",
+			"last_clicked_at":              now,
+			"last_clicked_by":              actor.ID,
+			"last_clicked_by_username":     actor.Username,
+			"last_clicked_by_display_name": actor.DisplayName,
+			"last_action":                  rollbackActionApply,
+			"execution_status":             rollbackStatusRunning,
+			"execution_error":              "",
 		},
-		"$push": bson.M{"history": defaultRollbackHistory(rollbackActionApply, telegramID, rollbackStatusRunning, "rollback apply clicked")},
+		"$push": bson.M{"history": defaultRollbackHistory(rollbackActionApply, actor.Identifier(), rollbackStatusRunning, "rollback apply clicked")},
 	}
 	return s.findOneAndUpdate(id, filter, update)
 }
 
-func (s *mongoRollbackStore) MarkApplied(id string, telegramID string) (RollbackRecord, error) {
+func (s *mongoRollbackStore) MarkApplied(id string, actor RollbackActor) (RollbackRecord, error) {
 	now := time.Now()
 	update := bson.M{
 		"$set": bson.M{
-			"executed_at":      now,
-			"executed_by":      telegramID,
-			"execution_status": rollbackStatusApplied,
-			"execution_error":  "",
-			"last_clicked_at":  now,
-			"last_clicked_by":  telegramID,
-			"last_action":      rollbackActionApply,
+			"executed_at":                  now,
+			"executed_by":                  actor.ID,
+			"executed_by_username":         actor.Username,
+			"executed_by_display_name":     actor.DisplayName,
+			"execution_status":             rollbackStatusApplied,
+			"execution_error":              "",
+			"last_clicked_at":              now,
+			"last_clicked_by":              actor.ID,
+			"last_clicked_by_username":     actor.Username,
+			"last_clicked_by_display_name": actor.DisplayName,
+			"last_action":                  rollbackActionApply,
 		},
-		"$push": bson.M{"history": defaultRollbackHistory(rollbackActionApply, telegramID, rollbackStatusApplied, "rollback applied")},
+		"$push": bson.M{"history": defaultRollbackHistory(rollbackActionApply, actor.Identifier(), rollbackStatusApplied, "rollback applied")},
 	}
 	return s.findOneAndUpdate(id, bson.M{"_id": id}, update)
 }
 
-func (s *mongoRollbackStore) MarkFailed(id string, telegramID string, message string) (RollbackRecord, error) {
+func (s *mongoRollbackStore) MarkFailed(id string, actor RollbackActor, message string) (RollbackRecord, error) {
 	now := time.Now()
 	update := bson.M{
 		"$set": bson.M{
-			"executed_at":      now,
-			"executed_by":      telegramID,
-			"execution_status": rollbackStatusFailed,
-			"execution_error":  message,
-			"last_clicked_at":  now,
-			"last_clicked_by":  telegramID,
-			"last_action":      rollbackActionApply,
+			"executed_at":                  now,
+			"executed_by":                  actor.ID,
+			"executed_by_username":         actor.Username,
+			"executed_by_display_name":     actor.DisplayName,
+			"execution_status":             rollbackStatusFailed,
+			"execution_error":              message,
+			"last_clicked_at":              now,
+			"last_clicked_by":              actor.ID,
+			"last_clicked_by_username":     actor.Username,
+			"last_clicked_by_display_name": actor.DisplayName,
+			"last_action":                  rollbackActionApply,
 		},
-		"$push": bson.M{"history": defaultRollbackHistory(rollbackActionApply, telegramID, rollbackStatusFailed, message)},
+		"$push": bson.M{"history": defaultRollbackHistory(rollbackActionApply, actor.Identifier(), rollbackStatusFailed, message)},
 	}
 	return s.findOneAndUpdate(id, bson.M{"_id": id}, update)
 }
 
-func (s *mongoRollbackStore) IncrementDownload(id string, telegramID string) (rollbackLoadedRecord, error) {
+func (s *mongoRollbackStore) IncrementDownload(id string, actor RollbackActor) (rollbackLoadedRecord, error) {
 	now := time.Now()
 	filter := bson.M{"_id": id, "expires_at": bson.M{"$gt": now}}
 	update := bson.M{
 		"$inc": bson.M{"download_click_count": 1},
 		"$set": bson.M{
-			"last_clicked_at": now,
-			"last_clicked_by": telegramID,
-			"last_action":     rollbackActionDownload,
+			"last_clicked_at":              now,
+			"last_clicked_by":              actor.ID,
+			"last_clicked_by_username":     actor.Username,
+			"last_clicked_by_display_name": actor.DisplayName,
+			"last_action":                  rollbackActionDownload,
 		},
-		"$push": bson.M{"history": defaultRollbackHistory(rollbackActionDownload, telegramID, "", "rollback yaml requested")},
+		"$push": bson.M{"history": defaultRollbackHistory(rollbackActionDownload, actor.Identifier(), "", "rollback yaml requested")},
 	}
 	record, err := s.findOneAndUpdate(id, filter, update)
 	if err != nil {

@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	inlineChangeDetailsLimit = 2400
-	diffValueLimit           = 600
+	inlineChangeDetailsLimit = 1800
+	diffValueLimit           = 300
 )
 
 func buildAdmissionChangeDetails(req *v1.AdmissionRequest) (string, string, string) {
@@ -121,10 +121,51 @@ func flattenJSON(prefix string, value interface{}, out map[string]string) {
 			flattenJSON(childPath, typed[key], out)
 		}
 	case []interface{}:
+		if flattenNamedJSONArray(prefix, typed, out) {
+			return
+		}
 		out[prefix] = compactJSONValue(typed)
 	default:
 		out[prefix] = compactJSONValue(typed)
 	}
+}
+
+func flattenNamedJSONArray(prefix string, values []interface{}, out map[string]string) bool {
+	if len(values) == 0 || strings.TrimSpace(prefix) == "" {
+		return false
+	}
+
+	seen := map[string]struct{}{}
+	named := make([]struct {
+		name string
+		obj  map[string]interface{}
+	}, 0, len(values))
+
+	for _, value := range values {
+		obj, ok := value.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		name := strings.TrimSpace(fmt.Sprint(obj["name"]))
+		if name == "" {
+			return false
+		}
+		if _, exists := seen[name]; exists {
+			return false
+		}
+		seen[name] = struct{}{}
+		named = append(named, struct {
+			name string
+			obj  map[string]interface{}
+		}{name: name, obj: obj})
+	}
+
+	sort.Slice(named, func(i, j int) bool { return named[i].name < named[j].name })
+	for _, item := range named {
+		childPath := fmt.Sprintf("%s[name=%s]", prefix, item.name)
+		flattenJSON(childPath, item.obj, out)
+	}
+	return true
 }
 
 func shouldSkipDiffPath(path string) bool {

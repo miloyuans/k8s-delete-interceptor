@@ -27,18 +27,18 @@ const (
 )
 
 type LifecycleConfig struct {
-	Enabled              bool               `json:"enabled" yaml:"enabled"`
-	NotifyStartup        bool               `json:"notify_startup" yaml:"notify_startup"`
-	NotifyShutdown       bool               `json:"notify_shutdown" yaml:"notify_shutdown"`
-	DetectUncleanShutdown bool              `json:"detect_unclean_shutdown" yaml:"detect_unclean_shutdown"`
-	Telegram             AuditTelegramConfig `json:"telegram" yaml:"telegram"`
+	Enabled               bool                `json:"enabled" yaml:"enabled"`
+	NotifyStartup         bool                `json:"notify_startup" yaml:"notify_startup"`
+	NotifyShutdown        bool                `json:"notify_shutdown" yaml:"notify_shutdown"`
+	DetectUncleanShutdown bool                `json:"detect_unclean_shutdown" yaml:"detect_unclean_shutdown"`
+	Telegram              AuditTelegramConfig `json:"telegram" yaml:"telegram"`
 }
 
 type lifecycleState struct {
-	Status     string    `json:"status"`
-	UpdatedAt  time.Time `json:"updated_at"`
-	Instance   string    `json:"instance"`
-	Reason     string    `json:"reason,omitempty"`
+	Status    string    `json:"status"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Instance  string    `json:"instance"`
+	Reason    string    `json:"reason,omitempty"`
 }
 
 type lifecycleManager struct {

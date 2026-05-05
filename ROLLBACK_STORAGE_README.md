@@ -16,8 +16,8 @@ The Telegram group message is updated after clicks and shows:
 - rollback click count
 - YAML download click count
 - last action
-- last clicking Telegram user ID
-- execution user and time
+- last clicking Telegram user (clickable mention)
+- execution user (clickable mention) and time
 - execution error, when failed
 
 If private chat delivery fails, the bot posts a group reminder that mentions the clicking user and asks them to open a private chat with the bot and send `/start`.
@@ -82,3 +82,23 @@ File backend records store metadata in JSON and the executable manifest in a sep
 - Updated: `delete_confirmation.go` rollback buttons
 - Updated: `main.go` rollback storage logging
 - Added: `config.rollback-storage.example.yaml`
+
+## Change notification diff compression
+
+Update audit notifications now flatten Kubernetes arrays that contain a stable `name` field instead of rendering the whole array as JSON. For example, an image-only change is rendered like:
+
+```text
+~ spec.template.spec.containers[name=api].image: old-image -> new-image
+```
+
+This also applies to nested named arrays such as `env`, `volumeMounts`, and similar Kubernetes object lists. Arrays without a stable `name` field still fall back to compact JSON output. The inline notification limit was reduced so very large diffs are sent as an attachment sooner.
+
+## Telegram user display in rollback status
+
+Rollback status messages now store the Telegram actor metadata from callback payloads:
+
+- Telegram user ID
+- username
+- display name
+
+The status message renders the last clicking user and execution user as a clickable Telegram mention, preferring `@username` when available and falling back to the user's display name or ID.

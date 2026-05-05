@@ -118,15 +118,15 @@ type AuditRecord struct {
 }
 
 type auditManager struct {
-	enabled          bool
-	directory        string
-	fileRetention    int
-	queue            chan AuditRecord
-	lastCleanupDate  string
-	cleanupMu        sync.Mutex
-	mongoCollection  *mongo.Collection
-	mongoEnabled     bool
-	mongoTimeout     time.Duration
+	enabled         bool
+	directory       string
+	fileRetention   int
+	queue           chan AuditRecord
+	lastCleanupDate string
+	cleanupMu       sync.Mutex
+	mongoCollection *mongo.Collection
+	mongoEnabled    bool
+	mongoTimeout    time.Duration
 }
 
 var admissionAuditor *auditManager

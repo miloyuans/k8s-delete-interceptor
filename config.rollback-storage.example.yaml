@@ -50,3 +50,14 @@ rollback:
 #   - name: rollback-data
 #     persistentVolumeClaim:
 #       claimName: k8s-delete-interceptor-rwx
+
+# Optional audit notification detail control.
+# ConfigMap/Secret style resources keep full update diff only in audit storage
+# (MongoDB audit collection and local JSONL audit files) and send only a short
+# summary to Telegram. Supports glob and regex: patterns.
+audit:
+  change_detail_audit_only_resources:
+    - configmap
+    - cm
+    - secret
+    - secrets

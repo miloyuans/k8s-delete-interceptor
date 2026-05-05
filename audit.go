@@ -64,13 +64,14 @@ var defaultAuditNotifyResources = []string{
 }
 
 type AuditConfig struct {
-	Enabled           bool                 `json:"enabled" yaml:"enabled"`
-	Directory         string               `json:"directory" yaml:"directory"`
-	FileRetentionDays int                  `json:"file_retention_days" yaml:"file_retention_days"`
-	Create            AuditOperationConfig `json:"create" yaml:"create"`
-	Update            AuditOperationConfig `json:"update" yaml:"update"`
-	Telegram          AuditTelegramConfig  `json:"telegram" yaml:"telegram"`
-	Mongo             MongoAuditConfig     `json:"mongo" yaml:"mongo"`
+	Enabled                        bool                 `json:"enabled" yaml:"enabled"`
+	Directory                      string               `json:"directory" yaml:"directory"`
+	FileRetentionDays              int                  `json:"file_retention_days" yaml:"file_retention_days"`
+	ChangeDetailAuditOnlyResources []string             `json:"change_detail_audit_only_resources" yaml:"change_detail_audit_only_resources"`
+	Create                         AuditOperationConfig `json:"create" yaml:"create"`
+	Update                         AuditOperationConfig `json:"update" yaml:"update"`
+	Telegram                       AuditTelegramConfig  `json:"telegram" yaml:"telegram"`
+	Mongo                          MongoAuditConfig     `json:"mongo" yaml:"mongo"`
 }
 
 type AuditOperationConfig struct {
@@ -112,6 +113,7 @@ type AuditRecord struct {
 	MatchedPolicy      string          `json:"matched_policy,omitempty" bson:"matched_policy,omitempty"`
 	Notified           bool            `json:"notified" bson:"notified"`
 	NotificationReason string          `json:"notification_reason,omitempty" bson:"notification_reason,omitempty"`
+	ChangeDetails      string          `json:"change_details,omitempty" bson:"change_details,omitempty"`
 	DryRun             bool            `json:"dry_run" bson:"dry_run"`
 	Object             json.RawMessage `json:"object,omitempty" bson:"object,omitempty"`
 	OldObject          json.RawMessage `json:"old_object,omitempty" bson:"old_object,omitempty"`
@@ -527,6 +529,10 @@ func auditRecordFileKey(record AuditRecord) string {
 }
 
 func buildAuditRecord(req *v1.AdmissionRequest, decision string, reason string, matchedPolicy string, notified bool, notificationReason string) AuditRecord {
+	return buildAuditRecordWithChangeDetails(req, decision, reason, matchedPolicy, notified, notificationReason, "")
+}
+
+func buildAuditRecordWithChangeDetails(req *v1.AdmissionRequest, decision string, reason string, matchedPolicy string, notified bool, notificationReason string, changeDetails string) AuditRecord {
 	dryRun := false
 	if req.DryRun != nil {
 		dryRun = *req.DryRun
@@ -556,6 +562,7 @@ func buildAuditRecord(req *v1.AdmissionRequest, decision string, reason string, 
 		MatchedPolicy:      matchedPolicy,
 		Notified:           notified,
 		NotificationReason: notificationReason,
+		ChangeDetails:      changeDetails,
 		DryRun:             dryRun,
 		Object:             cloneRawMessage(req.Object.Raw),
 		OldObject:          cloneRawMessage(req.OldObject.Raw),
@@ -601,11 +608,15 @@ func buildLifecycleAuditRecord(event string, reason string, notified bool, notif
 }
 
 func emitAuditRecord(req *v1.AdmissionRequest, decision string, reason string, matchedPolicy string, notified bool, notificationReason string) {
+	emitAuditRecordWithChangeDetails(req, decision, reason, matchedPolicy, notified, notificationReason, "")
+}
+
+func emitAuditRecordWithChangeDetails(req *v1.AdmissionRequest, decision string, reason string, matchedPolicy string, notified bool, notificationReason string, changeDetails string) {
 	if admissionAuditor == nil || !isAuditOperationEnabled(req.Operation) {
 		return
 	}
 
-	admissionAuditor.enqueue(buildAuditRecord(req, decision, reason, matchedPolicy, notified, notificationReason))
+	admissionAuditor.enqueue(buildAuditRecordWithChangeDetails(req, decision, reason, matchedPolicy, notified, notificationReason, changeDetails))
 }
 
 func emitLifecycleAuditRecord(event string, reason string, notified bool, notificationReason string) {

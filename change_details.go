@@ -16,23 +16,55 @@ const (
 	diffValueLimit           = 300
 )
 
-func buildAdmissionChangeDetails(req *v1.AdmissionRequest) (string, string, string) {
+var defaultChangeDetailAuditOnlyResources = []string{
+	"configmap",
+	"configmaps",
+	"cm",
+	"secret",
+	"secrets",
+}
+
+type AdmissionChangeDetails struct {
+	NotificationText  string
+	AuditDetails      string
+	AttachmentName    string
+	AttachmentContent string
+	AuditOnly         bool
+	ChangedFieldCount int
+}
+
+func buildAdmissionChangeDetails(req *v1.AdmissionRequest) AdmissionChangeDetails {
 	if req == nil {
-		return "未获取到请求详情。", "", ""
+		message := "未获取到请求详情。"
+		return AdmissionChangeDetails{NotificationText: message, AuditDetails: message}
 	}
 
+	resourceDesc := formatResource(req.Kind.Kind, req.Name, req.Namespace)
 	switch req.Operation {
 	case v1.Create:
-		return fmt.Sprintf("触发重要资源创建审计：%s。", formatResource(req.Kind.Kind, req.Name, req.Namespace)), "", ""
+		message := fmt.Sprintf("触发重要资源创建审计：%s。", resourceDesc)
+		return AdmissionChangeDetails{NotificationText: message, AuditDetails: message}
 	case v1.Update:
 		diffText := buildAdmissionObjectDiff(req.OldObject.Raw, req.Object.Raw)
 		if strings.TrimSpace(diffText) == "" {
-			return fmt.Sprintf("触发重要资源更新审计：%s，未检测到有效字段差异。", formatResource(req.Kind.Kind, req.Name, req.Namespace)), "", ""
+			message := fmt.Sprintf("触发重要资源更新审计：%s，未检测到有效字段差异。", resourceDesc)
+			return AdmissionChangeDetails{NotificationText: message, AuditDetails: message}
 		}
 
-		full := fmt.Sprintf("触发重要资源更新审计：%s。\n%s", formatResource(req.Kind.Kind, req.Name, req.Namespace), diffText)
+		full := fmt.Sprintf("触发重要资源更新审计：%s。\n%s", resourceDesc, diffText)
+		changedFieldCount := countDiffLines(diffText)
+		if isChangeDetailAuditOnlyResource(req.Kind.Kind, req.Resource.Resource) {
+			message := fmt.Sprintf("触发重要资源更新审计：%s。该资源属于配置/密钥类，变更详情已记录到审计存储，不在通知中展示。变更字段数: %d。", resourceDesc, changedFieldCount)
+			return AdmissionChangeDetails{
+				NotificationText:  message,
+				AuditDetails:      full,
+				AuditOnly:         true,
+				ChangedFieldCount: changedFieldCount,
+			}
+		}
+
 		if len([]rune(full)) <= inlineChangeDetailsLimit {
-			return full, "", ""
+			return AdmissionChangeDetails{NotificationText: full, AuditDetails: full, ChangedFieldCount: changedFieldCount}
 		}
 
 		fileName := fmt.Sprintf(
@@ -41,12 +73,51 @@ func buildAdmissionChangeDetails(req *v1.AdmissionRequest) (string, string, stri
 			safeFileNamePart(req.Name),
 			time.Now().Format("20060102-150405"),
 		)
-		return fmt.Sprintf("触发重要资源更新审计：%s。变更详情较多，已作为附件发送。", formatResource(req.Kind.Kind, req.Name, req.Namespace)), fileName, full
+		message := fmt.Sprintf("触发重要资源更新审计：%s。变更详情较多，已作为附件发送。变更字段数: %d。", resourceDesc, changedFieldCount)
+		return AdmissionChangeDetails{NotificationText: message, AuditDetails: full, AttachmentName: fileName, AttachmentContent: full, ChangedFieldCount: changedFieldCount}
 	case v1.Delete:
-		return fmt.Sprintf("触发重要资源删除拦截：%s。", formatResource(req.Kind.Kind, req.Name, req.Namespace)), "", ""
+		message := fmt.Sprintf("触发重要资源删除拦截：%s。", resourceDesc)
+		return AdmissionChangeDetails{NotificationText: message, AuditDetails: message}
 	default:
-		return fmt.Sprintf("触发重要资源%s操作审计：%s。", strings.ToUpper(string(req.Operation)), formatResource(req.Kind.Kind, req.Name, req.Namespace)), "", ""
+		message := fmt.Sprintf("触发重要资源%s操作审计：%s。", strings.ToUpper(string(req.Operation)), resourceDesc)
+		return AdmissionChangeDetails{NotificationText: message, AuditDetails: message}
 	}
+}
+
+func countDiffLines(diffText string) int {
+	count := 0
+	for _, line := range strings.Split(diffText, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "+ ") || strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "~ ") {
+			count++
+		}
+	}
+	return count
+}
+
+func resolveChangeDetailAuditOnlyResources() []string {
+	if len(config.Audit.ChangeDetailAuditOnlyResources) == 0 {
+		return defaultChangeDetailAuditOnlyResources
+	}
+	return config.Audit.ChangeDetailAuditOnlyResources
+}
+
+func isChangeDetailAuditOnlyResource(kind string, resource string) bool {
+	patterns := resolveChangeDetailAuditOnlyResources()
+	candidates := auditResourceCandidates(kind, resource)
+	for _, pattern := range patterns {
+		for _, candidate := range candidates {
+			matched, _, err := matchPattern(pattern, candidate)
+			if err != nil {
+				klog.Errorf("Invalid change detail audit-only resource pattern '%s': %v. This pattern will be skipped.", pattern, err)
+				break
+			}
+			if matched {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func buildAdmissionObjectDiff(oldRaw []byte, newRaw []byte) string {
@@ -242,10 +313,10 @@ func handleCreateOrUpdateAuditV2(req *v1.AdmissionRequest, rollbackID string) {
 
 	notified := false
 	notificationReason := ""
+	changeDetails := buildAdmissionChangeDetails(req)
 
 	if shouldNotify, userPattern, userMatcher, resourcePattern, resourceMatcher, resourceCandidate := shouldNotifyMutationAudit(req); shouldNotify {
-		changeDetails, attachmentName, attachmentContent := buildAdmissionChangeDetails(req)
-		notificationReason = changeDetails
+		notificationReason = changeDetails.NotificationText
 		ctx := buildSmartNotificationContext(
 			req.UID,
 			req.UserInfo.Username,
@@ -257,15 +328,18 @@ func handleCreateOrUpdateAuditV2(req *v1.AdmissionRequest, rollbackID string) {
 			auditDecisionAllowed,
 			notificationReason,
 		)
-		ctx.ChangeDetails = changeDetails
-		ctx.AttachmentName = attachmentName
-		ctx.AttachmentContent = attachmentContent
+		ctx.ChangeDetails = changeDetails.NotificationText
+		ctx.AttachmentName = changeDetails.AttachmentName
+		ctx.AttachmentContent = changeDetails.AttachmentContent
 		ctx.RollbackID = rollbackID
 		sendAuditTelegramNotification(ctx)
 		notified = true
 		matchedPolicy = fmt.Sprintf("%s_notify:%s|%s", strings.ToLower(string(req.Operation)), userPattern, resourcePattern)
+		if changeDetails.AuditOnly {
+			matchedPolicy += ":change_detail_audit_only"
+		}
 		klog.V(4).Infof("Mutation audit notification matched user pattern '%s' (%s), resource pattern '%s' (%s, candidate '%s')", userPattern, userMatcher, resourcePattern, resourceMatcher, resourceCandidate)
 	}
 
-	emitAuditRecord(req, auditDecisionAllowed, reason, matchedPolicy, notified, notificationReason)
+	emitAuditRecordWithChangeDetails(req, auditDecisionAllowed, reason, matchedPolicy, notified, notificationReason, changeDetails.AuditDetails)
 }

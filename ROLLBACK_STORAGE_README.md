@@ -102,3 +102,36 @@ Rollback status messages now store the Telegram actor metadata from callback pay
 - display name
 
 The status message renders the last clicking user and execution user as a clickable Telegram mention, preferring `@username` when available and falling back to the user's display name or ID.
+
+## ConfigMap / Secret change detail policy
+
+By default, update notifications for configuration and secret resources do not include detailed field-by-field diffs in Telegram. The full diff is still written to audit storage in the `change_details` field of each audit record, so it is available in both MongoDB audit records and local JSONL audit files.
+
+Default audit-only resources:
+
+```yaml
+audit:
+  change_detail_audit_only_resources:
+    - configmap
+    - configmaps
+    - cm
+    - secret
+    - secrets
+```
+
+The list supports the same matcher syntax as other resource rules: plain glob patterns and `regex:` patterns. Set the list explicitly if you want to add more resource types, for example `sealedsecret`, `externalsecret`, or custom configuration CRDs.
+
+For these resources, Telegram receives a compact summary like:
+
+```text
+触发重要资源更新审计：Secret 'app-secret' in namespace 'prod'。该资源属于配置/密钥类，变更详情已记录到审计存储，不在通知中展示。变更字段数: 3。
+```
+
+The complete diff is stored in audit records under:
+
+```json
+{
+  "notification_reason": "summary sent to Telegram",
+  "change_details": "full field-level diff stored for audit"
+}
+```

@@ -42,3 +42,34 @@ Webhook HTTPS：`delete-interceptor.webhook-system.svc:443`。
 ## 说明
 
 这个包是完整可编译代码和 K8s 部署基础，但生产落地前仍建议结合你的集群证书、Ingress、OIDC 登录、备份策略、RWX 存储类做二次适配。
+
+## Web Console v3 upgrade notes
+
+This build extends the Web Console from a single read/write JSON page into an RBAC-driven operations console:
+
+- Custom site name, subtitle, icon and default timezone through Web settings.
+- User dropdown with login, logout and user switching. Username/password login is backed by RuntimeConfig `web_users`; `WEB_ADMIN_TOKEN` remains supported as a bootstrap superadmin token.
+- Built-in RBAC roles: `superadmin`, `viewer`, `auditor`, `operator`, `rule_manager`. Roles map to granular permissions such as `rules:write`, `config:approve`, `datasources:write`, and `users:write`.
+- Data sources are now a standalone navigation entry. Only one enabled + active data source is allowed.
+- Cluster metadata endpoint automatically discovers namespaces, API resources, kinds, users and ServiceAccounts for dropdown selection.
+- Historical events support time range, timezone, namespace, resource, kind, operation, decision and wildcard/regex matching for names and users.
+- ServiceAccount page supports namespace filtering, collapsed details, and mounting an SA user string to an ActorGroup/security policy.
+- Rule configuration supports form-based CREATE / UPDATE / DELETE policies and generates RuntimeConfig scopes/rules automatically.
+- Important configuration changes create a pending config change request by default. Approvers can approve/reject in Web; Telegram notification is sent when Telegram is configured.
+- Configuration versions can be listed, exported as YAML/JSON, and restored by submitting a restore change request.
+
+Bootstrap login options:
+
+```bash
+# Backward compatible token login / superadmin bearer token
+WEB_ADMIN_TOKEN='change-me'
+
+# Optional username/password account inserted into default config on first boot
+WEB_ADMIN_USERNAME='admin'
+WEB_ADMIN_PASSWORD='change-me-too'
+
+# Defaults to true. Set false only for local development if direct apply is desired.
+CONFIG_CHANGE_REQUIRE_APPROVAL='true'
+```
+
+After a config mutation is submitted, check **变更审批** in the Web Console and approve it with a user that has `config:approve` or `*` permission.

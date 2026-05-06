@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -63,12 +64,15 @@ func (m *MongoStore) Init(ctx context.Context) error {
 	}{
 		{"config_versions", mongo.IndexModel{Keys: bson.D{{Key: "version", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"config_versions", mongo.IndexModel{Keys: bson.D{{Key: "active", Value: 1}}, Options: options.Index().SetName("active_unique").SetUnique(true).SetPartialFilterExpression(bson.M{"active": true})}},
+		{"config_change_requests", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
+		{"config_change_requests", mongo.IndexModel{Keys: bson.D{{Key: "status", Value: 1}, {Key: "created_at", Value: -1}}}},
 		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "time", Value: -1}}}},
 		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "cluster", Value: 1}, {Key: "namespace", Value: 1}, {Key: "kind", Value: 1}, {Key: "name", Value: 1}, {Key: "operation", Value: 1}, {Key: "decision", Value: 1}}}},
 		{"rollback_backups", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"rollback_backups", mongo.IndexModel{Keys: bson.D{{Key: "request_uid", Value: 1}}}},
 		{"service_account_inventory", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
+		{"service_account_inventory", mongo.IndexModel{Keys: bson.D{{Key: "namespace", Value: 1}, {Key: "name", Value: 1}}}},
 		{"data_sources", mongo.IndexModel{Keys: bson.D{{Key: "active", Value: 1}}, Options: options.Index().SetName("datasource_active_unique").SetUnique(true).SetPartialFilterExpression(bson.M{"active": true, "enabled": true})}},
 	}
 	for _, x := range idx {
@@ -135,6 +139,101 @@ func (m *MongoStore) GetActiveConfig(ctx context.Context) (*RuntimeConfig, error
 	return &cfg, nil
 }
 
+func (m *MongoStore) GetConfigVersion(ctx context.Context, version int64) (*RuntimeConfig, error) {
+	if m == nil {
+		return nil, errors.New("mongo not configured")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var doc struct {
+		Version int64         `bson:"version"`
+		Config  RuntimeConfig `bson:"config"`
+	}
+	err := m.db.Collection("config_versions").FindOne(ctx, bson.M{"version": version}).Decode(&doc)
+	if err != nil {
+		return nil, err
+	}
+	cfg := doc.Config
+	if cfg.Version == 0 {
+		cfg.Version = doc.Version
+	}
+	return &cfg, validateRuntimeConfig(&cfg)
+}
+
+func (m *MongoStore) ListConfigVersions(ctx context.Context, limit int) ([]ConfigVersionInfo, error) {
+	if m == nil {
+		return nil, errors.New("mongo not configured")
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cur, err := m.db.Collection("config_versions").Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "version", Value: -1}}).SetLimit(int64(limit)))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var out []ConfigVersionInfo
+	for cur.Next(ctx) {
+		var v ConfigVersionInfo
+		if cur.Decode(&v) == nil {
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
+
+func (m *MongoStore) SaveConfigChange(ctx context.Context, cr *ConfigChangeRequest) error {
+	if m == nil || cr == nil {
+		return errors.New("mongo not configured")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	_, err := m.db.Collection("config_change_requests").UpdateOne(ctx, bson.M{"id": cr.ID}, bson.M{"$set": cr}, options.Update().SetUpsert(true))
+	m.healthy.Store(err == nil)
+	return err
+}
+
+func (m *MongoStore) GetConfigChange(ctx context.Context, id string) (*ConfigChangeRequest, error) {
+	if m == nil {
+		return nil, errors.New("mongo not configured")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var cr ConfigChangeRequest
+	err := m.db.Collection("config_change_requests").FindOne(ctx, bson.M{"id": id}).Decode(&cr)
+	return &cr, err
+}
+
+func (m *MongoStore) ListConfigChanges(ctx context.Context, status string, limit int) ([]ConfigChangeRequest, error) {
+	if m == nil {
+		return nil, errors.New("mongo not configured")
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	filter := bson.M{}
+	if status != "" {
+		filter["status"] = status
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cur, err := m.db.Collection("config_change_requests").Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}).SetLimit(int64(limit)))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var out []ConfigChangeRequest
+	for cur.Next(ctx) {
+		var cr ConfigChangeRequest
+		if cur.Decode(&cr) == nil {
+			out = append(out, cr)
+		}
+	}
+	return out, nil
+}
+
 func (m *MongoStore) SaveEvent(ctx context.Context, ev *AdmissionEvent) error {
 	if m == nil || ev == nil {
 		return errors.New("mongo unavailable")
@@ -165,14 +264,14 @@ func (m *MongoStore) ListEventsByQuery(ctx context.Context, q EventQuery) ([]Adm
 		}
 		filter["time"] = timeFilter
 	}
-	addExactFilter(filter, "cluster", q.Cluster)
-	addExactFilter(filter, "namespace", q.Namespace)
-	addExactFilter(filter, "kind", q.Kind)
-	addExactFilter(filter, "resource", q.Resource)
-	addExactFilter(filter, "operation", q.Operation)
-	addExactFilter(filter, "decision", q.Decision)
-	addTextFilter(filter, "name", q.Name)
-	addTextFilter(filter, "user", q.User)
+	addPatternFilter(filter, "cluster", q.Cluster, true)
+	addPatternFilter(filter, "namespace", q.Namespace, true)
+	addPatternFilter(filter, "kind", q.Kind, true)
+	addPatternFilter(filter, "resource", q.Resource, true)
+	addPatternFilter(filter, "operation", q.Operation, true)
+	addPatternFilter(filter, "decision", q.Decision, true)
+	addPatternFilter(filter, "name", q.Name, false)
+	addPatternFilter(filter, "user", q.User, false)
 	if q.Allowed != nil {
 		filter["allowed"] = *q.Allowed
 	}
@@ -195,16 +294,24 @@ func (m *MongoStore) ListEventsByQuery(ctx context.Context, q EventQuery) ([]Adm
 	return out, nil
 }
 
-func addExactFilter(filter bson.M, key, value string) {
-	if value != "" {
+func addPatternFilter(filter bson.M, key, value string, exactDefault bool) {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "*" || strings.EqualFold(value, "all") {
+		return
+	}
+	if strings.HasPrefix(value, "regex:") {
+		filter[key] = bson.M{"$regex": strings.TrimPrefix(value, "regex:"), "$options": "i"}
+		return
+	}
+	if strings.ContainsAny(value, "*?") {
+		filter[key] = bson.M{"$regex": strings.TrimPrefix(wildcardRegex(strings.ToLower(value)).String(), "^"), "$options": "i"}
+		return
+	}
+	if exactDefault {
 		filter[key] = value
+		return
 	}
-}
-
-func addTextFilter(filter bson.M, key, value string) {
-	if value != "" {
-		filter[key] = bson.M{"$regex": regexp.QuoteMeta(value), "$options": "i"}
-	}
+	filter[key] = bson.M{"$regex": regexp.QuoteMeta(value), "$options": "i"}
 }
 
 func (m *MongoStore) SaveRollback(ctx context.Context, rb *RollbackBackup) error {
@@ -248,15 +355,23 @@ func (m *MongoStore) SaveServiceAccounts(ctx context.Context, items []ServiceAcc
 }
 
 func (m *MongoStore) ListServiceAccounts(ctx context.Context, limit int) ([]ServiceAccountInfo, error) {
+	return m.ListServiceAccountsByNamespace(ctx, "", limit)
+}
+
+func (m *MongoStore) ListServiceAccountsByNamespace(ctx context.Context, namespace string, limit int) ([]ServiceAccountInfo, error) {
 	if m == nil {
 		return nil, errors.New("mongo unavailable")
 	}
 	if limit <= 0 || limit > 5000 {
 		limit = 1000
 	}
+	filter := bson.M{}
+	if namespace != "" && namespace != "all" && namespace != "*" {
+		filter["namespace"] = namespace
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	cur, err := m.db.Collection("service_account_inventory").Find(ctx, bson.M{}, options.Find().SetLimit(int64(limit)).SetSort(bson.D{{Key: "namespace", Value: 1}, {Key: "name", Value: 1}}))
+	cur, err := m.db.Collection("service_account_inventory").Find(ctx, filter, options.Find().SetLimit(int64(limit)).SetSort(bson.D{{Key: "namespace", Value: 1}, {Key: "name", Value: 1}}))
 	if err != nil {
 		return nil, err
 	}

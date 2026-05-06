@@ -30,7 +30,7 @@ func NewLocalStore(root string) (*LocalStore, error) {
 		root = "/var/lib/k8s-delete-interceptor"
 	}
 	dirs := []string{
-		"config/versions", "config/lock", "spool/admission-events/pending", "spool/admission-events/processing", "spool/admission-events/synced", "spool/admission-events/failed",
+		"config/versions", "config/lock", "config/changes", "spool/admission-events/pending", "spool/admission-events/processing", "spool/admission-events/synced", "spool/admission-events/failed",
 		"rollback/backups", "rollback/jobs", "rollback/locks", "approvals/pending", "approvals/decided", "tmp",
 	}
 	for _, d := range dirs {
@@ -334,4 +334,126 @@ func fsyncFile(path string) error {
 	}
 	defer f.Close()
 	return f.Sync()
+}
+
+func (s *LocalStore) ListConfigVersions(limit int) ([]ConfigVersionInfo, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	base := filepath.Join(s.root, "config/versions")
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil, err
+	}
+	out := []ConfigVersionInfo{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "runtime-config-v") || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(base, e.Name())
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var cfg RuntimeConfig
+		if json.Unmarshal(b, &cfg) != nil {
+			continue
+		}
+		info, _ := e.Info()
+		created := time.Time{}
+		if info != nil {
+			created = info.ModTime().UTC()
+		}
+		out = append(out, ConfigVersionInfo{Version: cfg.Version, Active: false, Source: "local", CreatedAt: created})
+	}
+	if cur, err := s.LoadLatestConfig(); err == nil {
+		for i := range out {
+			if out[i].Version == cur.Version {
+				out[i].Active = true
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Version > out[j].Version })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *LocalStore) GetConfigVersion(version int64) (*RuntimeConfig, error) {
+	path := filepath.Join(s.root, "config/versions", fmt.Sprintf("runtime-config-v%d.json", version))
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg RuntimeConfig
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, validateRuntimeConfig(&cfg)
+}
+
+func (s *LocalStore) SaveConfigChange(cr *ConfigChangeRequest) error {
+	if cr == nil || cr.ID == "" {
+		return errors.New("config change id is required")
+	}
+	b, err := json.MarshalIndent(cr, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(s.root, "config/changes", safeFileName(cr.ID)+".json")
+	tmp := filepath.Join(s.root, "tmp", safeFileName(cr.ID)+fmt.Sprintf(".%d.change.tmp", time.Now().UnixNano()))
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
+		return err
+	}
+	if err := fsyncFile(tmp); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func (s *LocalStore) GetConfigChange(id string) (*ConfigChangeRequest, error) {
+	b, err := os.ReadFile(filepath.Join(s.root, "config/changes", safeFileName(id)+".json"))
+	if err != nil {
+		return nil, err
+	}
+	var cr ConfigChangeRequest
+	if err := json.Unmarshal(b, &cr); err != nil {
+		return nil, err
+	}
+	return &cr, nil
+}
+
+func (s *LocalStore) ListConfigChanges(status string, limit int) ([]ConfigChangeRequest, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	base := filepath.Join(s.root, "config/changes")
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil, err
+	}
+	out := []ConfigChangeRequest{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(base, e.Name()))
+		if err != nil {
+			continue
+		}
+		var cr ConfigChangeRequest
+		if json.Unmarshal(b, &cr) != nil {
+			continue
+		}
+		if status != "" && cr.Status != status {
+			continue
+		}
+		out = append(out, cr)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }

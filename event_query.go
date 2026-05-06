@@ -1,6 +1,7 @@
 package main
 
 import (
+	"regexp"
 	"strings"
 	"time"
 )
@@ -27,8 +28,8 @@ func (q EventQuery) NormalizedLimit(def int) int {
 	if q.Limit <= 0 {
 		return def
 	}
-	if q.Limit > 2000 {
-		return 2000
+	if q.Limit > 5000 {
+		return 5000
 	}
 	return q.Limit
 }
@@ -40,28 +41,28 @@ func (q EventQuery) Match(ev AdmissionEvent) bool {
 	if !q.End.IsZero() && !ev.Time.Before(q.End) {
 		return false
 	}
-	if q.Cluster != "" && !matchExact(ev.Cluster, q.Cluster) {
+	if q.Cluster != "" && !matchPattern(ev.Cluster, q.Cluster, true) {
 		return false
 	}
-	if q.Namespace != "" && !matchExact(ev.Namespace, q.Namespace) {
+	if q.Namespace != "" && !matchPattern(ev.Namespace, q.Namespace, true) {
 		return false
 	}
-	if q.Kind != "" && !matchExact(ev.Kind, q.Kind) {
+	if q.Kind != "" && !matchPattern(ev.Kind, q.Kind, true) {
 		return false
 	}
-	if q.Resource != "" && !matchExact(ev.Resource, q.Resource) {
+	if q.Resource != "" && !matchPattern(ev.Resource, q.Resource, true) {
 		return false
 	}
-	if q.Operation != "" && !matchExact(ev.Operation, q.Operation) {
+	if q.Operation != "" && !matchPattern(ev.Operation, q.Operation, true) {
 		return false
 	}
-	if q.Decision != "" && !matchExact(ev.Decision, q.Decision) {
+	if q.Decision != "" && !matchPattern(ev.Decision, q.Decision, true) {
 		return false
 	}
-	if q.Name != "" && !matchContains(ev.Name, q.Name) {
+	if q.Name != "" && !matchPattern(ev.Name, q.Name, false) {
 		return false
 	}
-	if q.User != "" && !matchContains(ev.User, q.User) {
+	if q.User != "" && !matchPattern(ev.User, q.User, false) {
 		return false
 	}
 	if q.Allowed != nil && ev.Allowed != *q.Allowed {
@@ -70,10 +71,42 @@ func (q EventQuery) Match(ev AdmissionEvent) bool {
 	return true
 }
 
-func matchExact(v, want string) bool {
-	return strings.EqualFold(strings.TrimSpace(v), strings.TrimSpace(want))
+func matchPattern(value, pattern string, exactDefault bool) bool {
+	v := strings.ToLower(strings.TrimSpace(value))
+	p := strings.ToLower(strings.TrimSpace(pattern))
+	if p == "" || p == "*" || p == "all" {
+		return true
+	}
+	if strings.HasPrefix(p, "regex:") {
+		re, err := regexp.Compile(strings.TrimPrefix(p, "regex:"))
+		return err == nil && re.MatchString(value)
+	}
+	if strings.ContainsAny(p, "*?") {
+		return wildcardRegex(p).MatchString(v)
+	}
+	if exactDefault {
+		return v == p
+	}
+	return strings.Contains(v, p)
 }
 
-func matchContains(v, want string) bool {
-	return strings.Contains(strings.ToLower(strings.TrimSpace(v)), strings.ToLower(strings.TrimSpace(want)))
+func wildcardRegex(pattern string) *regexp.Regexp {
+	var b strings.Builder
+	b.WriteString("^")
+	for _, r := range pattern {
+		switch r {
+		case '*':
+			b.WriteString(".*")
+		case '?':
+			b.WriteString(".")
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	b.WriteString("$")
+	re, err := regexp.Compile(b.String())
+	if err != nil {
+		return regexp.MustCompile("a^")
+	}
+	return re
 }

@@ -84,6 +84,21 @@ func applyRuntimeDefaults(c *RuntimeConfig) {
 			URIEnv: "MONGO_URI", Database: envOr("MONGO_DATABASE", "k8s_delete_interceptor"), Namespace: envOr("POD_NAMESPACE", "webhook-system"), Service: "delete-interceptor-mongodb", ReplicaSet: "rs0",
 		}}
 	}
+	if c.Web.SiteName == "" {
+		c.Web = defaultWebSettings()
+	}
+	if c.Web.DefaultTimezone == "" {
+		c.Web.DefaultTimezone = envOr("WEB_DEFAULT_TIMEZONE", "Asia/Shanghai")
+	}
+	if c.Web.SiteIcon == "" {
+		c.Web.SiteIcon = "⎈"
+	}
+	if len(c.WebRoles) == 0 {
+		c.WebRoles = defaultWebRoles()
+	}
+	if len(c.WebUsers) == 0 {
+		c.WebUsers = defaultWebUsers()
+	}
 }
 
 func validateRuntimeConfig(c *RuntimeConfig) error {
@@ -125,6 +140,32 @@ func validateRuntimeConfig(c *RuntimeConfig) error {
 		}
 		ids["template:"+t.ID] = t.Name
 	}
+	roleIDs := map[string]bool{}
+	for _, r := range c.WebRoles {
+		if r.ID == "" {
+			return errors.New("web role id is required")
+		}
+		if roleIDs[r.ID] {
+			return fmt.Errorf("duplicate web role id %s", r.ID)
+		}
+		roleIDs[r.ID] = true
+	}
+	userIDs := map[string]bool{}
+	for _, u := range c.WebUsers {
+		if strings.TrimSpace(u.Username) == "" {
+			return errors.New("web username is required")
+		}
+		lu := strings.ToLower(strings.TrimSpace(u.Username))
+		if userIDs[lu] {
+			return fmt.Errorf("duplicate web username %s", u.Username)
+		}
+		userIDs[lu] = true
+		for _, role := range u.Roles {
+			if !roleIDs[role] {
+				return fmt.Errorf("web user %s references missing role %s", u.Username, role)
+			}
+		}
+	}
 	for _, r := range c.Rules {
 		if r.ID == "" {
 			return errors.New("rule id is required")
@@ -159,6 +200,9 @@ func defaultRuntimeConfig() *RuntimeConfig {
 		Audit:            AuditConfig{Enabled: true, PreferMongo: true, RecordNoiseEvents: true},
 		Rollback:         RollbackConfig{Enabled: true, CreateDeleteRollback: false, RequireDryRun: true},
 		SystemProtection: SystemProtectionConfig{Enabled: true, SystemResourceLabel: "k8s-delete-interceptor.io/system-resource", InternalMongoResourceValue: "internal-mongodb", ProtectedNamespaces: []string{"webhook-system"}, AllowWebhookSelfMaintenance: true},
+		Web:              defaultWebSettings(),
+		WebRoles:         defaultWebRoles(),
+		WebUsers:         defaultWebUsers(),
 		DataSources:      []DataSource{{ID: "internal_mongo_default", Name: "内置 MongoDB", Type: "internal_mongodb", Enabled: true, Active: true, URIEnv: "MONGO_URI", Database: envOr("MONGO_DATABASE", "k8s_delete_interceptor"), Namespace: envOr("POD_NAMESPACE", "webhook-system"), Service: "delete-interceptor-mongodb", ReplicaSet: "rs0"}},
 		ResourceScopes:   defaultScopes(), ActorGroups: defaultActors(), NotificationTemplates: defaultTemplates(), Rules: defaultRules(),
 	}

@@ -32,6 +32,9 @@ type RuntimeConfig struct {
 	Rollback              RollbackConfig         `json:"rollback" yaml:"rollback" bson:"rollback"`
 	Audit                 AuditConfig            `json:"audit" yaml:"audit" bson:"audit"`
 	SystemProtection      SystemProtectionConfig `json:"system_protection" yaml:"system_protection" bson:"system_protection"`
+	Web                   WebSettings            `json:"web" yaml:"web" bson:"web"`
+	WebRoles              []WebRole              `json:"web_roles" yaml:"web_roles" bson:"web_roles"`
+	WebUsers              []WebUser              `json:"web_users" yaml:"web_users" bson:"web_users"`
 }
 
 type DefaultPolicy struct {
@@ -197,6 +200,55 @@ type NotificationTemplate struct {
 	ParseMode string `json:"parse_mode" yaml:"parse_mode" bson:"parse_mode"`
 	Enabled   bool   `json:"enabled" yaml:"enabled" bson:"enabled"`
 	Body      string `json:"body" yaml:"body" bson:"body"`
+}
+
+type WebSettings struct {
+	SiteName        string `json:"site_name" yaml:"site_name" bson:"site_name"`
+	SiteSubtitle    string `json:"site_subtitle" yaml:"site_subtitle" bson:"site_subtitle"`
+	SiteIcon        string `json:"site_icon" yaml:"site_icon" bson:"site_icon"`
+	DefaultTimezone string `json:"default_timezone" yaml:"default_timezone" bson:"default_timezone"`
+	Theme           string `json:"theme" yaml:"theme" bson:"theme"`
+}
+
+type WebRole struct {
+	ID          string   `json:"id" yaml:"id" bson:"id"`
+	Name        string   `json:"name" yaml:"name" bson:"name"`
+	Description string   `json:"description" yaml:"description" bson:"description"`
+	Permissions []string `json:"permissions" yaml:"permissions" bson:"permissions"`
+	Builtin     bool     `json:"builtin" yaml:"builtin" bson:"builtin"`
+}
+
+type WebUser struct {
+	Username     string    `json:"username" yaml:"username" bson:"username"`
+	DisplayName  string    `json:"display_name" yaml:"display_name" bson:"display_name"`
+	PasswordHash string    `json:"password_hash,omitempty" yaml:"password_hash,omitempty" bson:"password_hash,omitempty"`
+	Roles        []string  `json:"roles" yaml:"roles" bson:"roles"`
+	Enabled      bool      `json:"enabled" yaml:"enabled" bson:"enabled"`
+	CreatedAt    time.Time `json:"created_at,omitempty" yaml:"created_at,omitempty" bson:"created_at,omitempty"`
+	UpdatedAt    time.Time `json:"updated_at,omitempty" yaml:"updated_at,omitempty" bson:"updated_at,omitempty"`
+}
+
+type ConfigChangeRequest struct {
+	ID            string        `json:"id" bson:"id"`
+	Kind          string        `json:"kind" bson:"kind"`
+	Summary       string        `json:"summary" bson:"summary"`
+	DiffSummary   []string      `json:"diff_summary" bson:"diff_summary"`
+	Status        string        `json:"status" bson:"status"`
+	BaseVersion   int64         `json:"base_version" bson:"base_version"`
+	TargetVersion int64         `json:"target_version" bson:"target_version"`
+	CreatedBy     string        `json:"created_by" bson:"created_by"`
+	CreatedAt     time.Time     `json:"created_at" bson:"created_at"`
+	DecidedBy     string        `json:"decided_by,omitempty" bson:"decided_by,omitempty"`
+	DecidedAt     time.Time     `json:"decided_at,omitempty" bson:"decided_at,omitempty"`
+	DecisionNote  string        `json:"decision_note,omitempty" bson:"decision_note,omitempty"`
+	Config        RuntimeConfig `json:"config" bson:"config"`
+}
+
+type ConfigVersionInfo struct {
+	Version   int64     `json:"version" bson:"version"`
+	Active    bool      `json:"active" bson:"active"`
+	Source    string    `json:"source" bson:"source"`
+	CreatedAt time.Time `json:"created_at" bson:"created_at"`
 }
 
 type AdmissionEvent struct {

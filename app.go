@@ -6,8 +6,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -189,28 +187,7 @@ func (a *App) mongoHealthLoop(ctx context.Context) {
 	}
 }
 
-func (a *App) auth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if a.adminToken != "" {
-			expected := "Bearer " + a.adminToken
-			if r.Header.Get("Authorization") != expected && r.URL.Query().Get("token") != a.adminToken {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-		}
-		next(w, r)
-	}
-}
-
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
 }
-func parseLimit(r *http.Request, def int) int {
-	n, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if n <= 0 {
-		return def
-	}
-	return n
-}
-func pathID(prefix, p string) string { return strings.TrimPrefix(strings.TrimPrefix(p, prefix), "/") }

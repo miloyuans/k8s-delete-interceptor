@@ -22,11 +22,16 @@ type telegramSendMessageRequest struct {
 }
 
 func (a *App) notifyEvent(ctx context.Context, cfg *RuntimeConfig, ev *AdmissionEvent, pd PolicyDecision) {
-	if cfg == nil || !cfg.Telegram.Enabled || ev == nil || pd.Rule == nil {
+	if cfg == nil || ev == nil || pd.Rule == nil {
+		return
+	}
+	if !cfg.Telegram.Enabled {
+		log.Printf("telegram notify skipped: global disabled rule=%s event=%s", pd.Rule.ID, ev.ID)
 		return
 	}
 	bind := pd.Rule.Notify
 	if !bind.Enabled {
+		log.Printf("telegram notify skipped: rule notify disabled rule=%s event=%s decision=%s", pd.Rule.ID, ev.ID, pd.Decision)
 		return
 	}
 	tpl := findTemplate(cfg, bind.TemplateID)
@@ -34,6 +39,7 @@ func (a *App) notifyEvent(ctx context.Context, cfg *RuntimeConfig, ev *Admission
 		return
 	}
 	targets := resolveTelegramTargets(cfg, bind)
+	log.Printf("telegram notify resolving: rule=%s event=%s template=%s bots=%v chats=%v users=%v targets=%d", pd.Rule.ID, ev.ID, bind.TemplateID, bind.TelegramBotIDs, bind.TelegramChatIDs, bind.TelegramUserIDs, len(targets))
 	if len(targets) == 0 {
 		log.Printf("telegram notify skipped: no enabled target rule=%s template=%s", pd.Rule.ID, tpl.ID)
 		return
@@ -227,6 +233,7 @@ func escapeForMode(s, mode string) string {
 }
 
 func sendTelegram(ctx context.Context, token, chatID, text, parseMode string, markup any) error {
+	token = normalizeTelegramToken(token)
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	body := telegramSendMessageRequest{ChatID: chatID, Text: text, ParseMode: parseMode, ReplyMarkup: markup}
@@ -241,11 +248,87 @@ func sendTelegram(ctx context.Context, token, chatID, text, parseMode string, ma
 		return err
 	}
 	defer resp.Body.Close()
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("telegram status %s: %s", resp.Status, strings.TrimSpace(string(bodyBytes)))
+		detail := strings.TrimSpace(string(bodyBytes))
+		if resp.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("telegram API 404 Not Found: Bot Token 无效、粘贴了错误 token，或 token_env 读取到的环境变量不正确；Telegram 返回：%s", detail)
+		}
+		return fmt.Errorf("telegram status %s: %s", resp.Status, detail)
 	}
 	return nil
+}
+
+func normalizeTelegramToken(token string) string {
+	token = strings.TrimSpace(token)
+	token = strings.Trim(token, "\"'")
+	if strings.HasPrefix(token, "https://api.telegram.org/bot") {
+		token = strings.TrimPrefix(token, "https://api.telegram.org/bot")
+		if idx := strings.Index(token, "/"); idx >= 0 {
+			token = token[:idx]
+		}
+	}
+	if strings.HasPrefix(strings.ToLower(token), "bot") {
+		token = token[3:]
+	}
+	return strings.TrimSpace(token)
+}
+
+func tokenFingerprint(token string) string {
+	token = normalizeTelegramToken(token)
+	if token == "" {
+		return "empty"
+	}
+	parts := strings.SplitN(token, ":", 2)
+	if len(parts) == 2 {
+		suffix := parts[1]
+		if len(suffix) > 4 {
+			suffix = suffix[len(suffix)-4:]
+		}
+		return fmt.Sprintf("id=%s len=%d suffix=***%s", parts[0], len(token), suffix)
+	}
+	return fmt.Sprintf("len=%d no-colon", len(token))
+}
+
+func validateTelegramBotToken(ctx context.Context, token string) (string, error) {
+	token = normalizeTelegramToken(token)
+	if token == "" {
+		return "", fmt.Errorf("telegram token is empty")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://api.telegram.org/bot%s/getMe", token), nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode/100 != 2 {
+		detail := strings.TrimSpace(string(bodyBytes))
+		if resp.StatusCode == http.StatusNotFound {
+			return "", fmt.Errorf("telegram getMe 404 Not Found: Bot Token 无效或 token_env 指向了错误环境变量；Telegram 返回：%s", detail)
+		}
+		return "", fmt.Errorf("telegram getMe status %s: %s", resp.Status, detail)
+	}
+	var out struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			ID       int64  `json:"id"`
+			Username string `json:"username"`
+		} `json:"result"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(bodyBytes, &out); err != nil {
+		return "", err
+	}
+	if !out.OK {
+		return "", fmt.Errorf("telegram getMe failed: %s", out.Description)
+	}
+	return out.Result.Username, nil
 }
 
 func eventKeyboard(ev *AdmissionEvent) any {

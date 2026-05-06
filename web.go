@@ -786,32 +786,42 @@ func (a *App) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if chatID == "" {
-		log.Printf("telegram test failed: empty chat_id bot_id=%s", bot.ID)
-		http.Error(w, "chat_id is required; create or enable a Chat resource first", 400)
+	token := strings.TrimSpace(bot.Token)
+	tokenSource := "inline_token"
+	if (token == "" || token == "********") && bot.TokenEnv != "" {
+		token = envOr(bot.TokenEnv, "")
+		tokenSource = "env:" + bot.TokenEnv
+	}
+	if token == "" || token == "********" {
+		log.Printf("telegram test failed: empty token bot_id=%s token_env=%s", bot.ID, bot.TokenEnv)
+		http.Error(w, "telegram token is empty; 请填写 Bot Token 或确认 token_env 环境变量已挂载到容器", 400)
 		return
 	}
-	token := bot.Token
-	if token == "" && bot.TokenEnv != "" {
-		token = envOr(bot.TokenEnv, "")
+	token = normalizeTelegramToken(token)
+	log.Printf("telegram test validating token: bot_id=%s source=%s fingerprint=%s", bot.ID, tokenSource, tokenFingerprint(token))
+	botUsername, err := validateTelegramBotToken(r.Context(), token)
+	if err != nil {
+		log.Printf("telegram test token validation failed: bot_id=%s source=%s err=%v", bot.ID, tokenSource, err)
+		http.Error(w, err.Error(), 400)
+		return
 	}
-	if token == "" {
-		log.Printf("telegram test failed: empty token bot_id=%s token_env=%s", bot.ID, bot.TokenEnv)
-		http.Error(w, "telegram token is empty", 400)
+	if chatID == "" {
+		log.Printf("telegram test token valid without chat: bot_id=%s bot_username=%s source=%s", bot.ID, botUsername, tokenSource)
+		writeJSON(w, map[string]any{"ok": true, "validate_only": true, "bot_id": bot.ID, "bot_username": botUsername, "telegram_enabled": cfg.Telegram.Enabled, "token_source": tokenSource})
 		return
 	}
 	msg := body.Message
 	if msg == "" {
 		msg = "K8s Delete Interceptor Telegram test message"
 	}
-	log.Printf("telegram test sending: bot_id=%s chat_id=%s token_env=%s", bot.ID, chatID, bot.TokenEnv)
+	log.Printf("telegram test sending: bot_id=%s bot_username=%s chat_id=%s source=%s", bot.ID, botUsername, chatID, tokenSource)
 	if err := sendTelegram(r.Context(), token, chatID, msg, "Markdown", nil); err != nil {
-		log.Printf("telegram test failed: bot_id=%s chat_id=%s err=%v", bot.ID, chatID, err)
+		log.Printf("telegram test failed: bot_id=%s bot_username=%s chat_id=%s err=%v", bot.ID, botUsername, chatID, err)
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	log.Printf("telegram test sent: bot_id=%s chat_id=%s", bot.ID, chatID)
-	writeJSON(w, map[string]any{"ok": true, "bot_id": bot.ID, "chat_id": chatID, "telegram_enabled": cfg.Telegram.Enabled})
+	log.Printf("telegram test sent: bot_id=%s bot_username=%s chat_id=%s", bot.ID, botUsername, chatID)
+	writeJSON(w, map[string]any{"ok": true, "bot_id": bot.ID, "bot_username": botUsername, "chat_id": chatID, "telegram_enabled": cfg.Telegram.Enabled, "token_source": tokenSource})
 }
 
 func sanitizeTelegram(tg TelegramConfig) TelegramConfig {

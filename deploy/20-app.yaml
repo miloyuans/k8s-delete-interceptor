@@ -1,0 +1,116 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: delete-interceptor-selfsigned
+  namespace: webhook-system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: delete-interceptor-serving-cert
+  namespace: webhook-system
+spec:
+  secretName: delete-interceptor-serving-cert
+  dnsNames:
+    - delete-interceptor.webhook-system.svc
+    - delete-interceptor.webhook-system.svc.cluster.local
+  issuerRef:
+    name: delete-interceptor-selfsigned
+    kind: Issuer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: delete-interceptor
+  namespace: webhook-system
+  labels:
+    app.kubernetes.io/name: k8s-delete-interceptor
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k8s-delete-interceptor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: k8s-delete-interceptor
+    spec:
+      serviceAccountName: delete-interceptor
+      containers:
+        - name: app
+          image: your-registry/k8s-delete-interceptor-v2:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - -config=/etc/config/runtime-config.yaml
+            - -state-dir=/var/lib/k8s-delete-interceptor
+            - -tls-addr=:8443
+            - -web-addr=:8080
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: WEB_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: delete-interceptor-web-secret
+                  key: WEB_ADMIN_TOKEN
+            - name: MONGO_URI
+              valueFrom:
+                secretKeyRef:
+                  name: delete-interceptor-mongodb-secret
+                  key: MONGO_URI
+            - name: MONGO_DATABASE
+              value: k8s_delete_interceptor
+            - name: WEB_BASE_URL
+              value: "https://delete-interceptor.example.com"
+          ports:
+            - name: https
+              containerPort: 8443
+            - name: web
+              containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /etc/config
+              readOnly: true
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            - name: shared
+              mountPath: /var/lib/k8s-delete-interceptor
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: web
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: delete-interceptor-config
+        - name: tls
+          secret:
+            secretName: delete-interceptor-serving-cert
+        - name: shared
+          persistentVolumeClaim:
+            claimName: delete-interceptor-shared-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: delete-interceptor
+  namespace: webhook-system
+  labels:
+    app.kubernetes.io/name: k8s-delete-interceptor
+spec:
+  selector:
+    app.kubernetes.io/name: k8s-delete-interceptor
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+    - name: web
+      port: 8080
+      targetPort: web

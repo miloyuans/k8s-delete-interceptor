@@ -1,0 +1,133 @@
+package main
+
+import (
+	"context"
+	"crypto/sha1"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	admissionv1 "k8s.io/api/admission/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+func (a *App) handleValidate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 20<<20))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var review admissionv1.AdmissionReview
+	if err := json.Unmarshal(body, &review); err != nil {
+		http.Error(w, "invalid AdmissionReview: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if review.Request == nil {
+		http.Error(w, "empty AdmissionReview request", http.StatusBadRequest)
+		return
+	}
+	resp := a.admit(r.Context(), review.Request)
+	outReview := admissionv1.AdmissionReview{TypeMeta: metav1.TypeMeta{APIVersion: "admission.k8s.io/v1", Kind: "AdmissionReview"}, Response: resp}
+	outReview.Response.UID = review.Request.UID
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(outReview)
+}
+
+func (a *App) admit(ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+	cfg := a.Config()
+	if cfg == nil {
+		return &admissionv1.AdmissionResponse{Allowed: false, Result: &metav1.Status{Message: "runtime config unavailable"}}
+	}
+	objMap := map[string]any{}
+	oldMap := map[string]any{}
+	if len(req.Object.Raw) > 0 {
+		_ = json.Unmarshal(req.Object.Raw, &objMap)
+	}
+	if len(req.OldObject.Raw) > 0 {
+		_ = json.Unmarshal(req.OldObject.Raw, &oldMap)
+	}
+	ac := AdmissionContext{
+		Operation: string(req.Operation), APIGroup: req.Resource.Group, APIVersion: req.Resource.Version, Resource: req.Resource.Resource, SubResource: req.SubResource,
+		Kind: req.Kind.Kind, Namespace: req.Namespace, Name: req.Name, User: req.UserInfo.Username, Groups: req.UserInfo.Groups,
+		Object: objMap, OldObject: oldMap, ObjectRaw: req.Object.Raw, OldObjectRaw: req.OldObject.Raw, RequestUID: string(req.UID),
+	}
+	pd := decide(cfg, ac)
+	ev := a.buildEvent(cfg, req, ac, pd)
+	if shouldCreateRollback(cfg, pd, ac) {
+		if rb, err := a.createRollbackBackup(ctx, cfg, ev, ac, pd); err == nil && rb != nil {
+			ev.RollbackID = rb.ID
+		}
+	}
+	a.recordEventAsync(ev)
+	if shouldNotify(pd) {
+		go a.notifyEvent(context.Background(), cfg, ev, pd)
+	}
+	if pd.Decision == DecisionRequireApproval {
+		return &admissionv1.AdmissionResponse{Allowed: false, Result: &metav1.Status{Reason: metav1.StatusReasonForbidden, Message: "请求需要审批，已被拦截。请在 Web Console 或 Telegram 审批后重新执行。"}}
+	}
+	if !pd.Allowed {
+		return &admissionv1.AdmissionResponse{Allowed: false, Result: &metav1.Status{Reason: metav1.StatusReasonForbidden, Message: pd.Reason}}
+	}
+	return &admissionv1.AdmissionResponse{Allowed: true}
+}
+
+func (a *App) buildEvent(cfg *RuntimeConfig, req *admissionv1.AdmissionRequest, ac AdmissionContext, pd PolicyDecision) *AdmissionEvent {
+	id := eventID(cfg.ClusterName, string(req.UID), ac.Operation, ac.APIGroup, ac.Resource, ac.Namespace, ac.Name)
+	ev := &AdmissionEvent{ID: id, RequestUID: string(req.UID), Time: time.Now().UTC(), Cluster: cfg.ClusterName, Operation: ac.Operation, APIVersion: ac.APIVersion, APIGroup: ac.APIGroup, Resource: ac.Resource, SubResource: ac.SubResource, Kind: ac.Kind, Namespace: ac.Namespace, Name: ac.Name, User: ac.User, Groups: ac.Groups, ScopeMatched: pd.ScopeMatched, ScopeIDs: pd.ScopeIDs, Decision: pd.Decision, Allowed: pd.Allowed && pd.Decision != DecisionRequireApproval, Reason: pd.Reason, ChangeClass: pd.ChangeClass, ChangeSummary: pd.ChangeSummary, PersistStatus: "unknown", Object: ac.ObjectRaw, OldObject: ac.OldObjectRaw}
+	if pd.Rule != nil {
+		ev.RuleID = pd.Rule.ID
+		ev.RuleName = pd.Rule.Name
+	}
+	return ev
+}
+
+func eventID(cluster, uid, op, group, res, ns, name string) string {
+	s := strings.Join([]string{cluster, uid, op, group, res, ns, name}, "|")
+	h := sha1.Sum([]byte(s))
+	return fmt.Sprintf("%s_%s_%s_%s_%s", cluster, uid, strings.ToLower(op), res, hex.EncodeToString(h[:8]))
+}
+
+func shouldNotify(pd PolicyDecision) bool {
+	if pd.Rule == nil {
+		return false
+	}
+	if pd.Rule.Notify.Enabled {
+		return true
+	}
+	return pd.Decision == DecisionBlock || pd.Decision == DecisionAllowNotify || pd.Decision == DecisionRequireApproval
+}
+
+func shouldCreateRollback(cfg *RuntimeConfig, pd PolicyDecision, ac AdmissionContext) bool {
+	if cfg == nil || !cfg.Rollback.Enabled || pd.Rule == nil || !pd.Rule.Rollback.Enabled {
+		return false
+	}
+	switch strings.ToUpper(ac.Operation) {
+	case "UPDATE", "DELETE":
+		return len(ac.OldObjectRaw) > 0
+	case "CREATE":
+		return cfg.Rollback.CreateDeleteRollback && len(ac.ObjectRaw) > 0
+	default:
+		return false
+	}
+}
+
+func (a *App) recordEventAsync(ev *AdmissionEvent) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if a.mongo != nil && a.mongo.Healthy() {
+			if err := a.mongo.SaveEvent(ctx, ev); err == nil {
+				return
+			}
+		}
+		_ = a.local.SpoolEvent(ev)
+	}()
+}

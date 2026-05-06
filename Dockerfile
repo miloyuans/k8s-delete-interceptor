@@ -1,22 +1,12 @@
-FROM golang:1.21 AS builder
-
+FROM golang:1.22-alpine AS builder
 WORKDIR /src
-
-COPY go.mod ./
+COPY go.mod go.sum* ./
 RUN go mod download
-
 COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/k8s-delete-interceptor-v2 .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/k8s-delete-interceptor .
-
-FROM alpine:3.20
-
-RUN apk add --no-cache ca-certificates
-
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY --from=builder /out/k8s-delete-interceptor-v2 /k8s-delete-interceptor-v2
 USER 65532:65532
-
-COPY --from=builder /out/k8s-delete-interceptor /usr/local/bin/k8s-delete-interceptor
-
-EXPOSE 8443
-
-ENTRYPOINT ["/usr/local/bin/k8s-delete-interceptor"]
+ENTRYPOINT ["/k8s-delete-interceptor-v2"]

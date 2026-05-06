@@ -1,0 +1,30 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: delete-interceptor-v2
+  annotations:
+    cert-manager.io/inject-ca-from: webhook-system/delete-interceptor-serving-cert
+webhooks:
+  - name: delete-interceptor.webhook-system.svc
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    timeoutSeconds: 3
+    failurePolicy: Fail
+    matchPolicy: Equivalent
+    clientConfig:
+      service:
+        name: delete-interceptor
+        namespace: webhook-system
+        path: /validate
+        port: 443
+    rules:
+      - operations: ["CREATE", "UPDATE", "DELETE"]
+        apiGroups: ["*"]
+        apiVersions: ["*"]
+        resources: ["*", "*/*"]
+        scope: "*"
+    matchConditions:
+      - name: skip-status-subresources
+        expression: "!request.subResource.matches('status')"
+      - name: skip-tokenreviews-subjectaccessreviews
+        expression: "!(request.resource.group == 'authentication.k8s.io' || request.resource.group == 'authorization.k8s.io')"

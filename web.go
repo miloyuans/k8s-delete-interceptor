@@ -32,14 +32,22 @@ func (a *App) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/config/versions", a.require(PermConfigRead, a.handleConfigVersions))
 	mux.HandleFunc("/api/config/restore", a.require(PermConfigRestore, a.handleConfigRestore))
 	mux.HandleFunc("/api/config/changes", a.require(PermConfigRead, a.handleConfigChanges))
+	mux.HandleFunc("/api/config/audits", a.require(PermConfigRead, a.handleConfigAudits))
 	mux.HandleFunc("/api/config/changes/", a.handleConfigChangeAction)
 	mux.HandleFunc("/api/users", a.require(PermUsersWrite, a.handleUsers))
 	mux.HandleFunc("/api/users/", a.require(PermUsersWrite, a.handleUsers))
 	mux.HandleFunc("/api/roles", a.auth(a.handleRoles))
 	mux.HandleFunc("/api/roles/", a.auth(a.handleRoles))
 	mux.HandleFunc("/api/datasources", a.auth(a.handleDatasources))
+	mux.HandleFunc("/api/datasources/", a.auth(a.handleDatasources))
 	mux.HandleFunc("/api/datasources/test", a.require(PermDatasourceWrite, a.handleDatasourceTest))
 	mux.HandleFunc("/api/telegram", a.auth(a.handleTelegram))
+	mux.HandleFunc("/api/telegram/bots", a.auth(a.handleTelegramBots))
+	mux.HandleFunc("/api/telegram/bots/", a.auth(a.handleTelegramBots))
+	mux.HandleFunc("/api/telegram/chats", a.auth(a.handleTelegramChats))
+	mux.HandleFunc("/api/telegram/chats/", a.auth(a.handleTelegramChats))
+	mux.HandleFunc("/api/telegram/users", a.auth(a.handleTelegramUsers))
+	mux.HandleFunc("/api/telegram/users/", a.auth(a.handleTelegramUsers))
 	mux.HandleFunc("/api/telegram/test", a.require(PermTelegramWrite, a.handleTelegramTest))
 	mux.HandleFunc("/api/rules", a.auth(a.handleRules))
 	mux.HandleFunc("/api/rules/", a.auth(a.handleRules))
@@ -333,6 +341,20 @@ func (a *App) handleConfigChanges(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, xs)
 }
 
+func (a *App) handleConfigAudits(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	category := strings.TrimSpace(r.URL.Query().Get("category"))
+	xs, err := a.listConfigAudits(r.Context(), category, parseLimit(r, 100))
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	writeJSON(w, xs)
+}
+
 func (a *App) handleConfigChangeAction(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
@@ -346,22 +368,44 @@ func (a *App) handleConfigChangeAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var body struct {
-			Note string `json:"note"`
+			Note    string `json:"note"`
+			EventID string `json:"event_id"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.EventID == "" {
+			http.Error(w, "event_id is required to avoid concurrent approval conflicts", http.StatusConflict)
+			return
+		}
+		currentChange, err := a.getConfigChange(r.Context(), parts[0])
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		expectedEventID := currentChange.EventID
+		if expectedEventID == "" {
+			expectedEventID = currentChange.ID
+		}
+		if body.EventID != expectedEventID {
+			http.Error(w, "event_id conflict: change has been refreshed or modified", http.StatusConflict)
+			return
+		}
 		var cr *ConfigChangeRequest
-		var err error
+		var actionErr error
 		switch parts[1] {
 		case "approve":
-			cr, err = a.approveConfigChange(r.Context(), parts[0], body.Note, userFromContext(r.Context()))
+			cr, actionErr = a.approveConfigChange(r.Context(), parts[0], body.Note, userFromContext(r.Context()))
 		case "reject":
-			cr, err = a.rejectConfigChange(r.Context(), parts[0], body.Note, userFromContext(r.Context()))
+			cr, actionErr = a.rejectConfigChange(r.Context(), parts[0], body.Note, userFromContext(r.Context()))
 		default:
 			http.Error(w, "unknown action", 400)
 			return
 		}
-		if err != nil {
-			http.Error(w, err.Error(), 500)
+		if actionErr != nil {
+			code := 500
+			if strings.Contains(actionErr.Error(), "conflict") {
+				code = http.StatusConflict
+			}
+			http.Error(w, actionErr.Error(), code)
 			return
 		}
 		sanitizeRuntimeConfigForResponse(&cr.Config)
@@ -505,9 +549,24 @@ func (a *App) handleRoles(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleDatasources(w http.ResponseWriter, r *http.Request) {
 	u := userFromContext(r.Context())
 	cfg := a.Config()
+	if cfg == nil {
+		http.Error(w, "runtime config unavailable", 500)
+		return
+	}
+	id := strings.Trim(pathID("/api/datasources", r.URL.Path), "/")
 	if r.Method == http.MethodGet {
 		if !u.Can(PermConfigRead) {
 			http.Error(w, "forbidden", 403)
+			return
+		}
+		if id != "" {
+			for _, ds := range cfg.DataSources {
+				if ds.ID == id {
+					writeJSON(w, ds)
+					return
+				}
+			}
+			http.NotFound(w, r)
 			return
 		}
 		writeJSON(w, cfg.DataSources)
@@ -517,19 +576,99 @@ func (a *App) handleDatasources(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden: need permission "+PermDatasourceWrite, 403)
 		return
 	}
-	if r.Method != http.MethodPut && r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", 405)
-		return
-	}
-	var items []DataSource
-	if err := json.NewDecoder(r.Body).Decode(&items); err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
 	next := cloneConfig(cfg)
-	next.DataSources = items
-	cr, applied, err := a.proposeConfigChange(r.Context(), *next, "datasources", "更新数据源配置", u, true)
-	writeChangeResponse(w, cr, applied, err)
+	switch r.Method {
+	case http.MethodPost, http.MethodPut:
+		var raw json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		trim := strings.TrimSpace(string(raw))
+		if strings.HasPrefix(trim, "[") {
+			var items []DataSource
+			if err := json.Unmarshal(raw, &items); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			next.DataSources = normalizeDataSources(items)
+		} else {
+			var ds DataSource
+			if err := json.Unmarshal(raw, &ds); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			if ds.ID == "" {
+				ds.ID = id
+			}
+			if ds.ID == "" {
+				http.Error(w, "datasource id is required", 400)
+				return
+			}
+			if ds.Name == "" {
+				ds.Name = ds.ID
+			}
+			if ds.Type == "" {
+				ds.Type = "external_mongodb"
+			}
+			if ds.Database == "" {
+				ds.Database = "k8s_delete_interceptor"
+			}
+			next.DataSources = upsertDataSource(next.DataSources, ds)
+			next.DataSources = normalizeDataSources(next.DataSources)
+		}
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "datasources", "更新数据源配置", u, true)
+		writeChangeResponse(w, cr, applied, err)
+	case http.MethodDelete:
+		if id == "" {
+			http.Error(w, "datasource id is required", 400)
+			return
+		}
+		items := []DataSource{}
+		for _, ds := range next.DataSources {
+			if ds.ID != id {
+				items = append(items, ds)
+			}
+		}
+		next.DataSources = normalizeDataSources(items)
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "datasources", "删除数据源配置", u, true)
+		writeChangeResponse(w, cr, applied, err)
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
+}
+
+func upsertDataSource(items []DataSource, ds DataSource) []DataSource {
+	for i := range items {
+		if items[i].ID == ds.ID {
+			items[i] = ds
+			return items
+		}
+	}
+	return append(items, ds)
+}
+
+func normalizeDataSources(items []DataSource) []DataSource {
+	activeSet := false
+	for i := range items {
+		items[i].ID = strings.TrimSpace(items[i].ID)
+		items[i].Name = strings.TrimSpace(items[i].Name)
+		items[i].Type = strings.TrimSpace(items[i].Type)
+		if items[i].Type == "" {
+			items[i].Type = "external_mongodb"
+		}
+		if items[i].Database == "" {
+			items[i].Database = "k8s_delete_interceptor"
+		}
+		if items[i].Enabled && items[i].Active {
+			if activeSet {
+				items[i].Active = false
+			} else {
+				activeSet = true
+			}
+		}
+	}
+	return items
 }
 
 func (a *App) handleTelegram(w http.ResponseWriter, r *http.Request) {
@@ -648,6 +787,187 @@ func preserveTelegramSecrets(next *TelegramConfig, cur TelegramConfig) {
 			}
 		}
 	}
+}
+
+func (a *App) handleTelegramBots(w http.ResponseWriter, r *http.Request) {
+	a.handleTelegramResource(w, r, "bots")
+}
+
+func (a *App) handleTelegramChats(w http.ResponseWriter, r *http.Request) {
+	a.handleTelegramResource(w, r, "chats")
+}
+
+func (a *App) handleTelegramUsers(w http.ResponseWriter, r *http.Request) {
+	a.handleTelegramResource(w, r, "users")
+}
+
+func (a *App) handleTelegramResource(w http.ResponseWriter, r *http.Request, kind string) {
+	u := userFromContext(r.Context())
+	cfg := a.Config()
+	if cfg == nil {
+		http.Error(w, "runtime config unavailable", 500)
+		return
+	}
+	if r.Method == http.MethodGet {
+		if !u.Can(PermConfigRead) {
+			http.Error(w, "forbidden", 403)
+			return
+		}
+		safe := sanitizeTelegram(cfg.Telegram)
+		switch kind {
+		case "bots":
+			writeJSON(w, safe.Bots)
+		case "chats":
+			writeJSON(w, safe.Chats)
+		case "users":
+			writeJSON(w, safe.Users)
+		}
+		return
+	}
+	if !u.Can(PermTelegramWrite) {
+		http.Error(w, "forbidden: need permission "+PermTelegramWrite, 403)
+		return
+	}
+	id := telegramPathID(kind, r.URL.Path)
+	next := cloneConfig(cfg)
+	switch r.Method {
+	case http.MethodPost, http.MethodPut:
+		switch kind {
+		case "bots":
+			var item TelegramBot
+			if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			if item.ID == "" {
+				item.ID = id
+			}
+			if item.ID == "" {
+				http.Error(w, "bot id is required", 400)
+				return
+			}
+			if item.Name == "" {
+				item.Name = item.ID
+			}
+			if r.Method == http.MethodPost && item.Token == "" && item.TokenEnv == "" {
+				item.TokenEnv = "TELEGRAM_BOT_TOKEN"
+			}
+			next.Telegram.Bots = upsertTelegramBot(next.Telegram.Bots, item)
+		case "chats":
+			var item TelegramChat
+			if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			if item.ID == "" {
+				item.ID = id
+			}
+			if item.ID == "" {
+				http.Error(w, "chat id is required", 400)
+				return
+			}
+			if item.Name == "" {
+				item.Name = item.ID
+			}
+			next.Telegram.Chats = upsertTelegramChat(next.Telegram.Chats, item)
+		case "users":
+			var item TelegramUser
+			if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			if item.ID == "" {
+				item.ID = id
+			}
+			if item.ID == "" {
+				http.Error(w, "telegram user id is required", 400)
+				return
+			}
+			if item.DisplayName == "" {
+				item.DisplayName = item.ID
+			}
+			next.Telegram.Users = upsertTelegramUser(next.Telegram.Users, item)
+		}
+		preserveTelegramSecrets(&next.Telegram, cfg.Telegram)
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "telegram", "更新 Telegram "+kind+" 资源", u, true)
+		writeChangeResponse(w, cr, applied, err)
+	case http.MethodDelete:
+		if id == "" {
+			http.Error(w, "id is required", 400)
+			return
+		}
+		switch kind {
+		case "bots":
+			next.Telegram.Bots = deleteTelegramBot(next.Telegram.Bots, id)
+		case "chats":
+			next.Telegram.Chats = deleteTelegramChat(next.Telegram.Chats, id)
+		case "users":
+			next.Telegram.Users = deleteTelegramUser(next.Telegram.Users, id)
+		}
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "telegram", "删除 Telegram "+kind+" 资源", u, true)
+		writeChangeResponse(w, cr, applied, err)
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
+}
+
+func telegramPathID(kind, p string) string {
+	return strings.Trim(pathID("/api/telegram/"+kind, p), "/")
+}
+
+func upsertTelegramBot(items []TelegramBot, item TelegramBot) []TelegramBot {
+	for i := range items {
+		if items[i].ID == item.ID {
+			items[i] = item
+			return items
+		}
+	}
+	return append(items, item)
+}
+func upsertTelegramChat(items []TelegramChat, item TelegramChat) []TelegramChat {
+	for i := range items {
+		if items[i].ID == item.ID {
+			items[i] = item
+			return items
+		}
+	}
+	return append(items, item)
+}
+func upsertTelegramUser(items []TelegramUser, item TelegramUser) []TelegramUser {
+	for i := range items {
+		if items[i].ID == item.ID {
+			items[i] = item
+			return items
+		}
+	}
+	return append(items, item)
+}
+func deleteTelegramBot(items []TelegramBot, id string) []TelegramBot {
+	out := []TelegramBot{}
+	for _, item := range items {
+		if item.ID != id {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+func deleteTelegramChat(items []TelegramChat, id string) []TelegramChat {
+	out := []TelegramChat{}
+	for _, item := range items {
+		if item.ID != id {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+func deleteTelegramUser(items []TelegramUser, id string) []TelegramUser {
+	out := []TelegramUser{}
+	for _, item := range items {
+		if item.ID != id {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func (a *App) handleRules(w http.ResponseWriter, r *http.Request) {

@@ -75,9 +75,11 @@ func (a *App) BuildMetadata(ctx context.Context) ClusterMetadata {
 	md.MetadataFallback = true
 	md.Source = "config-only"
 	a.storeMetadata(md)
-	go func() {
-		_, _ = a.RefreshMetadata(context.Background(), false)
-	}()
+	if strings.EqualFold(strings.TrimSpace(envOr("METADATA_AUTO_REFRESH_ON_MISS", "false")), "true") {
+		go func() {
+			_, _ = a.RefreshMetadata(context.Background(), false)
+		}()
+	}
 	return md
 }
 

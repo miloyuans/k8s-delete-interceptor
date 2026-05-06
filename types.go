@@ -230,6 +230,9 @@ type WebUser struct {
 
 type ConfigChangeRequest struct {
 	ID            string        `json:"id" bson:"id"`
+	EventID       string        `json:"event_id" bson:"event_id"`
+	BaseHash      string        `json:"base_hash,omitempty" bson:"base_hash,omitempty"`
+	TargetHash    string        `json:"target_hash,omitempty" bson:"target_hash,omitempty"`
 	Kind          string        `json:"kind" bson:"kind"`
 	Summary       string        `json:"summary" bson:"summary"`
 	DiffSummary   []string      `json:"diff_summary" bson:"diff_summary"`
@@ -242,6 +245,20 @@ type ConfigChangeRequest struct {
 	DecidedAt     time.Time     `json:"decided_at,omitempty" bson:"decided_at,omitempty"`
 	DecisionNote  string        `json:"decision_note,omitempty" bson:"decision_note,omitempty"`
 	Config        RuntimeConfig `json:"config" bson:"config"`
+}
+
+type ConfigAuditEvent struct {
+	ID            string    `json:"id" bson:"id"`
+	EventID       string    `json:"event_id" bson:"event_id"`
+	Kind          string    `json:"kind" bson:"kind"`
+	Category      string    `json:"category" bson:"category"`
+	Summary       string    `json:"summary" bson:"summary"`
+	DiffSummary   []string  `json:"diff_summary,omitempty" bson:"diff_summary,omitempty"`
+	BaseVersion   int64     `json:"base_version" bson:"base_version"`
+	TargetVersion int64     `json:"target_version" bson:"target_version"`
+	Actor         string    `json:"actor" bson:"actor"`
+	CreatedAt     time.Time `json:"created_at" bson:"created_at"`
+	Status        string    `json:"status" bson:"status"`
 }
 
 type ConfigVersionInfo struct {

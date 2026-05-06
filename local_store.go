@@ -30,7 +30,7 @@ func NewLocalStore(root string) (*LocalStore, error) {
 		root = "/var/lib/k8s-delete-interceptor"
 	}
 	dirs := []string{
-		"config/versions", "config/lock", "config/changes", "spool/admission-events/pending", "spool/admission-events/processing", "spool/admission-events/synced", "spool/admission-events/failed",
+		"config/versions", "config/lock", "config/changes", "config/audits", "spool/admission-events/pending", "spool/admission-events/processing", "spool/admission-events/synced", "spool/admission-events/failed",
 		"rollback/backups", "rollback/jobs", "rollback/locks", "approvals/pending", "approvals/decided", "metadata", "tmp",
 	}
 	for _, d := range dirs {
@@ -480,6 +480,59 @@ func (s *LocalStore) ListConfigChanges(status string, limit int) ([]ConfigChange
 			continue
 		}
 		out = append(out, cr)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *LocalStore) SaveConfigAudit(ev *ConfigAuditEvent) error {
+	if ev == nil || ev.ID == "" {
+		return errors.New("config audit id is required")
+	}
+	b, err := json.MarshalIndent(ev, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(s.root, "config/audits", safeFileName(ev.ID)+".json")
+	tmp := filepath.Join(s.root, "tmp", safeFileName(ev.ID)+fmt.Sprintf(".%d.audit.tmp", time.Now().UnixNano()))
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
+		return err
+	}
+	if err := fsyncFile(tmp); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func (s *LocalStore) ListConfigAudits(category string, limit int) ([]ConfigAuditEvent, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	base := filepath.Join(s.root, "config/audits")
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil, err
+	}
+	out := []ConfigAuditEvent{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(base, e.Name()))
+		if err != nil {
+			continue
+		}
+		var ev ConfigAuditEvent
+		if json.Unmarshal(b, &ev) != nil {
+			continue
+		}
+		if category != "" && ev.Category != category {
+			continue
+		}
+		out = append(out, ev)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	if len(out) > limit {

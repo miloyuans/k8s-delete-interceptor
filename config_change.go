@@ -24,6 +24,29 @@ func newChangeID(kind, user string) string {
 	return "chg_" + hex.EncodeToString(h[:8])
 }
 
+func newConfigEventID(kind, user string) string {
+	s := fmt.Sprintf("event|%s|%s|%d", kind, user, time.Now().UnixNano())
+	h := sha1.Sum([]byte(s))
+	return "cfg_evt_" + hex.EncodeToString(h[:10])
+}
+
+func configChangeCategory(kind string) string {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "rules", "sa_mount", "raw_config", "restore":
+		return "business_config"
+	case "settings":
+		return "site_settings"
+	case "users", "roles":
+		return "identity_access"
+	case "datasources":
+		return "data_source"
+	case "telegram":
+		return "notification"
+	default:
+		return "system_config"
+	}
+}
+
 func configApprovalRequired() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("CONFIG_CHANGE_REQUIRE_APPROVAL")))
 	return v == "" || v == "1" || v == "true" || v == "yes"
@@ -55,7 +78,12 @@ func (a *App) proposeConfigChange(ctx context.Context, cfg RuntimeConfig, kind, 
 	if user != nil {
 		createdBy = user.Username
 	}
-	cr := &ConfigChangeRequest{ID: newChangeID(kind, createdBy), Kind: kind, Summary: summary, DiffSummary: diffConfigSummary(cur, &cfg), Status: ChangePending, BaseVersion: base, TargetVersion: cfg.Version, CreatedBy: createdBy, CreatedAt: time.Now().UTC(), Config: cfg}
+	diff := diffConfigSummary(cur, &cfg)
+	cr := &ConfigChangeRequest{ID: newChangeID(kind, createdBy), EventID: newConfigEventID(kind, createdBy), Kind: kind, Summary: summary, DiffSummary: diff, Status: ChangePending, BaseVersion: base, TargetVersion: cfg.Version, CreatedBy: createdBy, CreatedAt: time.Now().UTC(), Config: cfg}
+	if cur != nil {
+		cr.BaseHash = hashJSON(cur)
+	}
+	cr.TargetHash = hashJSON(&cfg)
 	if forceApply || !configApprovalRequiredForKind(kind) {
 		if err := a.applyConfig(ctx, &cfg, "web:"+kind); err != nil {
 			return nil, false, err
@@ -63,7 +91,7 @@ func (a *App) proposeConfigChange(ctx context.Context, cfg RuntimeConfig, kind, 
 		cr.Status = ChangeApproved
 		cr.DecidedBy = createdBy
 		cr.DecidedAt = time.Now().UTC()
-		_ = a.saveConfigChange(ctx, cr)
+		_ = a.saveConfigAudit(ctx, auditFromChange(cr, ChangeApproved))
 		return cr, true, nil
 	}
 	if err := a.saveConfigChange(ctx, cr); err != nil {
@@ -93,6 +121,60 @@ func (a *App) saveConfigChange(ctx context.Context, cr *ConfigChangeRequest) err
 		}
 	}
 	return a.local.SaveConfigChange(cr)
+}
+
+func auditFromChange(cr *ConfigChangeRequest, status string) *ConfigAuditEvent {
+	if cr == nil {
+		return nil
+	}
+	id := cr.EventID
+	if id == "" {
+		id = newConfigEventID(cr.Kind, cr.CreatedBy)
+	}
+	return &ConfigAuditEvent{
+		ID:            id,
+		EventID:       id,
+		Kind:          cr.Kind,
+		Category:      configChangeCategory(cr.Kind),
+		Summary:       cr.Summary,
+		DiffSummary:   cr.DiffSummary,
+		BaseVersion:   cr.BaseVersion,
+		TargetVersion: cr.TargetVersion,
+		Actor:         cr.CreatedBy,
+		CreatedAt:     cr.CreatedAt,
+		Status:        status,
+	}
+}
+
+func (a *App) saveConfigAudit(ctx context.Context, ev *ConfigAuditEvent) error {
+	if ev == nil {
+		return nil
+	}
+	if ev.CreatedAt.IsZero() {
+		ev.CreatedAt = time.Now().UTC()
+	}
+	if ev.ID == "" {
+		ev.ID = newConfigEventID(ev.Kind, ev.Actor)
+	}
+	if ev.EventID == "" {
+		ev.EventID = ev.ID
+	}
+	if a.mongo != nil && a.mongo.Healthy() {
+		if err := a.mongo.SaveConfigAudit(ctx, ev); err == nil {
+			_ = a.local.SaveConfigAudit(ev)
+			return nil
+		}
+	}
+	return a.local.SaveConfigAudit(ev)
+}
+
+func (a *App) listConfigAudits(ctx context.Context, category string, limit int) ([]ConfigAuditEvent, error) {
+	if a.mongo != nil && a.mongo.Healthy() {
+		if xs, err := a.mongo.ListConfigAudits(ctx, category, limit); err == nil {
+			return xs, nil
+		}
+	}
+	return a.local.ListConfigAudits(category, limit)
 }
 
 func (a *App) getConfigChange(ctx context.Context, id string) (*ConfigChangeRequest, error) {
@@ -130,9 +212,8 @@ func (a *App) approveConfigChange(ctx context.Context, id, note string, user *Au
 		return nil, fmt.Errorf("change %s is %s", id, cr.Status)
 	}
 	cur := a.Config()
-	if cur != nil && cr.Config.Version <= cur.Version {
-		cr.Config.Version = cur.Version + 1
-		cr.TargetVersion = cr.Config.Version
+	if cur != nil && cur.Version != cr.BaseVersion {
+		return nil, fmt.Errorf("config version conflict: current v%d, change %s is based on v%d; please recreate this change", cur.Version, id, cr.BaseVersion)
 	}
 	if err := a.applyConfig(ctx, &cr.Config, "approved:"+cr.Kind); err != nil {
 		return nil, err
@@ -143,7 +224,11 @@ func (a *App) approveConfigChange(ctx context.Context, id, note string, user *Au
 	}
 	cr.DecidedAt = time.Now().UTC()
 	cr.DecisionNote = note
-	return cr, a.saveConfigChange(ctx, cr)
+	if err := a.saveConfigChange(ctx, cr); err != nil {
+		return cr, err
+	}
+	_ = a.saveConfigAudit(ctx, auditFromChange(cr, ChangeApproved))
+	return cr, nil
 }
 
 func (a *App) rejectConfigChange(ctx context.Context, id, note string, user *AuthUser) (*ConfigChangeRequest, error) {
@@ -160,7 +245,11 @@ func (a *App) rejectConfigChange(ctx context.Context, id, note string, user *Aut
 	}
 	cr.DecidedAt = time.Now().UTC()
 	cr.DecisionNote = note
-	return cr, a.saveConfigChange(ctx, cr)
+	if err := a.saveConfigChange(ctx, cr); err != nil {
+		return cr, err
+	}
+	_ = a.saveConfigAudit(ctx, auditFromChange(cr, ChangeRejected))
+	return cr, nil
 }
 
 func diffConfigSummary(old, next *RuntimeConfig) []string {
@@ -207,7 +296,7 @@ func (a *App) notifyConfigChange(ctx context.Context, cr *ConfigChangeRequest) {
 	if cfg == nil || !cfg.Telegram.Enabled || cr == nil {
 		return
 	}
-	text := fmt.Sprintf("⚙️ 配置变更待审批\n类型: %s\n申请人: %s\n版本: v%d -> v%d\n摘要: %s\n差异: %s", cr.Kind, cr.CreatedBy, cr.BaseVersion, cr.TargetVersion, cr.Summary, strings.Join(cr.DiffSummary, ", "))
+	text := fmt.Sprintf("⚙️ 配置变更待审批\n事件ID: %s\n类型: %s\n申请人: %s\n版本: v%d -> v%d\n摘要: %s\n差异: %s", cr.EventID, cr.Kind, cr.CreatedBy, cr.BaseVersion, cr.TargetVersion, cr.Summary, strings.Join(cr.DiffSummary, ", "))
 	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
 	markup := any(nil)
 	if web != "" {

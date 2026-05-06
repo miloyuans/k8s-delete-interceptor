@@ -235,6 +235,45 @@ func (m *MongoStore) ListConfigChanges(ctx context.Context, status string, limit
 	return out, nil
 }
 
+func (m *MongoStore) SaveConfigAudit(ctx context.Context, ev *ConfigAuditEvent) error {
+	if m == nil || ev == nil {
+		return errors.New("mongo not configured")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := m.db.Collection("config_audit_events").UpdateOne(ctx, bson.M{"id": ev.ID}, bson.M{"$set": ev}, options.Update().SetUpsert(true))
+	m.healthy.Store(err == nil)
+	return err
+}
+
+func (m *MongoStore) ListConfigAudits(ctx context.Context, category string, limit int) ([]ConfigAuditEvent, error) {
+	if m == nil {
+		return nil, errors.New("mongo not configured")
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	filter := bson.M{}
+	if strings.TrimSpace(category) != "" {
+		filter["category"] = strings.TrimSpace(category)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cur, err := m.db.Collection("config_audit_events").Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}).SetLimit(int64(limit)))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	out := []ConfigAuditEvent{}
+	for cur.Next(ctx) {
+		var ev ConfigAuditEvent
+		if cur.Decode(&ev) == nil {
+			out = append(out, ev)
+		}
+	}
+	return out, nil
+}
+
 func (m *MongoStore) SaveEvent(ctx context.Context, ev *AdmissionEvent) error {
 	if m == nil || ev == nil {
 		return errors.New("mongo unavailable")

@@ -68,3 +68,31 @@ audit:
 # delete_confirmation.rules 里的用户可 Telegram 确认后放行，其他用户默认拒绝。
 delete_policy:
   default_block: true
+  # 安全控制器旁路：解决 default_block=true 时集群自维护 Pod 删除被误拦截的问题。
+  # 只建议用于 controller-owned Pod 删除，不建议用它替代 global_whitelist。
+  controller_bypass:
+    enabled: true
+    audit: true      # 审计记录 controller 自动放行的删除
+    notify: false    # 默认不发 Telegram，避免 rollout / reschedule 时刷屏
+    rules:
+      - name: k8s-controller-owned-pod-delete
+        users:
+          - system:kube-controller-manager
+          - system:serviceaccount:kube-system:replicaset-controller
+          - system:serviceaccount:kube-system:daemon-set-controller
+          - system:serviceaccount:kube-system:statefulset-controller
+          - system:serviceaccount:kube-system:job-controller
+          - regex:^system:serviceaccount:kube-system:.*controller.*
+        kinds:
+          - Pod
+        namespaces:
+          - "*"
+        names:
+          - "*"
+        require_owner_reference: true
+        require_controller_owner_reference: true
+        allowed_owner_kinds:
+          - ReplicaSet
+          - DaemonSet
+          - StatefulSet
+          - Job

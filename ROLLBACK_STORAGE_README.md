@@ -150,7 +150,7 @@ The complete diff is stored in audit records under:
 
 拦截成功的 DELETE 通知不再附带回滚或下载 YAML 按钮。原因是 Admission Webhook 已经拒绝了删除请求，资源并未被删除，此时展示回滚按钮容易造成误判。
 
-删除审批消息也只保留“确认删除 / 拒绝”按钮，不再展示“回滚 / 下载 YAML”。回滚按钮只保留在允许执行的 CREATE / UPDATE 审计通知中，用于恢复变更前版本。
+删除审批消息只保留“确认删除 / 拒绝”按钮，不再展示“回滚 / 下载 YAML”。审批通过后，用户重试删除并且 Admission 真正放行时，最终放行通知会展示“执行回滚 / 下载 YAML”。全局白名单直接放行的 DELETE 也会展示回滚按钮，因为删除确实会发生。
 
 ### 白名单与默认拦截
 
@@ -185,3 +185,62 @@ delete_confirmation:
 ```
 
 如果 `delete_policy.default_block` 不配置或为 `false`，则保持旧行为：未命中 `protected` 的删除请求会放行。
+
+
+## v7 Kubernetes 控制器删除旁路
+
+当 `delete_policy.default_block: true` 时，所有 DELETE 默认会被拦截。生产集群中这会影响 Kubernetes 控制器维护行为，例如 Deployment 滚动发布、Pod 重建、节点替换、Job 完成清理等场景中，ReplicaSet / DaemonSet / StatefulSet / Job 控制器会删除自己管理的 Pod。
+
+v7 新增 `delete_policy.controller_bypass`，用于安全放行“控制器删除自己管理的 Pod”。它不是简单用户白名单，而是同时检查：
+
+1. 发起删除的 Kubernetes 用户是否匹配控制器账号；
+2. 删除资源的 Kind / namespace / name 是否匹配规则；
+3. 被删除对象是否存在 `ownerReferences`；
+4. ownerReference 是否为 `controller: true`；
+5. owner kind 是否在允许列表中，例如 ReplicaSet、DaemonSet、StatefulSet、Job。
+
+推荐配置：
+
+```yaml
+delete_policy:
+  default_block: true
+  controller_bypass:
+    enabled: true
+    audit: true
+    notify: false
+    rules:
+      - name: k8s-controller-owned-pod-delete
+        users:
+          - system:kube-controller-manager
+          - system:serviceaccount:kube-system:replicaset-controller
+          - system:serviceaccount:kube-system:daemon-set-controller
+          - system:serviceaccount:kube-system:statefulset-controller
+          - system:serviceaccount:kube-system:job-controller
+          - regex:^system:serviceaccount:kube-system:.*controller.*
+        kinds:
+          - Pod
+        namespaces:
+          - "*"
+        names:
+          - "*"
+        require_owner_reference: true
+        require_controller_owner_reference: true
+        allowed_owner_kinds:
+          - ReplicaSet
+          - DaemonSet
+          - StatefulSet
+          - Job
+```
+
+新的 DELETE 决策顺序：
+
+1. webhook 自保护资源直接放行；
+2. `global_whitelist.users` 命中后直接放行，并发送带回滚按钮的最终放行通知；
+3. `delete_policy.controller_bypass` 命中后审计放行，默认不发 Telegram，不带回滚按钮；
+4. 命中 `protected` 或 `delete_policy.default_block: true` 后进入删除拦截；
+5. `delete_confirmation.rules` 命中后触发 Telegram 审批；审批后重试放行，并发送带回滚按钮的最终放行通知；
+6. 其他 DELETE 默认拒绝。
+
+如果 `controller_bypass.enabled: true` 但没有配置 `rules`，程序会使用内置默认规则：放行 kube-system 常见控制器删除 controller-owned Pod。
+
+不要把 `regex:^system:.*` 直接放进 `global_whitelist`。那样会放行过多系统身份，风险远大于 controller_bypass。

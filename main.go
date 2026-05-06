@@ -118,10 +118,34 @@ type DeletePolicyConfig struct {
 	// protected rule should still be denied by default.
 	//
 	// false keeps the original behavior: only configured protected resources are intercepted.
-	// true enables a deny-by-default posture for all DELETE requests after self-preservation
-	// and global whitelist checks. Users that match delete_confirmation.rules can use
-	// Telegram interactive approval; all other users are denied.
+	// true enables a deny-by-default posture for all DELETE requests after self-preservation,
+	// global whitelist, and controller bypass checks. Users that match delete_confirmation.rules
+	// can use Telegram interactive approval; all other users are denied.
 	DefaultBlock bool `json:"default_block" yaml:"default_block"`
+
+	// ControllerBypass allows safe Kubernetes controller maintenance deletes, especially
+	// controller-owned Pod deletes caused by rollout, reschedule, node replacement, or GC.
+	// This is intentionally separate from global_whitelist so it can require resource kind,
+	// namespace, name, and ownerReference checks instead of allowing a user identity broadly.
+	ControllerBypass ControllerBypassConfig `json:"controller_bypass" yaml:"controller_bypass"`
+}
+
+type ControllerBypassConfig struct {
+	Enabled bool                   `json:"enabled" yaml:"enabled"`
+	Audit   bool                   `json:"audit" yaml:"audit"`
+	Notify  bool                   `json:"notify" yaml:"notify"`
+	Rules   []ControllerBypassRule `json:"rules" yaml:"rules"`
+}
+
+type ControllerBypassRule struct {
+	Name                            string   `json:"name" yaml:"name"`
+	Users                           []string `json:"users" yaml:"users"`
+	Kinds                           []string `json:"kinds" yaml:"kinds"`
+	Namespaces                      []string `json:"namespaces" yaml:"namespaces"`
+	Names                           []string `json:"names" yaml:"names"`
+	RequireOwnerReference           bool     `json:"require_owner_reference" yaml:"require_owner_reference"`
+	RequireControllerOwnerReference bool     `json:"require_controller_owner_reference" yaml:"require_controller_owner_reference"`
+	AllowedOwnerKinds               []string `json:"allowed_owner_kinds" yaml:"allowed_owner_kinds"`
 }
 
 var config Config
@@ -135,6 +159,44 @@ func loadConfig(file string) error {
 		return fmt.Errorf("failed to unmarshal config from '%s': %w", file, err)
 	}
 	return nil
+}
+
+func applyDeletePolicyDefaults() {
+	if !config.DeletePolicy.ControllerBypass.Enabled {
+		return
+	}
+
+	if len(config.DeletePolicy.ControllerBypass.Rules) == 0 {
+		config.DeletePolicy.ControllerBypass.Rules = defaultControllerBypassRules()
+	}
+
+	// A controller bypass without audit and without notification is invisible.
+	// Prefer audit-only by default when the user enabled the feature but omitted both flags.
+	if !config.DeletePolicy.ControllerBypass.Audit && !config.DeletePolicy.ControllerBypass.Notify {
+		config.DeletePolicy.ControllerBypass.Audit = true
+	}
+}
+
+func defaultControllerBypassRules() []ControllerBypassRule {
+	return []ControllerBypassRule{
+		{
+			Name: "k8s-controller-owned-pod-delete",
+			Users: []string{
+				"system:kube-controller-manager",
+				"system:serviceaccount:kube-system:replicaset-controller",
+				"system:serviceaccount:kube-system:daemon-set-controller",
+				"system:serviceaccount:kube-system:statefulset-controller",
+				"system:serviceaccount:kube-system:job-controller",
+				"regex:^system:serviceaccount:kube-system:.*controller.*",
+			},
+			Kinds:                           []string{"Pod"},
+			Namespaces:                      []string{"*"},
+			Names:                           []string{"*"},
+			RequireOwnerReference:           true,
+			RequireControllerOwnerReference: true,
+			AllowedOwnerKinds:               []string{"ReplicaSet", "DaemonSet", "StatefulSet", "Job"},
+		},
+	}
 }
 
 func matchPattern(pattern string, candidate string) (bool, string, error) {
@@ -178,6 +240,189 @@ func matchGlobalWhitelist(user string) (bool, string, string) {
 	}
 
 	return false, "", ""
+}
+
+type admissionOwnerReference struct {
+	APIVersion string `json:"apiVersion"`
+	Kind       string `json:"kind"`
+	Name       string `json:"name"`
+	Controller *bool  `json:"controller,omitempty"`
+}
+
+type admissionObjectMetadata struct {
+	Metadata struct {
+		OwnerReferences []admissionOwnerReference `json:"ownerReferences"`
+	} `json:"metadata"`
+}
+
+func matchPolicyPatterns(patterns []string, candidate string, defaultMatch bool) (bool, string, string) {
+	if len(patterns) == 0 {
+		if defaultMatch {
+			return true, "*", "default"
+		}
+		return false, "", ""
+	}
+
+	for _, pattern := range patterns {
+		trimmedPattern := strings.TrimSpace(pattern)
+		if trimmedPattern == "" {
+			continue
+		}
+
+		matched, matcher, err := matchPattern(trimmedPattern, candidate)
+		if err != nil {
+			klog.Errorf("Invalid policy pattern '%s': %v. This pattern will be skipped.", trimmedPattern, err)
+			continue
+		}
+		if matched {
+			return true, trimmedPattern, matcher
+		}
+
+		// Kubernetes Kind names are usually capitalized while config authors often use lower case.
+		// Keep regex semantics unchanged, but make glob/exact matching friendlier for non-regex patterns.
+		if !strings.HasPrefix(strings.ToLower(trimmedPattern), "regex:") {
+			matched, matcher, err = matchPattern(strings.ToLower(trimmedPattern), strings.ToLower(candidate))
+			if err != nil {
+				klog.Errorf("Invalid lower-case policy pattern '%s': %v. This pattern will be skipped.", trimmedPattern, err)
+				continue
+			}
+			if matched {
+				return true, trimmedPattern, matcher
+			}
+		}
+	}
+
+	return false, "", ""
+}
+
+func admissionDeleteObjectRaw(req *v1.AdmissionRequest) []byte {
+	if req == nil {
+		return nil
+	}
+	if len(req.OldObject.Raw) > 0 {
+		return req.OldObject.Raw
+	}
+	if len(req.Object.Raw) > 0 {
+		return req.Object.Raw
+	}
+	return nil
+}
+
+func extractAdmissionOwnerReferences(req *v1.AdmissionRequest) []admissionOwnerReference {
+	raw := admissionDeleteObjectRaw(req)
+	if len(raw) == 0 {
+		return nil
+	}
+
+	var obj admissionObjectMetadata
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		klog.V(4).Infof("Failed to decode admission object metadata for controller bypass: %v", err)
+		return nil
+	}
+	return obj.Metadata.OwnerReferences
+}
+
+func ownerReferenceIsController(owner admissionOwnerReference) bool {
+	return owner.Controller != nil && *owner.Controller
+}
+
+func matchOwnerReferenceRule(rule ControllerBypassRule, owners []admissionOwnerReference) (bool, string) {
+	requireOwner := rule.RequireOwnerReference || rule.RequireControllerOwnerReference || len(rule.AllowedOwnerKinds) > 0
+	if !requireOwner {
+		return true, "ownerReference check not required"
+	}
+	if len(owners) == 0 {
+		return false, "object has no ownerReferences"
+	}
+
+	for _, owner := range owners {
+		if rule.RequireControllerOwnerReference && !ownerReferenceIsController(owner) {
+			continue
+		}
+
+		if len(rule.AllowedOwnerKinds) > 0 {
+			matched, pattern, matcher := matchPolicyPatterns(rule.AllowedOwnerKinds, owner.Kind, false)
+			if !matched {
+				continue
+			}
+			return true, fmt.Sprintf("ownerReference %s/%s matched owner kind pattern '%s' (%s)", owner.Kind, owner.Name, pattern, matcher)
+		}
+
+		return true, fmt.Sprintf("ownerReference %s/%s matched", owner.Kind, owner.Name)
+	}
+
+	if rule.RequireControllerOwnerReference {
+		return false, "no controller ownerReference matched the rule"
+	}
+	return false, "no ownerReference matched the allowed owner kind rules"
+}
+
+func shouldBypassForControllerDelete(req *v1.AdmissionRequest) (bool, string, string, bool, bool) {
+	if req == nil || !config.DeletePolicy.ControllerBypass.Enabled || req.Operation != v1.Delete {
+		return false, "", "", false, false
+	}
+
+	user := req.UserInfo.Username
+	kind := req.Kind.Kind
+	name := req.Name
+	namespace := req.Namespace
+	if strings.TrimSpace(namespace) == "" {
+		namespace = "cluster-scoped"
+	}
+	owners := extractAdmissionOwnerReferences(req)
+
+	for _, rule := range config.DeletePolicy.ControllerBypass.Rules {
+		ruleName := strings.TrimSpace(rule.Name)
+		if ruleName == "" {
+			ruleName = "unnamed-controller-bypass-rule"
+		}
+
+		userMatched, userPattern, userMatcher := matchPolicyPatterns(rule.Users, user, false)
+		if !userMatched {
+			continue
+		}
+
+		kindMatched, kindPattern, kindMatcher := matchPolicyPatterns(rule.Kinds, kind, true)
+		if !kindMatched {
+			continue
+		}
+
+		nsMatched, nsPattern, nsMatcher := matchPolicyPatterns(rule.Namespaces, namespace, true)
+		if !nsMatched {
+			continue
+		}
+
+		nameMatched, namePattern, nameMatcher := matchPolicyPatterns(rule.Names, name, true)
+		if !nameMatched {
+			continue
+		}
+
+		ownerMatched, ownerReason := matchOwnerReferenceRule(rule, owners)
+		if !ownerMatched {
+			klog.V(4).Infof("Controller bypass rule '%s' matched user/kind/namespace/name but failed owner check for %s '%s': %s", ruleName, kind, name, ownerReason)
+			continue
+		}
+
+		reason := fmt.Sprintf(
+			"Controller bypass allowed DELETE for %s: user '%s' matched rule '%s' (user pattern '%s' %s, kind pattern '%s' %s, namespace pattern '%s' %s, name pattern '%s' %s); %s.",
+			formatResource(kind, name, req.Namespace),
+			user,
+			ruleName,
+			userPattern,
+			userMatcher,
+			kindPattern,
+			kindMatcher,
+			nsPattern,
+			nsMatcher,
+			namePattern,
+			nameMatcher,
+			ownerReason,
+		)
+		policy := fmt.Sprintf("controller_bypass:%s", ruleName)
+		return true, reason, policy, config.DeletePolicy.ControllerBypass.Audit, config.DeletePolicy.ControllerBypass.Notify
+	}
+
+	return false, "", "", false, false
 }
 
 func formatResource(kind string, name string, namespace string) string {
@@ -909,6 +1154,22 @@ func validate(w http.ResponseWriter, r *http.Request) {
 		sendResponse(w, reqUID, true, allowReason)
 		return
 	}
+	if controllerBypass, controllerReason, controllerPolicy, auditControllerBypass, notifyControllerBypass := shouldBypassForControllerDelete(review.Request); controllerBypass {
+		notificationReason := fmt.Sprintf("Kubernetes 控制器维护删除已自动放行：%s。", resourceDesc)
+		klog.Infof("[Request %s] Allowed by controller bypass: %s", reqUID, controllerReason)
+		notified := false
+		if notifyControllerBypass {
+			ctx := buildSmartNotificationContext(reqUID, user, kind, name, namespace, operation, opDesc, "allowed", notificationReason)
+			sendTelegramNotification(ctx)
+			notified = true
+		}
+		if auditControllerBypass {
+			emitAuditRecord(review.Request, auditDecisionAllowed, controllerReason, controllerPolicy, notified, notificationReason)
+		}
+		sendResponse(w, reqUID, true, controllerReason)
+		return
+	}
+
 	/* legacy user_policies flow removed
 	if matched, action, pattern, matcher := matchUserPolicy(user); matched {
 		switch action {
@@ -1061,6 +1322,7 @@ func main() {
 	}
 	applyNotificationDefaults()
 	applyLifecycleDefaults()
+	applyDeletePolicyDefaults()
 	applyDeleteConfirmationDefaults()
 	applyRollbackDefaults()
 

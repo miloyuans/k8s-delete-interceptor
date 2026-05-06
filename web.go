@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -51,6 +52,8 @@ func (a *App) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/telegram/users", a.auth(a.handleTelegramUsers))
 	mux.HandleFunc("/api/telegram/users/", a.auth(a.handleTelegramUsers))
 	mux.HandleFunc("/api/telegram/test", a.require(PermTelegramWrite, a.handleTelegramTest))
+	mux.HandleFunc("/api/templates", a.auth(a.handleNotificationTemplates))
+	mux.HandleFunc("/api/templates/", a.auth(a.handleNotificationTemplates))
 	mux.HandleFunc("/api/rules/preview", a.auth(a.handleRulePreview))
 	mux.HandleFunc("/api/rules/parse", a.auth(a.handleRuleParse))
 	mux.HandleFunc("/api/rules", a.auth(a.handleRules))
@@ -720,31 +723,72 @@ func (a *App) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "runtime config unavailable", 500)
 		return
 	}
+	if !cfg.Telegram.Enabled {
+		log.Printf("telegram test blocked: telegram global disabled")
+		http.Error(w, "telegram global setting is disabled", 400)
+		return
+	}
 	var body struct {
-		BotID   string `json:"bot_id"`
-		ChatID  string `json:"chat_id"`
-		Message string `json:"message"`
+		BotID          string `json:"bot_id"`
+		ChatID         string `json:"chat_id"`
+		ChatResourceID string `json:"chat_resource_id"`
+		TelegramUserID string `json:"telegram_user_id"`
+		Message        string `json:"message"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	bot := findTelegramBot(cfg, body.BotID)
+	botID := strings.TrimSpace(body.BotID)
+	chatID := strings.TrimSpace(body.ChatID)
+	if body.ChatResourceID != "" {
+		for _, c := range cfg.Telegram.Chats {
+			if c.ID == body.ChatResourceID {
+				chatID = c.ChatID
+				if botID == "" {
+					botID = c.BotID
+				}
+				break
+			}
+		}
+	}
+	if body.TelegramUserID != "" {
+		for _, u := range cfg.Telegram.Users {
+			if u.ID == body.TelegramUserID || u.TelegramID == body.TelegramUserID {
+				if !u.Enabled {
+					http.Error(w, "telegram user is disabled", 400)
+					return
+				}
+				chatID = u.TelegramID
+				break
+			}
+		}
+	}
+	if botID == "" {
+		for _, b := range cfg.Telegram.Bots {
+			if b.Enabled {
+				botID = b.ID
+				break
+			}
+		}
+	}
+	bot := findTelegramBot(cfg, botID)
 	if bot == nil || !bot.Enabled {
+		log.Printf("telegram test failed: bot not found or disabled bot_id=%s", botID)
 		http.Error(w, "telegram bot not found or disabled", 400)
 		return
 	}
-	chatID := strings.TrimSpace(body.ChatID)
 	if chatID == "" {
 		for _, c := range cfg.Telegram.Chats {
-			if c.Enabled && c.BotID == body.BotID {
+			if c.Enabled && c.BotID == botID {
 				chatID = c.ChatID
 				break
 			}
 		}
 	}
 	if chatID == "" {
-		http.Error(w, "chat_id is required", 400)
+		log.Printf("telegram test failed: empty chat_id bot_id=%s", bot.ID)
+		http.Error(w, "chat_id is required; create or enable a Chat resource first", 400)
 		return
 	}
 	token := bot.Token
@@ -752,6 +796,7 @@ func (a *App) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 		token = envOr(bot.TokenEnv, "")
 	}
 	if token == "" {
+		log.Printf("telegram test failed: empty token bot_id=%s token_env=%s", bot.ID, bot.TokenEnv)
 		http.Error(w, "telegram token is empty", 400)
 		return
 	}
@@ -759,11 +804,14 @@ func (a *App) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 	if msg == "" {
 		msg = "K8s Delete Interceptor Telegram test message"
 	}
-	if err := sendTelegram(r.Context(), token, chatID, msg, "", nil); err != nil {
+	log.Printf("telegram test sending: bot_id=%s chat_id=%s token_env=%s", bot.ID, chatID, bot.TokenEnv)
+	if err := sendTelegram(r.Context(), token, chatID, msg, "Markdown", nil); err != nil {
+		log.Printf("telegram test failed: bot_id=%s chat_id=%s err=%v", bot.ID, chatID, err)
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	writeJSON(w, map[string]any{"ok": true})
+	log.Printf("telegram test sent: bot_id=%s chat_id=%s", bot.ID, chatID)
+	writeJSON(w, map[string]any{"ok": true, "bot_id": bot.ID, "chat_id": chatID, "telegram_enabled": cfg.Telegram.Enabled})
 }
 
 func sanitizeTelegram(tg TelegramConfig) TelegramConfig {
@@ -1084,6 +1132,109 @@ func removeString(xs []string, v string) []string {
 	return out
 }
 
+func (a *App) handleNotificationTemplates(w http.ResponseWriter, r *http.Request) {
+	u := userFromContext(r.Context())
+	cfg := a.Config()
+	if cfg == nil {
+		http.Error(w, "runtime config unavailable", 500)
+		return
+	}
+	id := strings.Trim(pathID("/api/templates", r.URL.Path), "/")
+	if r.Method == http.MethodGet {
+		if !u.Can(PermConfigRead) {
+			http.Error(w, "forbidden", 403)
+			return
+		}
+		if id != "" {
+			for _, t := range cfg.NotificationTemplates {
+				if t.ID == id {
+					writeJSON(w, t)
+					return
+				}
+			}
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, cfg.NotificationTemplates)
+		return
+	}
+	if !u.Can(PermTemplatesWrite) && !u.Can(PermTelegramWrite) {
+		http.Error(w, "forbidden: need permission "+PermTemplatesWrite, 403)
+		return
+	}
+	next := cloneConfig(cfg)
+	switch r.Method {
+	case http.MethodPost, http.MethodPut:
+		var item NotificationTemplate
+		if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if item.ID == "" {
+			item.ID = id
+		}
+		item = normalizeNotificationTemplate(item)
+		if item.ID == "" {
+			http.Error(w, "template name or id is required", 400)
+			return
+		}
+		next.NotificationTemplates = upsertNotificationTemplate(next.NotificationTemplates, item)
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "templates", "更新通知模板配置", u, true)
+		writeChangeResponse(w, cr, applied, err)
+	case http.MethodDelete:
+		if id == "" {
+			http.Error(w, "template id is required", 400)
+			return
+		}
+		next.NotificationTemplates = deleteNotificationTemplate(next.NotificationTemplates, id)
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "templates", "删除通知模板配置", u, true)
+		writeChangeResponse(w, cr, applied, err)
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
+}
+
+func normalizeNotificationTemplate(t NotificationTemplate) NotificationTemplate {
+	t.ID = strings.TrimSpace(t.ID)
+	t.Name = strings.TrimSpace(t.Name)
+	if t.ID == "" {
+		t.ID = autoID("tpl", t.Name)
+	}
+	if t.Name == "" {
+		t.Name = t.ID
+	}
+	if t.Channel == "" {
+		t.Channel = "telegram"
+	}
+	if t.ParseMode == "" {
+		t.ParseMode = "Markdown"
+	}
+	if t.Body == "" {
+		t.Body = "*{{.cluster}}* {{.operation}} {{.kind}}/{{.namespace}}/{{.name}}\n用户：{{.actor_display}}\n原因：{{.reason}}"
+	}
+	return t
+}
+
+func upsertNotificationTemplate(items []NotificationTemplate, item NotificationTemplate) []NotificationTemplate {
+	for i := range items {
+		if items[i].ID == item.ID {
+			items[i] = item
+			return items
+		}
+	}
+	return append(items, item)
+}
+
+func deleteNotificationTemplate(items []NotificationTemplate, id string) []NotificationTemplate {
+	out := []NotificationTemplate{}
+	for _, item := range items {
+		if item.ID != id {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
 func (a *App) handleRules(w http.ResponseWriter, r *http.Request) {
 	u := userFromContext(r.Context())
 	cfg := a.Config()
@@ -1194,26 +1345,30 @@ func (a *App) handleRuleParse(w http.ResponseWriter, r *http.Request) {
 }
 
 type RuleEditRequest struct {
-	ID             string   `json:"id" yaml:"id"`
-	Name           string   `json:"name" yaml:"name"`
-	Enabled        bool     `json:"enabled" yaml:"enabled"`
-	Priority       int      `json:"priority" yaml:"priority"`
-	Operations     []string `json:"operations" yaml:"operations"`
-	APIGroup       string   `json:"api_group" yaml:"api_group"`
-	APIGroups      []string `json:"api_groups" yaml:"api_groups"`
-	Resource       string   `json:"resource" yaml:"resource"`
-	Resources      []string `json:"resources" yaml:"resources"`
-	Kind           string   `json:"kind" yaml:"kind"`
-	Kinds          []string `json:"kinds" yaml:"kinds"`
-	Namespaces     []string `json:"namespaces" yaml:"namespaces"`
-	Names          []string `json:"names" yaml:"names"`
-	ActorGroupIDs  []string `json:"actor_group_ids" yaml:"actor_group_ids"`
-	ChangeClasses  []string `json:"change_classes" yaml:"change_classes"`
-	Decision       string   `json:"decision" yaml:"decision"`
-	Reason         string   `json:"reason" yaml:"reason"`
-	Approval       bool     `json:"approval" yaml:"approval"`
-	Rollback       bool     `json:"rollback" yaml:"rollback"`
-	NotifyTemplate string   `json:"notify_template" yaml:"notify_template"`
+	ID                    string   `json:"id" yaml:"id"`
+	Name                  string   `json:"name" yaml:"name"`
+	Enabled               bool     `json:"enabled" yaml:"enabled"`
+	Priority              int      `json:"priority" yaml:"priority"`
+	Operations            []string `json:"operations" yaml:"operations"`
+	APIGroup              string   `json:"api_group" yaml:"api_group"`
+	APIGroups             []string `json:"api_groups" yaml:"api_groups"`
+	Resource              string   `json:"resource" yaml:"resource"`
+	Resources             []string `json:"resources" yaml:"resources"`
+	Kind                  string   `json:"kind" yaml:"kind"`
+	Kinds                 []string `json:"kinds" yaml:"kinds"`
+	Namespaces            []string `json:"namespaces" yaml:"namespaces"`
+	Names                 []string `json:"names" yaml:"names"`
+	ActorGroupIDs         []string `json:"actor_group_ids" yaml:"actor_group_ids"`
+	ChangeClasses         []string `json:"change_classes" yaml:"change_classes"`
+	Decision              string   `json:"decision" yaml:"decision"`
+	Reason                string   `json:"reason" yaml:"reason"`
+	Approval              bool     `json:"approval" yaml:"approval"`
+	Rollback              bool     `json:"rollback" yaml:"rollback"`
+	NotifyTemplate        string   `json:"notify_template" yaml:"notify_template"`
+	TelegramBotIDs        []string `json:"telegram_bot_ids" yaml:"telegram_bot_ids"`
+	TelegramChatIDs       []string `json:"telegram_chat_ids" yaml:"telegram_chat_ids"`
+	TelegramUserIDs       []string `json:"telegram_user_ids" yaml:"telegram_user_ids"`
+	ApproverTelegramUsers []string `json:"approver_telegram_users" yaml:"approver_telegram_users"`
 }
 
 type RuleYAMLDocument struct {
@@ -1246,11 +1401,11 @@ func buildRuleFromRequest(req RuleEditRequest) (RuleEditRequest, ResourceScope, 
 	scopeID := "web_scope_" + req.ID
 	scope := ResourceScope{ID: scopeID, Name: req.Name + " 资源范围", Enabled: true, APIGroups: req.APIGroups, Resources: req.Resources, Kinds: req.Kinds, Namespaces: req.Namespaces, Names: req.Names}
 	rule := PolicyRule{ID: req.ID, Name: req.Name, Enabled: req.Enabled, Priority: req.Priority, ScopeIDs: []string{scopeID}, Operations: upperStrings(req.Operations), ActorGroupIDs: req.ActorGroupIDs, ChangeClasses: req.ChangeClasses, Decision: req.Decision, Reason: req.Reason}
-	if req.NotifyTemplate != "" {
-		rule.Notify = NotificationBinding{Enabled: true, TemplateID: req.NotifyTemplate}
+	if req.NotifyTemplate != "" || len(req.TelegramBotIDs) > 0 || len(req.TelegramChatIDs) > 0 || len(req.TelegramUserIDs) > 0 || req.Decision == DecisionAllowNotify || req.Decision == DecisionRequireApproval {
+		rule.Notify = NotificationBinding{Enabled: true, TemplateID: req.NotifyTemplate, TelegramBotIDs: req.TelegramBotIDs, TelegramChatIDs: req.TelegramChatIDs, TelegramUserIDs: req.TelegramUserIDs}
 	}
 	if req.Approval || req.Decision == DecisionRequireApproval {
-		rule.Approval = ApprovalBinding{Enabled: true, Mode: "both", TTLSeconds: 300, FailWhenStoreDown: true}
+		rule.Approval = ApprovalBinding{Enabled: true, Mode: "both", TTLSeconds: 300, ApproverTelegramUsers: req.ApproverTelegramUsers, FailWhenStoreDown: true}
 	}
 	if req.Rollback {
 		rule.Rollback = RollbackBinding{Enabled: true, Mode: RollbackRestoreOldObject, ShowInTelegram: true, ShowInWeb: true}
@@ -1296,6 +1451,10 @@ func normalizeRuleRequest(req RuleEditRequest) RuleEditRequest {
 	req.Names = dedupeTrim(req.Names)
 	req.ActorGroupIDs = dedupeTrim(req.ActorGroupIDs)
 	req.ChangeClasses = dedupeTrim(req.ChangeClasses)
+	req.TelegramBotIDs = dedupeTrim(req.TelegramBotIDs)
+	req.TelegramChatIDs = dedupeTrim(req.TelegramChatIDs)
+	req.TelegramUserIDs = dedupeTrim(req.TelegramUserIDs)
+	req.ApproverTelegramUsers = dedupeTrim(req.ApproverTelegramUsers)
 	if len(req.APIGroups) == 0 {
 		req.APIGroups = []string{"*"}
 	}
@@ -1334,7 +1493,7 @@ func parseRuleYAML(raw string) (RuleEditRequest, error) {
 }
 
 func requestFromRuleAndScope(rule PolicyRule, scope ResourceScope) RuleEditRequest {
-	req := RuleEditRequest{ID: rule.ID, Name: rule.Name, Enabled: rule.Enabled, Priority: rule.Priority, Operations: rule.Operations, ActorGroupIDs: rule.ActorGroupIDs, ChangeClasses: rule.ChangeClasses, Decision: rule.Decision, Reason: rule.Reason, Approval: rule.Approval.Enabled, Rollback: rule.Rollback.Enabled, NotifyTemplate: rule.Notify.TemplateID}
+	req := RuleEditRequest{ID: rule.ID, Name: rule.Name, Enabled: rule.Enabled, Priority: rule.Priority, Operations: rule.Operations, ActorGroupIDs: rule.ActorGroupIDs, ChangeClasses: rule.ChangeClasses, Decision: rule.Decision, Reason: rule.Reason, Approval: rule.Approval.Enabled, Rollback: rule.Rollback.Enabled, NotifyTemplate: rule.Notify.TemplateID, TelegramBotIDs: rule.Notify.TelegramBotIDs, TelegramChatIDs: rule.Notify.TelegramChatIDs, TelegramUserIDs: rule.Notify.TelegramUserIDs, ApproverTelegramUsers: rule.Approval.ApproverTelegramUsers}
 	if len(scope.APIGroups) > 0 {
 		req.APIGroups = scope.APIGroups
 	}

@@ -40,7 +40,7 @@ func configChangeCategory(kind string) string {
 		return "identity_access"
 	case "datasources":
 		return "data_source"
-	case "telegram":
+	case "telegram", "templates":
 		return "notification"
 	default:
 		return "system_config"

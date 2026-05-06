@@ -35,6 +35,7 @@ const (
 	PermRulesWrite       = "rules:write"
 	PermDatasourceWrite  = "datasources:write"
 	PermTelegramWrite    = "telegram:write"
+	PermTemplatesWrite   = "templates:write"
 	PermSettingsWrite    = "settings:write"
 	PermUsersWrite       = "users:write"
 	PermRolesWrite       = "roles:write"
@@ -66,7 +67,7 @@ func defaultWebRoles() []WebRole {
 		{ID: "viewer", Name: "只读用户", Description: "只能查看首页、事件、SA、配置和数据源", Permissions: []string{PermDashboardRead, PermEventsRead, PermSARead, PermConfigRead}, Builtin: true},
 		{ID: "auditor", Name: "审计员", Description: "查看历史事件、SA 资产和配置版本", Permissions: []string{PermDashboardRead, PermEventsRead, PermSARead, PermConfigRead}, Builtin: true},
 		{ID: "operator", Name: "运维操作员", Description: "查看审计、扫描 SA、执行授权回滚", Permissions: []string{PermDashboardRead, PermEventsRead, PermSARead, PermSAScan, PermConfigRead, PermRollbackExecute}, Builtin: true},
-		{ID: "rule_manager", Name: "规则管理员", Description: "可提交规则、SA 挂载、数据源和配置变更申请", Permissions: []string{PermDashboardRead, PermEventsRead, PermSARead, PermSAScan, PermSAMount, PermActorGroupsWrite, PermConfigRead, PermConfigWrite, PermRulesWrite, PermDatasourceWrite}, Builtin: true},
+		{ID: "rule_manager", Name: "规则管理员", Description: "可提交规则、SA 挂载、数据源和配置变更申请", Permissions: []string{PermDashboardRead, PermEventsRead, PermSARead, PermSAScan, PermSAMount, PermActorGroupsWrite, PermConfigRead, PermConfigWrite, PermRulesWrite, PermDatasourceWrite, PermTelegramWrite, PermTemplatesWrite}, Builtin: true},
 	}
 }
 

@@ -138,6 +138,9 @@ func validateRuntimeConfig(c *RuntimeConfig) error {
 		if t.ID == "" {
 			return errors.New("template id is required")
 		}
+		if old := ids["template:"+t.ID]; old != "" {
+			return fmt.Errorf("duplicate template id %s (%s)", t.ID, old)
+		}
 		ids["template:"+t.ID] = t.Name
 	}
 	roleIDs := map[string]bool{}

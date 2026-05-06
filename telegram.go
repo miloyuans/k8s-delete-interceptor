@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -31,13 +33,20 @@ func (a *App) notifyEvent(ctx context.Context, cfg *RuntimeConfig, ev *Admission
 	if tpl == nil || !tpl.Enabled {
 		return
 	}
-	chats := resolveTelegramChats(cfg, bind)
-	if len(chats) == 0 {
+	targets := resolveTelegramTargets(cfg, bind)
+	if len(targets) == 0 {
+		log.Printf("telegram notify skipped: no enabled target rule=%s template=%s", pd.Rule.ID, tpl.ID)
 		return
 	}
-	for _, chat := range chats {
-		bot := findTelegramBot(cfg, chat.BotID)
+	msg, err := renderTemplate(cfg, ev, pd, *tpl)
+	if err != nil {
+		log.Printf("telegram render template failed: rule=%s template=%s err=%v", pd.Rule.ID, tpl.ID, err)
+		return
+	}
+	for _, target := range targets {
+		bot := findTelegramBot(cfg, target.BotID)
 		if bot == nil || !bot.Enabled {
+			log.Printf("telegram notify skipped: bot not found or disabled bot_id=%s rule=%s", target.BotID, pd.Rule.ID)
 			continue
 		}
 		token := bot.Token
@@ -45,14 +54,21 @@ func (a *App) notifyEvent(ctx context.Context, cfg *RuntimeConfig, ev *Admission
 			token = os.Getenv(bot.TokenEnv)
 		}
 		if token == "" {
+			log.Printf("telegram notify skipped: empty token bot_id=%s token_env=%s", bot.ID, bot.TokenEnv)
 			continue
 		}
-		msg, err := renderTemplate(cfg, ev, pd, *tpl)
-		if err != nil {
-			continue
+		if err := sendTelegram(ctx, token, target.ChatID, msg, tpl.ParseMode, eventKeyboard(ev)); err != nil {
+			log.Printf("telegram notify failed: bot_id=%s chat_id=%s rule=%s err=%v", bot.ID, target.ChatID, pd.Rule.ID, err)
+		} else {
+			log.Printf("telegram notify sent: bot_id=%s chat_id=%s rule=%s event=%s", bot.ID, target.ChatID, pd.Rule.ID, ev.ID)
 		}
-		_ = sendTelegram(ctx, token, chat.ChatID, msg, tpl.ParseMode, eventKeyboard(ev))
 	}
+}
+
+type telegramTarget struct {
+	BotID  string
+	ChatID string
+	Name   string
 }
 
 func findTemplate(cfg *RuntimeConfig, id string) *NotificationTemplate {
@@ -83,18 +99,69 @@ func findTelegramUser(cfg *RuntimeConfig, id string) *TelegramUser {
 	return nil
 }
 
-func resolveTelegramChats(cfg *RuntimeConfig, bind NotificationBinding) []TelegramChat {
-	ids := map[string]bool{}
-	for _, id := range bind.TelegramChatIDs {
-		ids[id] = true
+func resolveTelegramTargets(cfg *RuntimeConfig, bind NotificationBinding) []telegramTarget {
+	botIDs := map[string]bool{}
+	chatIDs := map[string]bool{}
+	userIDs := map[string]bool{}
+	for _, id := range bind.TelegramBotIDs {
+		if strings.TrimSpace(id) != "" {
+			botIDs[id] = true
+		}
 	}
-	out := []TelegramChat{}
+	for _, id := range bind.TelegramChatIDs {
+		if strings.TrimSpace(id) != "" {
+			chatIDs[id] = true
+		}
+	}
+	for _, id := range bind.TelegramUserIDs {
+		if strings.TrimSpace(id) != "" {
+			userIDs[id] = true
+		}
+	}
+	allBots := len(botIDs) == 0
+	allChats := len(chatIDs) == 0
+	out := []telegramTarget{}
+	seen := map[string]bool{}
+	add := func(t telegramTarget) {
+		if t.BotID == "" || t.ChatID == "" {
+			return
+		}
+		key := t.BotID + "|" + t.ChatID
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, t)
+	}
 	for _, c := range cfg.Telegram.Chats {
 		if !c.Enabled {
 			continue
 		}
-		if len(ids) == 0 || ids[c.ID] {
-			out = append(out, c)
+		if !allBots && !botIDs[c.BotID] {
+			continue
+		}
+		if !allChats && !chatIDs[c.ID] {
+			continue
+		}
+		add(telegramTarget{BotID: c.BotID, ChatID: c.ChatID, Name: c.Name})
+	}
+	if len(userIDs) > 0 {
+		for _, u := range cfg.Telegram.Users {
+			if !u.Enabled || u.TelegramID == "" {
+				continue
+			}
+			if !userIDs[u.ID] && !userIDs[u.TelegramID] {
+				continue
+			}
+			for _, b := range cfg.Telegram.Bots {
+				if !b.Enabled {
+					continue
+				}
+				if !allBots && !botIDs[b.ID] {
+					continue
+				}
+				add(telegramTarget{BotID: b.ID, ChatID: u.TelegramID, Name: u.DisplayName})
+			}
 		}
 	}
 	return out
@@ -174,8 +241,9 @@ func sendTelegram(ctx context.Context, token, chatID, text, parseMode string, ma
 		return err
 	}
 	defer resp.Body.Close()
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("telegram status %s", resp.Status)
+		return fmt.Errorf("telegram status %s: %s", resp.Status, strings.TrimSpace(string(bodyBytes)))
 	}
 	return nil
 }

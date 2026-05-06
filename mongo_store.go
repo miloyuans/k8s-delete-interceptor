@@ -207,6 +207,26 @@ func (m *MongoStore) GetConfigChange(ctx context.Context, id string) (*ConfigCha
 	return &cr, err
 }
 
+func (m *MongoStore) ClaimConfigChange(ctx context.Context, id, eventID, nextStatus, decidedBy string) (*ConfigChangeRequest, error) {
+	if m == nil {
+		return nil, errors.New("mongo not configured")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	filter := bson.M{"id": id, "status": ChangePending}
+	if strings.TrimSpace(eventID) != "" {
+		filter["event_id"] = eventID
+	}
+	update := bson.M{"$set": bson.M{"status": nextStatus, "decided_by": decidedBy, "decided_at": time.Now().UTC()}}
+	var cr ConfigChangeRequest
+	err := m.db.Collection("config_change_requests").FindOneAndUpdate(ctx, filter, update, options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(&cr)
+	m.healthy.Store(err == nil)
+	if err != nil {
+		return nil, err
+	}
+	return &cr, nil
+}
+
 func (m *MongoStore) ListConfigChanges(ctx context.Context, status string, limit int) ([]ConfigChangeRequest, error) {
 	if m == nil {
 		return nil, errors.New("mongo not configured")

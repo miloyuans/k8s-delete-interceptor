@@ -21,6 +21,18 @@ type telegramSendMessageRequest struct {
 	ReplyMarkup any    `json:"reply_markup,omitempty"`
 }
 
+type telegramEditMessageRequest struct {
+	ChatID      string `json:"chat_id"`
+	MessageID   int64  `json:"message_id"`
+	Text        string `json:"text"`
+	ParseMode   string `json:"parse_mode,omitempty"`
+	ReplyMarkup any    `json:"reply_markup,omitempty"`
+}
+
+type telegramSendResult struct {
+	MessageID int64
+}
+
 func (a *App) notifyEvent(ctx context.Context, cfg *RuntimeConfig, ev *AdmissionEvent, pd PolicyDecision) {
 	if cfg == nil || ev == nil || pd.Rule == nil {
 		return
@@ -55,16 +67,13 @@ func (a *App) notifyEvent(ctx context.Context, cfg *RuntimeConfig, ev *Admission
 			log.Printf("telegram notify skipped: bot not found or disabled bot_id=%s rule=%s", target.BotID, pd.Rule.ID)
 			continue
 		}
-		token := bot.Token
-		if token == "" && bot.TokenEnv != "" {
-			token = os.Getenv(bot.TokenEnv)
-		}
+		token, source := telegramTokenForBot(*bot)
 		if token == "" {
-			log.Printf("telegram notify skipped: empty token bot_id=%s token_env=%s", bot.ID, bot.TokenEnv)
+			log.Printf("telegram notify skipped: empty token bot_id=%s token_env=%s rule=%s", bot.ID, bot.TokenEnv, pd.Rule.ID)
 			continue
 		}
 		if err := sendTelegram(ctx, token, target.ChatID, msg, tpl.ParseMode, eventKeyboard(ev)); err != nil {
-			log.Printf("telegram notify failed: bot_id=%s chat_id=%s rule=%s err=%v", bot.ID, target.ChatID, pd.Rule.ID, err)
+			log.Printf("telegram notify failed: bot_id=%s chat_id=%s source=%s rule=%s err=%v", bot.ID, target.ChatID, source, pd.Rule.ID, err)
 		} else {
 			log.Printf("telegram notify sent: bot_id=%s chat_id=%s rule=%s event=%s", bot.ID, target.ChatID, pd.Rule.ID, ev.ID)
 		}
@@ -232,13 +241,74 @@ func escapeForMode(s, mode string) string {
 	return s
 }
 
+func telegramTokenForBot(bot TelegramBot) (string, string) {
+	token := strings.TrimSpace(bot.Token)
+	source := "inline_token"
+	if token != "" && token != "********" {
+		return normalizeTelegramToken(token), source
+	}
+	if bot.TokenEnv != "" {
+		token = os.Getenv(bot.TokenEnv)
+		source = "env:" + bot.TokenEnv
+	}
+	return normalizeTelegramToken(token), source
+}
+
 func sendTelegram(ctx context.Context, token, chatID, text, parseMode string, markup any) error {
+	_, err := sendTelegramWithResult(ctx, token, chatID, text, parseMode, markup)
+	return err
+}
+
+func sendTelegramWithResult(ctx context.Context, token, chatID, text, parseMode string, markup any) (telegramSendResult, error) {
 	token = normalizeTelegramToken(token)
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	body := telegramSendMessageRequest{ChatID: chatID, Text: text, ParseMode: parseMode, ReplyMarkup: markup}
 	b, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token), bytes.NewReader(b))
+	if err != nil {
+		return telegramSendResult{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return telegramSendResult{}, err
+	}
+	defer resp.Body.Close()
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	if resp.StatusCode/100 != 2 {
+		detail := strings.TrimSpace(string(bodyBytes))
+		if resp.StatusCode == http.StatusNotFound {
+			return telegramSendResult{}, fmt.Errorf("telegram API 404 Not Found: Bot Token 无效、粘贴了错误 token，或 token_env 读取到的环境变量不正确；Telegram 返回：%s", detail)
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return telegramSendResult{}, fmt.Errorf("telegram API 429 Too Many Requests: 发送过于频繁或重复目标过多，请等待 Telegram 限流恢复；Telegram 返回：%s", detail)
+		}
+		return telegramSendResult{}, fmt.Errorf("telegram status %s: %s", resp.Status, detail)
+	}
+	var out struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			MessageID int64 `json:"message_id"`
+		} `json:"result"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(bodyBytes, &out); err != nil {
+		return telegramSendResult{}, err
+	}
+	if !out.OK {
+		return telegramSendResult{}, fmt.Errorf("telegram send failed: %s", out.Description)
+	}
+	return telegramSendResult{MessageID: out.Result.MessageID}, nil
+}
+
+func editTelegramMessage(ctx context.Context, token, chatID string, messageID int64, text, parseMode string, markup any) error {
+	token = normalizeTelegramToken(token)
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	body := telegramEditMessageRequest{ChatID: chatID, MessageID: messageID, Text: text, ParseMode: parseMode, ReplyMarkup: markup}
+	b, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://api.telegram.org/bot%s/editMessageText", token), bytes.NewReader(b))
 	if err != nil {
 		return err
 	}
@@ -248,13 +318,10 @@ func sendTelegram(ctx context.Context, token, chatID, text, parseMode string, ma
 		return err
 	}
 	defer resp.Body.Close()
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 	if resp.StatusCode/100 != 2 {
 		detail := strings.TrimSpace(string(bodyBytes))
-		if resp.StatusCode == http.StatusNotFound {
-			return fmt.Errorf("telegram API 404 Not Found: Bot Token 无效、粘贴了错误 token，或 token_env 读取到的环境变量不正确；Telegram 返回：%s", detail)
-		}
-		return fmt.Errorf("telegram status %s: %s", resp.Status, detail)
+		return fmt.Errorf("telegram editMessageText status %s: %s", resp.Status, detail)
 	}
 	return nil
 }
@@ -262,6 +329,11 @@ func sendTelegram(ctx context.Context, token, chatID, text, parseMode string, ma
 func normalizeTelegramToken(token string) string {
 	token = strings.TrimSpace(token)
 	token = strings.Trim(token, "\"'")
+	if strings.Contains(token, "=") && strings.HasPrefix(strings.ToUpper(strings.TrimSpace(token)), "TELEGRAM") {
+		parts := strings.SplitN(token, "=", 2)
+		token = strings.TrimSpace(parts[1])
+		token = strings.Trim(token, "\"'")
+	}
 	if strings.HasPrefix(token, "https://api.telegram.org/bot") {
 		token = strings.TrimPrefix(token, "https://api.telegram.org/bot")
 		if idx := strings.Index(token, "/"); idx >= 0 {

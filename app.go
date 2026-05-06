@@ -21,6 +21,9 @@ type App struct {
 	configValue     atomic.Value // *RuntimeConfig
 	local           *LocalStore
 	mongo           *MongoStore
+	mongoURI        string
+	mongoDatabase   string
+	mongoMu         sync.Mutex
 	kubeClient      *kubernetes.Clientset
 	dynamicClient   dynamic.Interface
 	discoveryClient discovery.DiscoveryInterface
@@ -62,7 +65,7 @@ func NewApp(ctx context.Context, bootstrapPath, stateDir string) (*App, error) {
 		}
 	}
 	_ = local.SaveConfig(cfg, "startup")
-	a := &App{local: local, mongo: mongoStore, adminToken: os.Getenv("WEB_ADMIN_TOKEN")}
+	a := &App{local: local, mongo: mongoStore, mongoURI: uri, mongoDatabase: db, adminToken: os.Getenv("WEB_ADMIN_TOKEN")}
 	a.configValue.Store(cfg)
 	a.initKubeClients()
 	a.loadPersistedMetadata(ctx)
@@ -144,6 +147,7 @@ func (a *App) configSyncLoop(ctx context.Context) {
 		if cur == nil || cfg.Version > cur.Version {
 			if err := a.SetConfig(cfg, "mongo-sync"); err == nil {
 				log.Printf("runtime config hot loaded version=%d", cfg.Version)
+				a.reconcileMongoConnection(ctx, cfg)
 			}
 		}
 	}
@@ -191,6 +195,77 @@ func (a *App) mongoHealthLoop(ctx context.Context) {
 			log.Printf("mongo reconnected")
 		}
 	}
+}
+
+func (a *App) latestConfigFromStore(ctx context.Context) (*RuntimeConfig, error) {
+	cur := a.Config()
+	if a.mongo != nil && a.mongo.Healthy() {
+		cfg, err := a.mongo.GetActiveConfig(ctx)
+		if err == nil && cfg != nil {
+			if cur == nil || cfg.Version > cur.Version {
+				if setErr := a.SetConfig(cfg, "mongo-refresh"); setErr == nil {
+					log.Printf("runtime config refreshed before write version=%d", cfg.Version)
+					a.reconcileMongoConnection(ctx, cfg)
+				}
+			}
+			return cfg, nil
+		}
+		if err != nil {
+			return cur, err
+		}
+	}
+	return cur, nil
+}
+
+func (a *App) reconcileMongoConnection(ctx context.Context, cfg *RuntimeConfig) {
+	if cfg == nil {
+		return
+	}
+	uri, db := resolveMongoURI(cfg)
+	a.mongoMu.Lock()
+	defer a.mongoMu.Unlock()
+	if uri == "" {
+		if a.mongo != nil {
+			log.Printf("mongo config cleared; keeping local runtime only")
+		}
+		a.mongo = nil
+		a.mongoURI, a.mongoDatabase = "", ""
+		return
+	}
+	if a.mongo != nil && a.mongo.Healthy() && uri == a.mongoURI && db == a.mongoDatabase {
+		return
+	}
+	m, err := NewMongoStore(ctx, uri, db)
+	if err != nil {
+		log.Printf("mongo reconnect failed uri_source=%s db=%s err=%v", mongoURISource(cfg), db, err)
+		return
+	}
+	a.mongo = m
+	a.mongoURI, a.mongoDatabase = uri, db
+	_ = a.mongo.EnsureConfig(ctx, cfg)
+	_ = a.mongo.SaveConfig(ctx, cfg, "mongo-reconcile", true)
+	log.Printf("mongo connection reconciled db=%s uri_source=%s", db, mongoURISource(cfg))
+}
+
+func mongoURISource(cfg *RuntimeConfig) string {
+	if cfg == nil {
+		return "none"
+	}
+	for _, ds := range cfg.DataSources {
+		if !ds.Enabled || !ds.Active {
+			continue
+		}
+		if ds.URIEnv != "" {
+			return "env:" + ds.URIEnv
+		}
+		if ds.URI != "" {
+			return "inline"
+		}
+	}
+	if os.Getenv("MONGO_URI") != "" {
+		return "env:MONGO_URI"
+	}
+	return "none"
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

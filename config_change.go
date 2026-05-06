@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"sort"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 const (
 	ChangePending  = "pending"
+	ChangeApplying = "applying"
 	ChangeApproved = "approved"
 	ChangeRejected = "rejected"
 )
@@ -65,10 +67,17 @@ func configApprovalRequiredForKind(kind string) bool {
 }
 
 func (a *App) proposeConfigChange(ctx context.Context, cfg RuntimeConfig, kind, summary string, user *AuthUser, forceApply bool) (*ConfigChangeRequest, bool, error) {
-	cur := a.Config()
+	requestedBase := cfg.Version
+	cur, refreshErr := a.latestConfigFromStore(ctx)
+	if refreshErr != nil {
+		logConfigWriteStoreWarning(kind, refreshErr)
+	}
 	base := int64(0)
 	if cur != nil {
 		base = cur.Version
+	}
+	if requestedBase > 0 && base > 0 && requestedBase != base {
+		return nil, false, fmt.Errorf("config version conflict: current v%d, request is based on v%d; please refresh and submit again", base, requestedBase)
 	}
 	cfg.Version = base + 1
 	if err := validateRuntimeConfig(&cfg); err != nil {
@@ -105,12 +114,25 @@ func (a *App) applyConfig(ctx context.Context, cfg *RuntimeConfig, source string
 	if err := validateRuntimeConfig(cfg); err != nil {
 		return err
 	}
+	usedSharedStore := false
 	if a.mongo != nil && a.mongo.Healthy() {
 		if err := a.mongo.SaveConfig(ctx, cfg, source, true); err != nil {
 			return err
 		}
+		usedSharedStore = true
 	}
-	return a.SetConfig(cfg, source)
+	if !usedSharedStore {
+		log.Printf("config apply warning: mongo shared store unavailable, source=%s version=%d; only this pod will use the change until mongo reconnects", source, cfg.Version)
+	}
+	if err := a.SetConfig(cfg, source); err != nil {
+		return err
+	}
+	a.reconcileMongoConnection(ctx, cfg)
+	if a.mongo != nil && a.mongo.Healthy() {
+		// Write once more after reconcile so data-source switches seed the newly active shared store too.
+		_ = a.mongo.SaveConfig(ctx, cfg, source+":active-store", true)
+	}
+	return nil
 }
 
 func (a *App) saveConfigChange(ctx context.Context, cr *ConfigChangeRequest) error {
@@ -203,19 +225,31 @@ func sanitizeChanges(xs []ConfigChangeRequest) []ConfigChangeRequest {
 	return xs
 }
 
-func (a *App) approveConfigChange(ctx context.Context, id, note string, user *AuthUser) (*ConfigChangeRequest, error) {
+func (a *App) approveConfigChange(ctx context.Context, id, eventID, note string, user *AuthUser) (*ConfigChangeRequest, error) {
 	cr, err := a.getConfigChange(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	if eventID != "" && cr.EventID != "" && eventID != cr.EventID {
+		return nil, fmt.Errorf("event_id conflict: change has been refreshed or modified")
+	}
 	if cr.Status != ChangePending {
 		return nil, fmt.Errorf("change %s is %s", id, cr.Status)
 	}
-	cur := a.Config()
+	cur, refreshErr := a.latestConfigFromStore(ctx)
+	if refreshErr != nil {
+		logConfigWriteStoreWarning("approve:"+cr.Kind, refreshErr)
+	}
 	if cur != nil && cur.Version != cr.BaseVersion {
 		return nil, fmt.Errorf("config version conflict: current v%d, change %s is based on v%d; please recreate this change", cur.Version, id, cr.BaseVersion)
 	}
+	if !a.claimConfigChange(ctx, cr, ChangeApplying, user) {
+		return nil, fmt.Errorf("change %s is already being processed or no longer pending", id)
+	}
 	if err := a.applyConfig(ctx, &cr.Config, "approved:"+cr.Kind); err != nil {
+		cr.Status = ChangePending
+		cr.DecisionNote = "apply failed: " + err.Error()
+		_ = a.saveConfigChange(ctx, cr)
 		return nil, err
 	}
 	cr.Status = ChangeApproved
@@ -228,27 +262,31 @@ func (a *App) approveConfigChange(ctx context.Context, id, note string, user *Au
 		return cr, err
 	}
 	_ = a.saveConfigAudit(ctx, auditFromChange(cr, ChangeApproved))
+	go a.updateConfigChangeTelegramStatus(context.Background(), cr)
 	return cr, nil
 }
 
-func (a *App) rejectConfigChange(ctx context.Context, id, note string, user *AuthUser) (*ConfigChangeRequest, error) {
+func (a *App) rejectConfigChange(ctx context.Context, id, eventID, note string, user *AuthUser) (*ConfigChangeRequest, error) {
 	cr, err := a.getConfigChange(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	if eventID != "" && cr.EventID != "" && eventID != cr.EventID {
+		return nil, fmt.Errorf("event_id conflict: change has been refreshed or modified")
+	}
 	if cr.Status != ChangePending {
 		return nil, fmt.Errorf("change %s is %s", id, cr.Status)
 	}
-	cr.Status = ChangeRejected
-	if user != nil {
-		cr.DecidedBy = user.Username
+	if !a.claimConfigChange(ctx, cr, ChangeRejected, user) {
+		return nil, fmt.Errorf("change %s is already being processed or no longer pending", id)
 	}
-	cr.DecidedAt = time.Now().UTC()
+	cr.Status = ChangeRejected
 	cr.DecisionNote = note
 	if err := a.saveConfigChange(ctx, cr); err != nil {
 		return cr, err
 	}
 	_ = a.saveConfigAudit(ctx, auditFromChange(cr, ChangeRejected))
+	go a.updateConfigChangeTelegramStatus(context.Background(), cr)
 	return cr, nil
 }
 
@@ -291,32 +329,146 @@ func hashJSON(v any) string {
 	return hex.EncodeToString(h[:])
 }
 
+func logConfigWriteStoreWarning(kind string, err error) {
+	if err != nil {
+		log.Printf("config write warning: failed to refresh active config before %s: %v", kind, err)
+	}
+}
+
+func (a *App) claimConfigChange(ctx context.Context, cr *ConfigChangeRequest, status string, user *AuthUser) bool {
+	if cr == nil {
+		return false
+	}
+	actor := "unknown"
+	if user != nil {
+		actor = user.Username
+	}
+	if a.mongo != nil && a.mongo.Healthy() {
+		claimed, err := a.mongo.ClaimConfigChange(ctx, cr.ID, cr.EventID, status, actor)
+		if err != nil {
+			log.Printf("config change claim failed: id=%s event_id=%s err=%v", cr.ID, cr.EventID, err)
+			return false
+		}
+		*cr = *claimed
+		_ = a.local.SaveConfigChange(cr)
+		return true
+	}
+	// Local fallback is single-pod only; keep a normal pending guard.
+	if cr.Status != ChangePending {
+		return false
+	}
+	cr.Status = status
+	cr.DecidedBy = actor
+	cr.DecidedAt = time.Now().UTC()
+	if err := a.saveConfigChange(ctx, cr); err != nil {
+		log.Printf("config change claim failed: id=%s err=%v", cr.ID, err)
+		return false
+	}
+	return true
+}
+
 func (a *App) notifyConfigChange(ctx context.Context, cr *ConfigChangeRequest) {
 	cfg := a.Config()
-	if cfg == nil || !cfg.Telegram.Enabled || cr == nil {
+	if cfg == nil || cr == nil {
 		return
 	}
-	text := fmt.Sprintf("⚙️ 配置变更待审批\n事件ID: %s\n类型: %s\n申请人: %s\n版本: v%d -> v%d\n摘要: %s\n差异: %s", cr.EventID, cr.Kind, cr.CreatedBy, cr.BaseVersion, cr.TargetVersion, cr.Summary, strings.Join(cr.DiffSummary, ", "))
+	if !cfg.Telegram.Enabled {
+		log.Printf("config change telegram skipped: global disabled change=%s", cr.ID)
+		return
+	}
+	text := configChangeTelegramText(cr)
 	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
 	markup := any(nil)
 	if web != "" {
 		markup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "打开 Web 审批", "url": web + "/?change=" + cr.ID}}}}
 	}
+	refs := []TelegramMessageRef{}
+	seen := map[string]bool{}
 	for _, chat := range cfg.Telegram.Chats {
-		if !chat.Enabled {
+		if !chat.Enabled || chat.ChatID == "" || chat.BotID == "" {
 			continue
 		}
+		key := chat.BotID + "|" + chat.ChatID
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		bot := findTelegramBot(cfg, chat.BotID)
 		if bot == nil || !bot.Enabled {
+			log.Printf("config change telegram skipped: bot disabled or missing bot_id=%s change=%s", chat.BotID, cr.ID)
 			continue
 		}
-		token := bot.Token
-		if token == "" && bot.TokenEnv != "" {
-			token = os.Getenv(bot.TokenEnv)
+		token, source := telegramTokenForBot(*bot)
+		if token == "" {
+			log.Printf("config change telegram skipped: empty token bot_id=%s token_env=%s change=%s", bot.ID, bot.TokenEnv, cr.ID)
+			continue
 		}
+		res, err := sendTelegramWithResult(ctx, token, chat.ChatID, text, "", markup)
+		if err != nil {
+			log.Printf("config change telegram failed: bot_id=%s chat_id=%s source=%s change=%s err=%v", bot.ID, chat.ChatID, source, cr.ID, err)
+			continue
+		}
+		refs = append(refs, TelegramMessageRef{BotID: bot.ID, ChatID: chat.ChatID, MessageID: res.MessageID})
+		log.Printf("config change telegram sent: bot_id=%s chat_id=%s message_id=%d change=%s", bot.ID, chat.ChatID, res.MessageID, cr.ID)
+	}
+	if len(refs) > 0 {
+		cr.NotificationMessages = refs
+		if err := a.saveConfigChange(ctx, cr); err != nil {
+			log.Printf("config change telegram message refs save failed: change=%s err=%v", cr.ID, err)
+		}
+	}
+}
+
+func configChangeTelegramText(cr *ConfigChangeRequest) string {
+	if cr == nil {
+		return ""
+	}
+	status := "待审批"
+	switch cr.Status {
+	case ChangeApproved:
+		status = "已通过"
+	case ChangeRejected:
+		status = "已拒绝"
+	case ChangeApplying:
+		status = "处理中"
+	}
+	decided := ""
+	if cr.DecidedBy != "" {
+		decided = fmt.Sprintf("\n处理人: %s", cr.DecidedBy)
+	}
+	if !cr.DecidedAt.IsZero() {
+		decided += fmt.Sprintf("\n处理时间: %s", cr.DecidedAt.Format("2006-01-02 15:04:05 MST"))
+	}
+	return fmt.Sprintf("⚙️ 配置变更%s\n事件ID: %s\n类型: %s\n申请人: %s\n版本: v%d -> v%d%s\n摘要: %s\n差异: %s", status, cr.EventID, cr.Kind, cr.CreatedBy, cr.BaseVersion, cr.TargetVersion, decided, cr.Summary, strings.Join(cr.DiffSummary, ", "))
+}
+
+func (a *App) updateConfigChangeTelegramStatus(ctx context.Context, cr *ConfigChangeRequest) {
+	if cr == nil || len(cr.NotificationMessages) == 0 {
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil || !cfg.Telegram.Enabled {
+		return
+	}
+	text := configChangeTelegramText(cr)
+	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
+	markup := any(nil)
+	if web != "" {
+		markup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "打开 Web 查看", "url": web + "/?change=" + cr.ID}}}}
+	}
+	for _, ref := range cr.NotificationMessages {
+		bot := findTelegramBot(cfg, ref.BotID)
+		if bot == nil || !bot.Enabled || ref.MessageID == 0 || ref.ChatID == "" {
+			continue
+		}
+		token, source := telegramTokenForBot(*bot)
 		if token == "" {
 			continue
 		}
-		_ = sendTelegram(ctx, token, chat.ChatID, text, "", markup)
+		if err := editTelegramMessage(ctx, token, ref.ChatID, ref.MessageID, text, "", markup); err != nil {
+			log.Printf("config change telegram status update failed: bot_id=%s chat_id=%s message_id=%d source=%s change=%s err=%v", bot.ID, ref.ChatID, ref.MessageID, source, cr.ID, err)
+		} else {
+			log.Printf("config change telegram status updated: bot_id=%s chat_id=%s message_id=%d change=%s status=%s", bot.ID, ref.ChatID, ref.MessageID, cr.ID, cr.Status)
+		}
 	}
 }

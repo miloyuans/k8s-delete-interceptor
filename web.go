@@ -400,9 +400,9 @@ func (a *App) handleConfigChangeAction(w http.ResponseWriter, r *http.Request) {
 		var actionErr error
 		switch parts[1] {
 		case "approve":
-			cr, actionErr = a.approveConfigChange(r.Context(), parts[0], body.Note, userFromContext(r.Context()))
+			cr, actionErr = a.approveConfigChange(r.Context(), parts[0], body.EventID, body.Note, userFromContext(r.Context()))
 		case "reject":
-			cr, actionErr = a.rejectConfigChange(r.Context(), parts[0], body.Note, userFromContext(r.Context()))
+			cr, actionErr = a.rejectConfigChange(r.Context(), parts[0], body.EventID, body.Note, userFromContext(r.Context()))
 		default:
 			http.Error(w, "unknown action", 400)
 			return
@@ -786,18 +786,12 @@ func (a *App) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	token := strings.TrimSpace(bot.Token)
-	tokenSource := "inline_token"
-	if (token == "" || token == "********") && bot.TokenEnv != "" {
-		token = envOr(bot.TokenEnv, "")
-		tokenSource = "env:" + bot.TokenEnv
-	}
-	if token == "" || token == "********" {
+	token, tokenSource := telegramTokenForBot(*bot)
+	if token == "" {
 		log.Printf("telegram test failed: empty token bot_id=%s token_env=%s", bot.ID, bot.TokenEnv)
 		http.Error(w, "telegram token is empty; 请填写 Bot Token 或确认 token_env 环境变量已挂载到容器", 400)
 		return
 	}
-	token = normalizeTelegramToken(token)
 	log.Printf("telegram test validating token: bot_id=%s source=%s fingerprint=%s", bot.ID, tokenSource, tokenFingerprint(token))
 	botUsername, err := validateTelegramBotToken(r.Context(), token)
 	if err != nil {

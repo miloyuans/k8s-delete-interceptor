@@ -228,23 +228,30 @@ type WebUser struct {
 	UpdatedAt    time.Time `json:"updated_at,omitempty" yaml:"updated_at,omitempty" bson:"updated_at,omitempty"`
 }
 
+type TelegramMessageRef struct {
+	BotID     string `json:"bot_id" bson:"bot_id"`
+	ChatID    string `json:"chat_id" bson:"chat_id"`
+	MessageID int64  `json:"message_id" bson:"message_id"`
+}
+
 type ConfigChangeRequest struct {
-	ID            string        `json:"id" bson:"id"`
-	EventID       string        `json:"event_id" bson:"event_id"`
-	BaseHash      string        `json:"base_hash,omitempty" bson:"base_hash,omitempty"`
-	TargetHash    string        `json:"target_hash,omitempty" bson:"target_hash,omitempty"`
-	Kind          string        `json:"kind" bson:"kind"`
-	Summary       string        `json:"summary" bson:"summary"`
-	DiffSummary   []string      `json:"diff_summary" bson:"diff_summary"`
-	Status        string        `json:"status" bson:"status"`
-	BaseVersion   int64         `json:"base_version" bson:"base_version"`
-	TargetVersion int64         `json:"target_version" bson:"target_version"`
-	CreatedBy     string        `json:"created_by" bson:"created_by"`
-	CreatedAt     time.Time     `json:"created_at" bson:"created_at"`
-	DecidedBy     string        `json:"decided_by,omitempty" bson:"decided_by,omitempty"`
-	DecidedAt     time.Time     `json:"decided_at,omitempty" bson:"decided_at,omitempty"`
-	DecisionNote  string        `json:"decision_note,omitempty" bson:"decision_note,omitempty"`
-	Config        RuntimeConfig `json:"config" bson:"config"`
+	ID                   string               `json:"id" bson:"id"`
+	EventID              string               `json:"event_id" bson:"event_id"`
+	BaseHash             string               `json:"base_hash,omitempty" bson:"base_hash,omitempty"`
+	TargetHash           string               `json:"target_hash,omitempty" bson:"target_hash,omitempty"`
+	Kind                 string               `json:"kind" bson:"kind"`
+	Summary              string               `json:"summary" bson:"summary"`
+	DiffSummary          []string             `json:"diff_summary" bson:"diff_summary"`
+	Status               string               `json:"status" bson:"status"`
+	BaseVersion          int64                `json:"base_version" bson:"base_version"`
+	TargetVersion        int64                `json:"target_version" bson:"target_version"`
+	CreatedBy            string               `json:"created_by" bson:"created_by"`
+	CreatedAt            time.Time            `json:"created_at" bson:"created_at"`
+	DecidedBy            string               `json:"decided_by,omitempty" bson:"decided_by,omitempty"`
+	DecidedAt            time.Time            `json:"decided_at,omitempty" bson:"decided_at,omitempty"`
+	DecisionNote         string               `json:"decision_note,omitempty" bson:"decision_note,omitempty"`
+	NotificationMessages []TelegramMessageRef `json:"notification_messages,omitempty" bson:"notification_messages,omitempty"`
+	Config               RuntimeConfig        `json:"config" bson:"config"`
 }
 
 type ConfigAuditEvent struct {

@@ -196,7 +196,7 @@ func (a *App) baseMetadata() ClusterMetadata {
 }
 
 func allWebPermissions() []string {
-	out := []string{PermDashboardRead, PermEventsRead, PermSARead, PermSAScan, PermSAMount, PermConfigRead, PermConfigWrite, PermConfigApprove, PermConfigRestore, PermRulesWrite, PermDatasourceWrite, PermTelegramWrite, PermSettingsWrite, PermUsersWrite, PermRolesWrite, PermRollbackExecute}
+	out := []string{PermDashboardRead, PermEventsRead, PermSARead, PermSAScan, PermSAMount, PermActorGroupsWrite, PermConfigRead, PermConfigWrite, PermConfigApprove, PermConfigRestore, PermRulesWrite, PermDatasourceWrite, PermTelegramWrite, PermSettingsWrite, PermUsersWrite, PermRolesWrite, PermRollbackExecute}
 	sort.Strings(out)
 	return out
 }

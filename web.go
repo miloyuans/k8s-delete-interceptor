@@ -26,6 +26,8 @@ func (a *App) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/serviceaccounts", a.require(PermSARead, a.handleServiceAccounts))
 	mux.HandleFunc("/api/serviceaccounts/scan", a.require(PermSAScan, a.handleServiceAccountScan))
 	mux.HandleFunc("/api/serviceaccounts/mount", a.require(PermSAMount, a.handleServiceAccountMount))
+	mux.HandleFunc("/api/actorgroups", a.auth(a.handleActorGroups))
+	mux.HandleFunc("/api/actorgroups/", a.auth(a.handleActorGroups))
 	mux.HandleFunc("/api/config", a.require(PermConfigRead, a.handleConfig))
 	mux.HandleFunc("/api/config/publish", a.require(PermConfigWrite, a.handlePublishConfig))
 	mux.HandleFunc("/api/config/export", a.require(PermConfigRead, a.handleConfigExport))
@@ -49,6 +51,8 @@ func (a *App) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/telegram/users", a.auth(a.handleTelegramUsers))
 	mux.HandleFunc("/api/telegram/users/", a.auth(a.handleTelegramUsers))
 	mux.HandleFunc("/api/telegram/test", a.require(PermTelegramWrite, a.handleTelegramTest))
+	mux.HandleFunc("/api/rules/preview", a.auth(a.handleRulePreview))
+	mux.HandleFunc("/api/rules/parse", a.auth(a.handleRuleParse))
 	mux.HandleFunc("/api/rules", a.auth(a.handleRules))
 	mux.HandleFunc("/api/rules/", a.auth(a.handleRules))
 	mux.HandleFunc("/api/rollback/", a.require(PermRollbackExecute, a.handleRollback))
@@ -970,9 +974,123 @@ func deleteTelegramUser(items []TelegramUser, id string) []TelegramUser {
 	return out
 }
 
+func (a *App) handleActorGroups(w http.ResponseWriter, r *http.Request) {
+	u := userFromContext(r.Context())
+	cfg := a.Config()
+	if cfg == nil {
+		http.Error(w, "runtime config unavailable", 500)
+		return
+	}
+	id := strings.Trim(pathID("/api/actorgroups", r.URL.Path), "/")
+	if r.Method == http.MethodGet {
+		if !u.Can(PermConfigRead) {
+			http.Error(w, "forbidden", 403)
+			return
+		}
+		if id != "" {
+			for _, g := range cfg.ActorGroups {
+				if g.ID == id {
+					writeJSON(w, g)
+					return
+				}
+			}
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, cfg.ActorGroups)
+		return
+	}
+	if !u.Can(PermActorGroupsWrite) && !u.Can(PermRulesWrite) {
+		http.Error(w, "forbidden: need permission "+PermActorGroupsWrite, 403)
+		return
+	}
+	next := cloneConfig(cfg)
+	switch r.Method {
+	case http.MethodPost, http.MethodPut:
+		var item ActorGroup
+		if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if item.ID == "" {
+			item.ID = id
+		}
+		item = normalizeActorGroup(item)
+		if item.ID == "" {
+			http.Error(w, "actor group name is required", 400)
+			return
+		}
+		next.ActorGroups = upsertActorGroup(next.ActorGroups, item)
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "actor_groups", "创建或更新 ActorGroup 逻辑组", u, false)
+		writeChangeResponse(w, cr, applied, err)
+	case http.MethodDelete:
+		if id == "" {
+			http.Error(w, "actor group id is required", 400)
+			return
+		}
+		next.ActorGroups = deleteActorGroup(next.ActorGroups, id)
+		for i := range next.Rules {
+			next.Rules[i].ActorGroupIDs = removeString(next.Rules[i].ActorGroupIDs, id)
+		}
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "actor_groups", "删除 ActorGroup 逻辑组", u, false)
+		writeChangeResponse(w, cr, applied, err)
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
+}
+
+func normalizeActorGroup(g ActorGroup) ActorGroup {
+	g.ID = strings.TrimSpace(g.ID)
+	g.Name = strings.TrimSpace(g.Name)
+	if g.ID == "" {
+		g.ID = autoID("actor", g.Name)
+	}
+	if g.Name == "" {
+		g.Name = g.ID
+	}
+	g.Users = dedupeSort(g.Users)
+	g.Groups = dedupeSort(g.Groups)
+	g.ServiceAccounts = dedupeSort(g.ServiceAccounts)
+	return g
+}
+
+func upsertActorGroup(items []ActorGroup, item ActorGroup) []ActorGroup {
+	for i := range items {
+		if items[i].ID == item.ID {
+			items[i] = item
+			return items
+		}
+	}
+	return append(items, item)
+}
+
+func deleteActorGroup(items []ActorGroup, id string) []ActorGroup {
+	out := []ActorGroup{}
+	for _, item := range items {
+		if item.ID != id {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func removeString(xs []string, v string) []string {
+	out := []string{}
+	for _, x := range xs {
+		if x != v {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
 func (a *App) handleRules(w http.ResponseWriter, r *http.Request) {
 	u := userFromContext(r.Context())
 	cfg := a.Config()
+	if cfg == nil {
+		http.Error(w, "runtime config unavailable", 500)
+		return
+	}
 	if r.Method == http.MethodGet {
 		if !u.Can(PermConfigRead) {
 			http.Error(w, "forbidden", 403)
@@ -1000,18 +1118,22 @@ func (a *App) handleRules(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "rules", "通过表单创建或更新规则策略", u, false)
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "rules", "通过可视化表单或 YAML 提交规则策略", u, false)
 		writeChangeResponse(w, cr, applied, err)
 	case http.MethodDelete:
 		id := strings.Trim(pathID("/api/rules", r.URL.Path), "/")
 		next := cloneConfig(cfg)
 		filtered := []PolicyRule{}
+		removedScopeIDs := []string{}
 		for _, rule := range next.Rules {
 			if rule.ID != id {
 				filtered = append(filtered, rule)
+				continue
 			}
+			removedScopeIDs = append(removedScopeIDs, rule.ScopeIDs...)
 		}
 		next.Rules = filtered
+		next.ResourceScopes = removeUnusedAutoScopes(next.ResourceScopes, next.Rules, removedScopeIDs)
 		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "rules", "删除规则策略", u, false)
 		writeChangeResponse(w, cr, applied, err)
 	default:
@@ -1019,61 +1141,92 @@ func (a *App) handleRules(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (a *App) handleRulePreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	u := userFromContext(r.Context())
+	if !u.Can(PermConfigRead) {
+		http.Error(w, "forbidden", 403)
+		return
+	}
+	var req RuleEditRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	norm, scope, rule := buildRuleFromRequest(req)
+	doc := RuleYAMLDocument{Rule: rule, ResourceScope: scope}
+	b, err := yaml.Marshal(doc)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	writeJSON(w, map[string]any{"request": norm, "rule": rule, "resource_scope": scope, "yaml": string(b)})
+}
+
+func (a *App) handleRuleParse(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	u := userFromContext(r.Context())
+	if !u.Can(PermConfigRead) {
+		http.Error(w, "forbidden", 403)
+		return
+	}
+	var body struct {
+		YAML string `json:"yaml"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	req, err := parseRuleYAML(body.YAML)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	norm, scope, rule := buildRuleFromRequest(req)
+	b, _ := yaml.Marshal(RuleYAMLDocument{Rule: rule, ResourceScope: scope})
+	writeJSON(w, map[string]any{"request": norm, "rule": rule, "resource_scope": scope, "yaml": string(b)})
+}
+
 type RuleEditRequest struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	Enabled        bool     `json:"enabled"`
-	Priority       int      `json:"priority"`
-	Operations     []string `json:"operations"`
-	APIGroup       string   `json:"api_group"`
-	Resource       string   `json:"resource"`
-	Kind           string   `json:"kind"`
-	Namespaces     []string `json:"namespaces"`
-	Names          []string `json:"names"`
-	ActorGroupIDs  []string `json:"actor_group_ids"`
-	ChangeClasses  []string `json:"change_classes"`
-	Decision       string   `json:"decision"`
-	Reason         string   `json:"reason"`
-	Approval       bool     `json:"approval"`
-	Rollback       bool     `json:"rollback"`
-	NotifyTemplate string   `json:"notify_template"`
+	ID             string   `json:"id" yaml:"id"`
+	Name           string   `json:"name" yaml:"name"`
+	Enabled        bool     `json:"enabled" yaml:"enabled"`
+	Priority       int      `json:"priority" yaml:"priority"`
+	Operations     []string `json:"operations" yaml:"operations"`
+	APIGroup       string   `json:"api_group" yaml:"api_group"`
+	APIGroups      []string `json:"api_groups" yaml:"api_groups"`
+	Resource       string   `json:"resource" yaml:"resource"`
+	Resources      []string `json:"resources" yaml:"resources"`
+	Kind           string   `json:"kind" yaml:"kind"`
+	Kinds          []string `json:"kinds" yaml:"kinds"`
+	Namespaces     []string `json:"namespaces" yaml:"namespaces"`
+	Names          []string `json:"names" yaml:"names"`
+	ActorGroupIDs  []string `json:"actor_group_ids" yaml:"actor_group_ids"`
+	ChangeClasses  []string `json:"change_classes" yaml:"change_classes"`
+	Decision       string   `json:"decision" yaml:"decision"`
+	Reason         string   `json:"reason" yaml:"reason"`
+	Approval       bool     `json:"approval" yaml:"approval"`
+	Rollback       bool     `json:"rollback" yaml:"rollback"`
+	NotifyTemplate string   `json:"notify_template" yaml:"notify_template"`
+}
+
+type RuleYAMLDocument struct {
+	Rule          PolicyRule    `json:"rule" yaml:"rule"`
+	ResourceScope ResourceScope `json:"resource_scope" yaml:"resource_scope"`
 }
 
 func upsertRuleFromRequest(cfg *RuntimeConfig, req RuleEditRequest) error {
-	if strings.TrimSpace(req.ID) == "" {
-		return fmt.Errorf("rule id is required")
+	_, scope, rule := buildRuleFromRequest(req)
+	if strings.TrimSpace(rule.ID) == "" {
+		return fmt.Errorf("rule name is required")
 	}
-	if req.Name == "" {
-		req.Name = req.ID
-	}
-	if req.Priority == 0 {
-		req.Priority = 100
-	}
-	if len(req.Operations) == 0 {
-		req.Operations = []string{"DELETE"}
-	}
-	if req.Decision == "" {
-		req.Decision = DecisionRequireApproval
-	}
-	if len(req.Namespaces) == 0 {
-		req.Namespaces = []string{"*"}
-	}
-	if len(req.Names) == 0 {
-		req.Names = []string{"*"}
-	}
-	scopeID := "web_scope_" + req.ID
-	scope := ResourceScope{ID: scopeID, Name: req.Name + " 资源范围", Enabled: true, APIGroups: []string{req.APIGroup}, Resources: []string{req.Resource}, Kinds: []string{req.Kind}, Namespaces: req.Namespaces, Names: req.Names}
 	upsertScope(cfg, scope)
-	rule := PolicyRule{ID: req.ID, Name: req.Name, Enabled: req.Enabled, Priority: req.Priority, ScopeIDs: []string{scopeID}, Operations: upperStrings(req.Operations), ActorGroupIDs: req.ActorGroupIDs, ChangeClasses: req.ChangeClasses, Decision: req.Decision, Reason: req.Reason}
-	if req.NotifyTemplate != "" {
-		rule.Notify = NotificationBinding{Enabled: true, TemplateID: req.NotifyTemplate}
-	}
-	if req.Approval || req.Decision == DecisionRequireApproval {
-		rule.Approval = ApprovalBinding{Enabled: true, Mode: "both", TTLSeconds: 300, FailWhenStoreDown: true}
-	}
-	if req.Rollback {
-		rule.Rollback = RollbackBinding{Enabled: true, Mode: RollbackRestoreOldObject, ShowInTelegram: true, ShowInWeb: true}
-	}
 	updated := false
 	for i := range cfg.Rules {
 		if cfg.Rules[i].ID == rule.ID {
@@ -1088,6 +1241,139 @@ func upsertRuleFromRequest(cfg *RuntimeConfig, req RuleEditRequest) error {
 	return validateRuntimeConfig(cfg)
 }
 
+func buildRuleFromRequest(req RuleEditRequest) (RuleEditRequest, ResourceScope, PolicyRule) {
+	req = normalizeRuleRequest(req)
+	scopeID := "web_scope_" + req.ID
+	scope := ResourceScope{ID: scopeID, Name: req.Name + " 资源范围", Enabled: true, APIGroups: req.APIGroups, Resources: req.Resources, Kinds: req.Kinds, Namespaces: req.Namespaces, Names: req.Names}
+	rule := PolicyRule{ID: req.ID, Name: req.Name, Enabled: req.Enabled, Priority: req.Priority, ScopeIDs: []string{scopeID}, Operations: upperStrings(req.Operations), ActorGroupIDs: req.ActorGroupIDs, ChangeClasses: req.ChangeClasses, Decision: req.Decision, Reason: req.Reason}
+	if req.NotifyTemplate != "" {
+		rule.Notify = NotificationBinding{Enabled: true, TemplateID: req.NotifyTemplate}
+	}
+	if req.Approval || req.Decision == DecisionRequireApproval {
+		rule.Approval = ApprovalBinding{Enabled: true, Mode: "both", TTLSeconds: 300, FailWhenStoreDown: true}
+	}
+	if req.Rollback {
+		rule.Rollback = RollbackBinding{Enabled: true, Mode: RollbackRestoreOldObject, ShowInTelegram: true, ShowInWeb: true}
+	}
+	return req, scope, rule
+}
+
+func normalizeRuleRequest(req RuleEditRequest) RuleEditRequest {
+	req.ID = strings.TrimSpace(req.ID)
+	req.Name = strings.TrimSpace(req.Name)
+	if req.ID == "" {
+		req.ID = autoID("rule", req.Name)
+	}
+	if req.Name == "" {
+		req.Name = req.ID
+	}
+	if req.Priority == 0 {
+		req.Priority = 100
+	}
+	if len(req.Operations) == 0 {
+		req.Operations = []string{"DELETE"}
+	}
+	if req.Decision == "" {
+		req.Decision = DecisionRequireApproval
+	}
+	if !req.Enabled {
+		// zero value from old clients should still create enabled rules unless the ID already exists.
+		req.Enabled = true
+	}
+	if len(req.APIGroups) == 0 && req.APIGroup != "" {
+		req.APIGroups = []string{req.APIGroup}
+	}
+	if len(req.Resources) == 0 && req.Resource != "" {
+		req.Resources = []string{req.Resource}
+	}
+	if len(req.Kinds) == 0 && req.Kind != "" {
+		req.Kinds = []string{req.Kind}
+	}
+	req.APIGroups = keepEmptyCoreGroup(dedupeTrim(req.APIGroups))
+	req.Resources = dedupeTrim(req.Resources)
+	req.Kinds = dedupeTrim(req.Kinds)
+	req.Namespaces = dedupeTrim(req.Namespaces)
+	req.Names = dedupeTrim(req.Names)
+	req.ActorGroupIDs = dedupeTrim(req.ActorGroupIDs)
+	req.ChangeClasses = dedupeTrim(req.ChangeClasses)
+	if len(req.APIGroups) == 0 {
+		req.APIGroups = []string{"*"}
+	}
+	if len(req.Resources) == 0 {
+		req.Resources = []string{"*"}
+	}
+	if len(req.Kinds) == 0 {
+		req.Kinds = []string{"*"}
+	}
+	if len(req.Namespaces) == 0 {
+		req.Namespaces = []string{"*"}
+	}
+	if len(req.Names) == 0 {
+		req.Names = []string{"*"}
+	}
+	return req
+}
+
+func parseRuleYAML(raw string) (RuleEditRequest, error) {
+	var doc RuleYAMLDocument
+	if err := yaml.Unmarshal([]byte(raw), &doc); err == nil && doc.Rule.ID != "" {
+		return requestFromRuleAndScope(doc.Rule, doc.ResourceScope), nil
+	}
+	var req RuleEditRequest
+	if err := yaml.Unmarshal([]byte(raw), &req); err == nil && (req.ID != "" || req.Name != "") {
+		return req, nil
+	}
+	var rule PolicyRule
+	if err := yaml.Unmarshal([]byte(raw), &rule); err != nil {
+		return RuleEditRequest{}, err
+	}
+	if rule.ID == "" && rule.Name == "" {
+		return RuleEditRequest{}, fmt.Errorf("yaml must contain rule or rule-like fields")
+	}
+	return requestFromRuleAndScope(rule, ResourceScope{}), nil
+}
+
+func requestFromRuleAndScope(rule PolicyRule, scope ResourceScope) RuleEditRequest {
+	req := RuleEditRequest{ID: rule.ID, Name: rule.Name, Enabled: rule.Enabled, Priority: rule.Priority, Operations: rule.Operations, ActorGroupIDs: rule.ActorGroupIDs, ChangeClasses: rule.ChangeClasses, Decision: rule.Decision, Reason: rule.Reason, Approval: rule.Approval.Enabled, Rollback: rule.Rollback.Enabled, NotifyTemplate: rule.Notify.TemplateID}
+	if len(scope.APIGroups) > 0 {
+		req.APIGroups = scope.APIGroups
+	}
+	if len(scope.Resources) > 0 {
+		req.Resources = scope.Resources
+	}
+	if len(scope.Kinds) > 0 {
+		req.Kinds = scope.Kinds
+	}
+	if len(scope.Namespaces) > 0 {
+		req.Namespaces = scope.Namespaces
+	}
+	if len(scope.Names) > 0 {
+		req.Names = scope.Names
+	}
+	return req
+}
+
+func removeUnusedAutoScopes(scopes []ResourceScope, rules []PolicyRule, ids []string) []ResourceScope {
+	remove := map[string]bool{}
+	for _, id := range ids {
+		if strings.HasPrefix(id, "web_scope_") {
+			remove[id] = true
+		}
+	}
+	for _, r := range rules {
+		for _, id := range r.ScopeIDs {
+			delete(remove, id)
+		}
+	}
+	out := []ResourceScope{}
+	for _, s := range scopes {
+		if !remove[s.ID] {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func upsertScope(cfg *RuntimeConfig, scope ResourceScope) {
 	for i := range cfg.ResourceScopes {
 		if cfg.ResourceScopes[i].ID == scope.ID {
@@ -1098,10 +1384,78 @@ func upsertScope(cfg *RuntimeConfig, scope ResourceScope) {
 	cfg.ResourceScopes = append(cfg.ResourceScopes, scope)
 }
 
+func autoID(prefix, name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range name {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if ok {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if r > 127 {
+			if !lastDash {
+				b.WriteByte('-')
+				lastDash = true
+			}
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	id := strings.Trim(b.String(), "-")
+	if id == "" {
+		id = fmt.Sprintf("%d", time.Now().Unix())
+	}
+	return prefix + "_" + id
+}
+
+func dedupeTrim(xs []string) []string {
+	set := map[string]bool{}
+	out := []string{}
+	for _, x := range xs {
+		x = strings.TrimSpace(x)
+		if x == "" || set[x] {
+			continue
+		}
+		set[x] = true
+		out = append(out, x)
+	}
+	return out
+}
+
+func keepEmptyCoreGroup(xs []string) []string {
+	if len(xs) == 0 {
+		return xs
+	}
+	seenCore := false
+	out := []string{}
+	for _, x := range xs {
+		if x == "core" || x == "<core>" {
+			x = ""
+		}
+		if x == "" {
+			if seenCore {
+				continue
+			}
+			seenCore = true
+		}
+		out = append(out, x)
+	}
+	return out
+}
+
 func upperStrings(xs []string) []string {
 	out := make([]string, 0, len(xs))
 	for _, x := range xs {
-		out = append(out, strings.ToUpper(strings.TrimSpace(x)))
+		v := strings.ToUpper(strings.TrimSpace(x))
+		if v != "" {
+			out = append(out, v)
+		}
 	}
 	return out
 }

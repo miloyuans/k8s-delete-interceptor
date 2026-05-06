@@ -32,7 +32,7 @@ func newConfigEventID(kind, user string) string {
 
 func configChangeCategory(kind string) string {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
-	case "rules", "sa_mount", "raw_config", "restore":
+	case "rules", "sa_mount", "actor_groups", "raw_config", "restore":
 		return "business_config"
 	case "settings":
 		return "site_settings"
@@ -57,7 +57,7 @@ func configApprovalRequiredForKind(kind string) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(kind)) {
-	case "rules", "sa_mount", "raw_config", "restore":
+	case "rules", "sa_mount", "actor_groups", "raw_config", "restore":
 		return true
 	default:
 		return false

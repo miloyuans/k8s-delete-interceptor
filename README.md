@@ -94,3 +94,29 @@ METADATA_REFRESH_TIMEOUT=20s       # capped at 60s
 METADATA_INITIAL_DELAY=20s         # delay before first background refresh after startup
 ```
 
+
+## Telegram 全局队列与多副本消费
+
+本版本将 Telegram 资源配置独立持久化到 MongoDB 的 `telegram_config` 集合，Web 页面更新 Bot、群/Chat、用户 ID 后会直接写入数据库，不再通过业务配置审批，也不依赖各 Pod 的本地运行配置缓存。发送通知时会实时读取数据库中的 Telegram 配置；如果 MongoDB 不可用，Telegram 通知不会直发，等待数据库恢复后继续消费队列。
+
+通知消息统一写入 `telegram_notification_events` 集合，状态流转为：
+
+- `pending`：未消费
+- `sending`：消费中，带有 worker lease
+- `sent`：消费完成
+- `failed`：达到最大重试次数后的失败状态
+
+多副本运行时，每个 Pod 会先探测是否有待消费事件；发现队列后随机竞争 `telegram_dispatcher` 分布式锁，只有抢到锁的 Pod 会启动本轮 Telegram 消费。队列被清空后释放锁；如果 Pod 异常退出，lease 到期后其他 Pod 会继续断点重试。
+
+可用环境变量：
+
+```bash
+TELEGRAM_NOTIFY_MAX_WORKERS=8          # 最大并发 worker 数
+TELEGRAM_NOTIFY_MIN_INTERVAL=1200ms    # 单 worker 发送间隔，避免 Telegram 限流
+TELEGRAM_NOTIFY_MAX_ATTEMPTS=10        # 单条通知最大重试次数
+TELEGRAM_NOTIFY_LEASE=2m               # 事件和 dispatcher 的 lease 时间
+TELEGRAM_NOTIFY_IDLE_POLL=2s           # 无队列时探测间隔
+TELEGRAM_NOTIFY_PROBE_JITTER=1500ms    # 多 Pod 随机竞争抖动
+```
+
+一个 Bot 可以配置 `token_env`、`token_envs`、`token`、`tokens`。程序会按可用 token 数自动提升消费 worker 数，但仍通过队列状态和 Mongo 原子抢占避免重复消费。生产环境建议使用 `token_env` / `token_envs`，不要在页面明文保存 token。

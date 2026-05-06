@@ -7,12 +7,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 )
@@ -36,12 +39,112 @@ type telegramSendResult struct {
 	MessageID int64
 }
 
+type telegramTokenCandidate struct {
+	Token  string
+	Source string
+}
+
+func (a *App) getTelegramConfig(ctx context.Context) (*TelegramConfig, error) {
+	if a.mongo == nil || !a.mongo.Healthy() {
+		return nil, fmt.Errorf("telegram config store unavailable: mongo is not healthy")
+	}
+	cfg, err := a.mongo.GetTelegramConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeTelegramConfig(*cfg), nil
+}
+
+func (a *App) saveTelegramConfig(ctx context.Context, cfg TelegramConfig, actor string) (*TelegramConfig, error) {
+	if a.mongo == nil || !a.mongo.Healthy() {
+		return nil, fmt.Errorf("telegram config store unavailable: mongo is not healthy")
+	}
+	cfg = *normalizeTelegramConfig(cfg)
+	return a.mongo.SaveTelegramConfig(ctx, cfg, actor)
+}
+
+func normalizeTelegramConfig(cfg TelegramConfig) *TelegramConfig {
+	cfg.ID = "default"
+	seenBots := map[string]bool{}
+	bots := []TelegramBot{}
+	for _, b := range cfg.Bots {
+		b.ID = strings.TrimSpace(b.ID)
+		b.Name = strings.TrimSpace(b.Name)
+		b.Token = strings.TrimSpace(b.Token)
+		b.TokenEnv = strings.TrimSpace(b.TokenEnv)
+		b.Tokens = dedupeSort(compactStrings(b.Tokens))
+		b.TokenEnvs = dedupeSort(compactStrings(b.TokenEnvs))
+		if b.ID == "" {
+			b.ID = autoID("bot", b.Name)
+		}
+		if b.ID == "" || seenBots[b.ID] {
+			continue
+		}
+		if b.Name == "" {
+			b.Name = b.ID
+		}
+		seenBots[b.ID] = true
+		bots = append(bots, b)
+	}
+	cfg.Bots = bots
+	seenChats := map[string]bool{}
+	chats := []TelegramChat{}
+	for _, c := range cfg.Chats {
+		c.ID = strings.TrimSpace(c.ID)
+		c.Name = strings.TrimSpace(c.Name)
+		c.BotID = strings.TrimSpace(c.BotID)
+		c.ChatID = strings.TrimSpace(c.ChatID)
+		if c.ID == "" {
+			c.ID = autoID("chat", c.Name+c.ChatID)
+		}
+		if c.ID == "" || seenChats[c.ID] {
+			continue
+		}
+		if c.Name == "" {
+			c.Name = c.ID
+		}
+		seenChats[c.ID] = true
+		chats = append(chats, c)
+	}
+	cfg.Chats = chats
+	seenUsers := map[string]bool{}
+	users := []TelegramUser{}
+	for _, u := range cfg.Users {
+		u.ID = strings.TrimSpace(u.ID)
+		u.TelegramID = strings.TrimSpace(u.TelegramID)
+		u.Username = strings.TrimSpace(strings.TrimPrefix(u.Username, "@"))
+		u.DisplayName = strings.TrimSpace(u.DisplayName)
+		u.Alias = strings.TrimSpace(u.Alias)
+		u.Roles = dedupeSort(compactStrings(u.Roles))
+		if u.ID == "" {
+			u.ID = autoID("tg_user", u.DisplayName+u.TelegramID+u.Username)
+		}
+		if u.ID == "" || seenUsers[u.ID] {
+			continue
+		}
+		if u.DisplayName == "" {
+			u.DisplayName = u.ID
+		}
+		seenUsers[u.ID] = true
+		users = append(users, u)
+	}
+	cfg.Users = users
+	return &cfg
+}
+
+func compactStrings(xs []string) []string {
+	out := []string{}
+	for _, x := range xs {
+		x = strings.TrimSpace(x)
+		if x != "" {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
 func (a *App) notifyEvent(ctx context.Context, cfg *RuntimeConfig, ev *AdmissionEvent, pd PolicyDecision) {
 	if cfg == nil || ev == nil || pd.Rule == nil {
-		return
-	}
-	if !cfg.Telegram.Enabled {
-		log.Printf("telegram notify skipped: global disabled rule=%s event=%s", pd.Rule.ID, ev.ID)
 		return
 	}
 	bind := pd.Rule.Notify
@@ -49,18 +152,27 @@ func (a *App) notifyEvent(ctx context.Context, cfg *RuntimeConfig, ev *Admission
 		log.Printf("telegram notify skipped: rule notify disabled rule=%s event=%s decision=%s", pd.Rule.ID, ev.ID, pd.Decision)
 		return
 	}
+	tg, err := a.getTelegramConfig(ctx)
+	if err != nil {
+		log.Printf("telegram notify skipped: cannot read db telegram config rule=%s event=%s err=%v", pd.Rule.ID, ev.ID, err)
+		return
+	}
+	if !tg.Enabled {
+		log.Printf("telegram notify skipped: db telegram global disabled rule=%s event=%s", pd.Rule.ID, ev.ID)
+		return
+	}
 	tpl := findTemplate(cfg, bind.TemplateID)
 	if tpl == nil || !tpl.Enabled {
 		log.Printf("telegram notify skipped: template disabled or missing rule=%s template=%s", pd.Rule.ID, bind.TemplateID)
 		return
 	}
-	targets := resolveTelegramTargets(cfg, bind)
+	targets := resolveTelegramTargets(tg, bind)
 	log.Printf("telegram notify resolving: rule=%s event=%s template=%s bots=%v chats=%v users=%v targets=%d", pd.Rule.ID, ev.ID, bind.TemplateID, bind.TelegramBotIDs, bind.TelegramChatIDs, bind.TelegramUserIDs, len(targets))
 	if len(targets) == 0 {
 		log.Printf("telegram notify skipped: no enabled target rule=%s template=%s", pd.Rule.ID, tpl.ID)
 		return
 	}
-	msg, err := renderTemplate(cfg, ev, pd, *tpl)
+	msg, err := renderTemplate(cfg, tg, ev, pd, *tpl)
 	if err != nil {
 		log.Printf("telegram render template failed: rule=%s template=%s err=%v", pd.Rule.ID, tpl.ID, err)
 		return
@@ -94,32 +206,17 @@ func (a *App) enqueueTelegramNotification(ctx context.Context, ev *TelegramNotif
 	if ev == nil {
 		return nil
 	}
-	if a.mongo != nil && a.mongo.Healthy() {
-		return a.mongo.EnqueueTelegramNotification(ctx, ev)
+	if a.mongo == nil || !a.mongo.Healthy() {
+		return fmt.Errorf("telegram notification queue unavailable: mongo is not healthy")
 	}
-	// Mongo 是多副本全局队列的唯一共享后端。不可用时保留单 Pod 直发兜底，并明确打日志。
-	log.Printf("telegram notification queue unavailable; sending directly in current pod only: id=%s kind=%s event=%s", ev.ID, ev.Kind, ev.EventID)
-	return a.sendTelegramNotificationNow(ctx, ev)
+	return a.mongo.EnqueueTelegramNotification(ctx, ev)
 }
 
 func (a *App) telegramNotificationLoop(ctx context.Context) {
-	workers := envInt("TELEGRAM_NOTIFY_WORKERS", 1)
-	if workers < 1 {
-		workers = 1
-	}
-	if workers > 5 {
-		workers = 5
-	}
-	for i := 0; i < workers; i++ {
-		go a.telegramNotificationWorker(ctx, i)
-	}
-}
-
-func (a *App) telegramNotificationWorker(ctx context.Context, idx int) {
-	worker := fmt.Sprintf("%s-%d", envOr("HOSTNAME", "pod"), idx)
-	minInterval := telegramMinInterval()
+	owner := fmt.Sprintf("%s-%d", envOr("HOSTNAME", "pod"), time.Now().UnixNano())
+	idle := envDuration("TELEGRAM_NOTIFY_IDLE_POLL", 2*time.Second)
 	lease := telegramLease()
-	idle := 2 * time.Second
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	for {
 		select {
 		case <-ctx.Done():
@@ -127,31 +224,150 @@ func (a *App) telegramNotificationWorker(ctx context.Context, idx int) {
 		default:
 		}
 		if a.mongo == nil || !a.mongo.Healthy() {
-			select {
-			case <-ctx.Done():
+			waitContext(ctx, idle)
+			continue
+		}
+		pending, err := a.mongo.CountRunnableTelegramNotifications(ctx, time.Now().UTC())
+		if err != nil {
+			log.Printf("telegram dispatcher probe failed owner=%s err=%v", owner, err)
+			waitContext(ctx, idle)
+			continue
+		}
+		if pending == 0 {
+			waitContext(ctx, idle)
+			continue
+		}
+		jitter := time.Duration(rng.Int63n(int64(telegramProbeJitter())))
+		waitContext(ctx, jitter)
+		ok, err := a.mongo.AcquireTelegramDispatchLock(ctx, owner, lease)
+		if err != nil {
+			log.Printf("telegram dispatcher lock failed owner=%s err=%v", owner, err)
+			waitContext(ctx, idle)
+			continue
+		}
+		if !ok {
+			waitContext(ctx, idle)
+			continue
+		}
+		log.Printf("telegram dispatcher acquired owner=%s pending=%d", owner, pending)
+		a.runTelegramDispatchSession(ctx, owner)
+		_ = a.mongo.ReleaseTelegramDispatchLock(context.Background(), owner)
+		log.Printf("telegram dispatcher released owner=%s", owner)
+	}
+}
+
+func (a *App) runTelegramDispatchSession(ctx context.Context, owner string) {
+	lease := telegramLease()
+	tg, err := a.getTelegramConfig(ctx)
+	if err != nil {
+		log.Printf("telegram dispatcher cannot load db telegram config owner=%s err=%v", owner, err)
+		return
+	}
+	if !tg.Enabled {
+		log.Printf("telegram dispatcher stopped: telegram disabled owner=%s", owner)
+		return
+	}
+	workers := telegramWorkerCount(tg)
+	if workers < 1 {
+		log.Printf("telegram dispatcher stopped: no enabled bot token owner=%s", owner)
+		return
+	}
+	maxWorkers := envInt("TELEGRAM_NOTIFY_MAX_WORKERS", 8)
+	if maxWorkers < 1 {
+		maxWorkers = 1
+	}
+	if maxWorkers > 32 {
+		maxWorkers = 32
+	}
+	if workers > maxWorkers {
+		workers = maxWorkers
+	}
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			a.telegramNotificationWorker(sessionCtx, fmt.Sprintf("%s-w%d", owner, idx))
+		}(i)
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	renew := time.NewTicker(maxDuration(lease/3, 5*time.Second))
+	defer renew.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			cancel()
+			<-done
+			return
+		case <-done:
+			return
+		case <-renew.C:
+			ok, err := a.mongo.RenewTelegramDispatchLock(ctx, owner, lease)
+			if err != nil || !ok {
+				log.Printf("telegram dispatcher lost lock owner=%s ok=%v err=%v", owner, ok, err)
+				cancel()
+				<-done
 				return
-			case <-time.After(idle):
-				continue
 			}
 		}
-		n, err := a.mongo.ClaimTelegramNotification(ctx, worker, lease)
+	}
+}
+
+func telegramWorkerCount(tg *TelegramConfig) int {
+	if tg == nil || !tg.Enabled {
+		return 0
+	}
+	n := 0
+	for _, b := range tg.Bots {
+		if !b.Enabled {
+			continue
+		}
+		c := len(telegramTokenCandidates(b))
+		if c == 0 {
+			continue
+		}
+		n += c
+	}
+	if n < 1 {
+		return 0
+	}
+	return n
+}
+
+func (a *App) telegramNotificationWorker(ctx context.Context, worker string) {
+	minInterval := telegramMinInterval()
+	idle := envDuration("TELEGRAM_NOTIFY_EMPTY_WAIT", 700*time.Millisecond)
+	empty := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if a.mongo == nil || !a.mongo.Healthy() {
+			return
+		}
+		n, err := a.mongo.ClaimTelegramNotification(ctx, worker, telegramLease())
 		if err != nil {
 			log.Printf("telegram notification claim failed worker=%s err=%v", worker, err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(idle):
-			}
+			waitContext(ctx, idle)
 			continue
 		}
 		if n == nil {
-			select {
-			case <-ctx.Done():
+			empty++
+			if empty >= 3 {
 				return
-			case <-time.After(idle):
 			}
+			waitContext(ctx, idle)
 			continue
 		}
+		empty = 0
 		if err := a.sendTelegramNotificationNow(ctx, n); err != nil {
 			delay := telegramRetryDelay(err, n.Attempts)
 			terminal := n.Attempts >= n.MaxAttempts
@@ -162,29 +378,28 @@ func (a *App) telegramNotificationWorker(ctx context.Context, idx int) {
 			}
 			_ = a.mongo.FailTelegramNotification(ctx, n, err.Error(), time.Now().UTC().Add(delay), terminal)
 		} else {
-			log.Printf("telegram notification consumed: id=%s kind=%s event=%s bot_id=%s chat_id=%s", n.ID, n.Kind, n.EventID, n.BotID, n.ChatID)
+			log.Printf("telegram notification consumed: id=%s kind=%s event=%s bot_id=%s chat_id=%s worker=%s", n.ID, n.Kind, n.EventID, n.BotID, n.ChatID, worker)
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(minInterval):
-		}
+		waitContext(ctx, minInterval)
 	}
 }
 
 func (a *App) sendTelegramNotificationNow(ctx context.Context, n *TelegramNotificationEvent) error {
-	cfg := a.Config()
-	if cfg == nil || n == nil {
-		return fmt.Errorf("runtime config or notification event unavailable")
+	if n == nil {
+		return fmt.Errorf("notification event unavailable")
 	}
-	if !cfg.Telegram.Enabled {
+	tg, err := a.getTelegramConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("telegram db config unavailable: %w", err)
+	}
+	if !tg.Enabled {
 		return fmt.Errorf("telegram global setting is disabled")
 	}
-	bot := findTelegramBot(cfg, n.BotID)
+	bot := findTelegramBot(tg, n.BotID)
 	if bot == nil || !bot.Enabled {
 		return fmt.Errorf("telegram bot not found or disabled: %s", n.BotID)
 	}
-	token, source := telegramTokenForBot(*bot)
+	token, source := telegramTokenForBotKey(*bot, n.ID+"|"+n.ClaimedBy)
 	if token == "" {
 		return fmt.Errorf("telegram token is empty for bot_id=%s token_env=%s", bot.ID, bot.TokenEnv)
 	}
@@ -218,6 +433,18 @@ func (a *App) sendTelegramNotificationNow(ctx context.Context, n *TelegramNotifi
 	return nil
 }
 
+func envDuration(k string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
+}
+
 func telegramMaxAttempts() int {
 	n := envInt("TELEGRAM_NOTIFY_MAX_ATTEMPTS", 10)
 	if n < 1 {
@@ -237,6 +464,18 @@ func telegramMinInterval() time.Duration {
 	d, err := time.ParseDuration(v)
 	if err != nil || d < 100*time.Millisecond {
 		return 1200 * time.Millisecond
+	}
+	return d
+}
+
+func telegramProbeJitter() time.Duration {
+	v := strings.TrimSpace(os.Getenv("TELEGRAM_NOTIFY_PROBE_JITTER"))
+	if v == "" {
+		return 1500 * time.Millisecond
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 100*time.Millisecond {
+		return 1500 * time.Millisecond
 	}
 	return d
 }
@@ -281,6 +520,23 @@ func minInt(a, b int) int {
 	return b
 }
 
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func waitContext(ctx context.Context, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
+	}
+}
+
 type telegramTarget struct {
 	BotID  string
 	ChatID string
@@ -298,24 +554,35 @@ func findTemplate(cfg *RuntimeConfig, id string) *NotificationTemplate {
 	}
 	return nil
 }
-func findTelegramBot(cfg *RuntimeConfig, id string) *TelegramBot {
-	for i := range cfg.Telegram.Bots {
-		if cfg.Telegram.Bots[i].ID == id {
-			return &cfg.Telegram.Bots[i]
-		}
+
+func findTelegramBot(tg *TelegramConfig, id string) *TelegramBot {
+	if tg == nil {
+		return nil
 	}
-	return nil
-}
-func findTelegramUser(cfg *RuntimeConfig, id string) *TelegramUser {
-	for i := range cfg.Telegram.Users {
-		if cfg.Telegram.Users[i].ID == id || cfg.Telegram.Users[i].TelegramID == id {
-			return &cfg.Telegram.Users[i]
+	for i := range tg.Bots {
+		if tg.Bots[i].ID == id {
+			return &tg.Bots[i]
 		}
 	}
 	return nil
 }
 
-func resolveTelegramTargets(cfg *RuntimeConfig, bind NotificationBinding) []telegramTarget {
+func findTelegramUser(tg *TelegramConfig, id string) *TelegramUser {
+	if tg == nil {
+		return nil
+	}
+	for i := range tg.Users {
+		if tg.Users[i].ID == id || tg.Users[i].TelegramID == id {
+			return &tg.Users[i]
+		}
+	}
+	return nil
+}
+
+func resolveTelegramTargets(tg *TelegramConfig, bind NotificationBinding) []telegramTarget {
+	if tg == nil || !tg.Enabled {
+		return nil
+	}
 	botIDs := map[string]bool{}
 	chatIDs := map[string]bool{}
 	userIDs := map[string]bool{}
@@ -349,7 +616,7 @@ func resolveTelegramTargets(cfg *RuntimeConfig, bind NotificationBinding) []tele
 		seen[key] = true
 		out = append(out, t)
 	}
-	for _, c := range cfg.Telegram.Chats {
+	for _, c := range tg.Chats {
 		if !c.Enabled {
 			continue
 		}
@@ -359,18 +626,22 @@ func resolveTelegramTargets(cfg *RuntimeConfig, bind NotificationBinding) []tele
 		if !allChats && !chatIDs[c.ID] {
 			continue
 		}
+		bot := findTelegramBot(tg, c.BotID)
+		if bot == nil || !bot.Enabled || len(telegramTokenCandidates(*bot)) == 0 {
+			continue
+		}
 		add(telegramTarget{BotID: c.BotID, ChatID: c.ChatID, Name: c.Name})
 	}
 	if len(userIDs) > 0 {
-		for _, u := range cfg.Telegram.Users {
+		for _, u := range tg.Users {
 			if !u.Enabled || u.TelegramID == "" {
 				continue
 			}
 			if !userIDs[u.ID] && !userIDs[u.TelegramID] {
 				continue
 			}
-			for _, b := range cfg.Telegram.Bots {
-				if !b.Enabled {
+			for _, b := range tg.Bots {
+				if !b.Enabled || len(telegramTokenCandidates(b)) == 0 {
 					continue
 				}
 				if !allBots && !botIDs[b.ID] {
@@ -383,7 +654,7 @@ func resolveTelegramTargets(cfg *RuntimeConfig, bind NotificationBinding) []tele
 	return out
 }
 
-func renderTemplate(cfg *RuntimeConfig, ev *AdmissionEvent, pd PolicyDecision, tpl NotificationTemplate) (string, error) {
+func renderTemplate(cfg *RuntimeConfig, tg *TelegramConfig, ev *AdmissionEvent, pd PolicyDecision, tpl NotificationTemplate) (string, error) {
 	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
 	eventURL := ""
 	if web != "" {
@@ -393,7 +664,7 @@ func renderTemplate(cfg *RuntimeConfig, ev *AdmissionEvent, pd PolicyDecision, t
 	approvers := []string{}
 	if pd.Rule != nil {
 		for _, id := range pd.Rule.Approval.ApproverTelegramUsers {
-			if u := findTelegramUser(cfg, id); u != nil {
+			if u := findTelegramUser(tg, id); u != nil {
 				approvers = append(approvers, telegramMention(*u, tpl.ParseMode))
 			}
 		}
@@ -442,17 +713,60 @@ func escapeForMode(s, mode string) string {
 	return s
 }
 
-func telegramTokenForBot(bot TelegramBot) (string, string) {
-	token := strings.TrimSpace(bot.Token)
-	source := "inline_token"
-	if token != "" && token != "********" {
-		return normalizeTelegramToken(token), source
+func telegramTokenCandidates(bot TelegramBot) []telegramTokenCandidate {
+	out := []telegramTokenCandidate{}
+	seen := map[string]bool{}
+	add := func(token, source string) {
+		token = normalizeTelegramToken(token)
+		if token == "" || token == "********" {
+			return
+		}
+		key := source + "|" + token
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, telegramTokenCandidate{Token: token, Source: source})
+	}
+	if bot.Token != "" && bot.Token != "********" {
+		add(bot.Token, "inline_token")
+	}
+	for i, t := range bot.Tokens {
+		add(t, fmt.Sprintf("inline_token[%d]", i))
 	}
 	if bot.TokenEnv != "" {
-		token = os.Getenv(bot.TokenEnv)
-		source = "env:" + bot.TokenEnv
+		add(os.Getenv(bot.TokenEnv), "env:"+bot.TokenEnv)
 	}
-	return normalizeTelegramToken(token), source
+	for _, env := range bot.TokenEnvs {
+		env = strings.TrimSpace(env)
+		if env == "" {
+			continue
+		}
+		add(os.Getenv(env), "env:"+env)
+	}
+	return out
+}
+
+func telegramTokenForBot(bot TelegramBot) (string, string) {
+	return telegramTokenForBotKey(bot, "")
+}
+
+func telegramTokenForBotKey(bot TelegramBot, key string) (string, string) {
+	cands := telegramTokenCandidates(bot)
+	if len(cands) == 0 {
+		return "", "none"
+	}
+	idx := stableIndex(key, len(cands))
+	return cands[idx].Token, cands[idx].Source
+}
+
+func stableIndex(key string, n int) int {
+	if n <= 1 {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % uint32(n))
 }
 
 func sendTelegram(ctx context.Context, token, chatID, text, parseMode string, markup any) error {

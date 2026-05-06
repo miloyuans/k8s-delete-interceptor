@@ -368,12 +368,16 @@ func (a *App) claimConfigChange(ctx context.Context, cr *ConfigChangeRequest, st
 }
 
 func (a *App) notifyConfigChange(ctx context.Context, cr *ConfigChangeRequest) {
-	cfg := a.Config()
-	if cfg == nil || cr == nil {
+	if cr == nil {
 		return
 	}
-	if !cfg.Telegram.Enabled {
-		log.Printf("config change telegram skipped: global disabled change=%s", cr.ID)
+	tg, err := a.getTelegramConfig(ctx)
+	if err != nil {
+		log.Printf("config change telegram skipped: cannot read db telegram config change=%s err=%v", cr.ID, err)
+		return
+	}
+	if !tg.Enabled {
+		log.Printf("config change telegram skipped: db telegram global disabled change=%s", cr.ID)
 		return
 	}
 	text := configChangeTelegramText(cr)
@@ -384,7 +388,7 @@ func (a *App) notifyConfigChange(ctx context.Context, cr *ConfigChangeRequest) {
 	}
 	queued := 0
 	seen := map[string]bool{}
-	for _, chat := range cfg.Telegram.Chats {
+	for _, chat := range tg.Chats {
 		if !chat.Enabled || chat.ChatID == "" || chat.BotID == "" {
 			continue
 		}
@@ -393,9 +397,9 @@ func (a *App) notifyConfigChange(ctx context.Context, cr *ConfigChangeRequest) {
 			continue
 		}
 		seen[key] = true
-		bot := findTelegramBot(cfg, chat.BotID)
-		if bot == nil || !bot.Enabled {
-			log.Printf("config change telegram skipped: bot disabled or missing bot_id=%s change=%s", chat.BotID, cr.ID)
+		bot := findTelegramBot(tg, chat.BotID)
+		if bot == nil || !bot.Enabled || len(telegramTokenCandidates(*bot)) == 0 {
+			log.Printf("config change telegram skipped: bot disabled, missing or token empty bot_id=%s change=%s", chat.BotID, cr.ID)
 			continue
 		}
 		n := &TelegramNotificationEvent{Kind: NotifyKindConfigChange, EventID: cr.EventID, ChangeID: cr.ID, BotID: bot.ID, ChatID: chat.ChatID, TargetName: chat.Name, Text: text, ReplyMarkup: markup, Status: NotifyStatusPending, MaxAttempts: telegramMaxAttempts(), CreatedAt: time.Now().UTC(), NextAttemptAt: time.Now().UTC()}
@@ -464,15 +468,16 @@ func (a *App) updateSingleConfigChangeTelegramStatus(ctx context.Context, cr *Co
 	if cr == nil || ref.MessageID == 0 || ref.ChatID == "" || ref.BotID == "" {
 		return
 	}
-	cfg := a.Config()
-	if cfg == nil || !cfg.Telegram.Enabled {
+	tg, err := a.getTelegramConfig(ctx)
+	if err != nil || !tg.Enabled {
+		log.Printf("config change telegram status update skipped: db telegram config unavailable change=%s err=%v", cr.ID, err)
 		return
 	}
-	bot := findTelegramBot(cfg, ref.BotID)
+	bot := findTelegramBot(tg, ref.BotID)
 	if bot == nil || !bot.Enabled {
 		return
 	}
-	token, source := telegramTokenForBot(*bot)
+	token, source := telegramTokenForBotKey(*bot, cr.ID+"|"+ref.ChatID)
 	if token == "" {
 		return
 	}
@@ -493,18 +498,6 @@ func (a *App) updateConfigChangeTelegramStatus(ctx context.Context, cr *ConfigCh
 	if cr == nil || len(cr.NotificationMessages) == 0 {
 		return
 	}
-	cfg := a.Config()
-	if cfg == nil || !cfg.Telegram.Enabled {
-		return
-	}
-	text := configChangeTelegramText(cr)
-	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
-	markup := any(nil)
-	if web != "" {
-		markup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "打开 Web 查看", "url": web + "/?change=" + cr.ID}}}}
-	}
-	_ = text
-	_ = markup
 	for _, ref := range cr.NotificationMessages {
 		a.updateSingleConfigChangeTelegramStatus(ctx, cr, ref)
 	}

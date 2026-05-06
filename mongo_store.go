@@ -75,14 +75,156 @@ func (m *MongoStore) Init(ctx context.Context) error {
 		{"service_account_inventory", mongo.IndexModel{Keys: bson.D{{Key: "namespace", Value: 1}, {Key: "name", Value: 1}}}},
 		{"data_sources", mongo.IndexModel{Keys: bson.D{{Key: "active", Value: 1}}, Options: options.Index().SetName("datasource_active_unique").SetUnique(true).SetPartialFilterExpression(bson.M{"active": true, "enabled": true})}},
 		{"cluster_metadata_snapshots", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
+		{"telegram_config", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
+		{"telegram_worker_locks", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"telegram_notification_events", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
-		{"telegram_notification_events", mongo.IndexModel{Keys: bson.D{{Key: "status", Value: 1}, {Key: "next_attempt_at", Value: 1}, {Key: "created_at", Value: 1}}}},
+		{"telegram_notification_events", mongo.IndexModel{Keys: bson.D{{Key: "status", Value: 1}, {Key: "bot_id", Value: 1}, {Key: "next_attempt_at", Value: 1}, {Key: "created_at", Value: 1}}}},
 		{"telegram_notification_events", mongo.IndexModel{Keys: bson.D{{Key: "kind", Value: 1}, {Key: "event_id", Value: 1}}}},
 	}
 	for _, x := range idx {
 		_, _ = m.db.Collection(x.col).Indexes().CreateOne(ctx, x.model)
 	}
 	return nil
+}
+
+
+func (m *MongoStore) EnsureTelegramConfig(ctx context.Context, cfg TelegramConfig) error {
+	if m == nil {
+		return errors.New("mongo not configured")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var existing TelegramConfig
+	err := m.db.Collection("telegram_config").FindOne(ctx, bson.M{"id": "default"}).Decode(&existing)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		m.healthy.Store(false)
+		return err
+	}
+	if cfg.ID == "" {
+		cfg.ID = "default"
+	}
+	if cfg.UpdatedAt.IsZero() {
+		cfg.UpdatedAt = time.Now().UTC()
+	}
+	if cfg.Version == 0 {
+		cfg.Version = 1
+	}
+	_, err = m.db.Collection("telegram_config").InsertOne(ctx, cfg)
+	m.healthy.Store(err == nil)
+	return err
+}
+
+func (m *MongoStore) GetTelegramConfig(ctx context.Context) (*TelegramConfig, error) {
+	if m == nil {
+		return nil, errors.New("mongo not configured")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var cfg TelegramConfig
+	err := m.db.Collection("telegram_config").FindOne(ctx, bson.M{"id": "default"}).Decode(&cfg)
+	m.healthy.Store(err == nil)
+	if err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func (m *MongoStore) SaveTelegramConfig(ctx context.Context, cfg TelegramConfig, actor string) (*TelegramConfig, error) {
+	if m == nil {
+		return nil, errors.New("mongo not configured")
+	}
+	now := time.Now().UTC()
+	cfg.ID = "default"
+	cfg.UpdatedAt = now
+	cfg.UpdatedBy = actor
+	cfg.Version = 0 // updated through $inc to avoid lost updates and concurrent writes overwriting the counter
+	ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	var out TelegramConfig
+	err := m.db.Collection("telegram_config").FindOneAndUpdate(ctx, bson.M{"id": "default"}, bson.M{"$set": cfg, "$inc": bson.M{"version": 1}}, options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)).Decode(&out)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		err = m.db.Collection("telegram_config").FindOne(ctx, bson.M{"id": "default"}).Decode(&out)
+	}
+	m.healthy.Store(err == nil)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (m *MongoStore) CountRunnableTelegramNotifications(ctx context.Context, now time.Time) (int64, error) {
+	if m == nil {
+		return 0, errors.New("mongo unavailable")
+	}
+	filter := bson.M{"$or": []bson.M{
+		{"status": NotifyStatusPending, "next_attempt_at": bson.M{"$lte": now}},
+		{"status": NotifyStatusPending, "next_attempt_at": bson.M{"$exists": false}},
+		{"status": NotifyStatusSending, "claimed_at": bson.M{"$lte": now.Add(-telegramLease())}},
+	}}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	n, err := m.db.Collection("telegram_notification_events").CountDocuments(ctx, filter)
+	m.healthy.Store(err == nil)
+	return n, err
+}
+
+func (m *MongoStore) AcquireTelegramDispatchLock(ctx context.Context, owner string, lease time.Duration) (bool, error) {
+	if m == nil {
+		return false, errors.New("mongo unavailable")
+	}
+	if lease <= 0 {
+		lease = 2 * time.Minute
+	}
+	now := time.Now().UTC()
+	filter := bson.M{"id": "telegram_dispatcher", "$or": []bson.M{{"expires_at": bson.M{"$lte": now}}, {"owner": owner}, {"expires_at": bson.M{"$exists": false}}}}
+	update := bson.M{"$set": bson.M{"id": "telegram_dispatcher", "owner": owner, "expires_at": now.Add(lease), "updated_at": now}, "$inc": bson.M{"epoch": 1}}
+	opts := options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	var doc struct{ Owner string `bson:"owner"` }
+	err := m.db.Collection("telegram_worker_locks").FindOneAndUpdate(ctx, filter, update, opts).Decode(&doc)
+	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return false, nil
+		}
+		m.healthy.Store(false)
+		return false, err
+	}
+	m.healthy.Store(true)
+	return doc.Owner == owner, nil
+}
+
+func (m *MongoStore) RenewTelegramDispatchLock(ctx context.Context, owner string, lease time.Duration) (bool, error) {
+	if m == nil {
+		return false, errors.New("mongo unavailable")
+	}
+	if lease <= 0 {
+		lease = 2 * time.Minute
+	}
+	now := time.Now().UTC()
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	res, err := m.db.Collection("telegram_worker_locks").UpdateOne(ctx, bson.M{"id": "telegram_dispatcher", "owner": owner}, bson.M{"$set": bson.M{"expires_at": now.Add(lease), "updated_at": now}})
+	m.healthy.Store(err == nil)
+	if err != nil {
+		return false, err
+	}
+	return res.ModifiedCount > 0 || res.MatchedCount > 0, nil
+}
+
+func (m *MongoStore) ReleaseTelegramDispatchLock(ctx context.Context, owner string) error {
+	if m == nil {
+		return errors.New("mongo unavailable")
+	}
+	now := time.Now().UTC()
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	_, err := m.db.Collection("telegram_worker_locks").UpdateOne(ctx, bson.M{"id": "telegram_dispatcher", "owner": owner}, bson.M{"$set": bson.M{"expires_at": now, "updated_at": now}})
+	m.healthy.Store(err == nil)
+	return err
 }
 
 func (m *MongoStore) EnsureConfig(ctx context.Context, cfg *RuntimeConfig) error {

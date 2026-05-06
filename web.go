@@ -342,20 +342,25 @@ func (a *App) handleConfigExport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "runtime config unavailable", 500)
 		return
 	}
+	out := cloneConfig(cfg)
+	if tg, err := a.getTelegramConfig(r.Context()); err == nil && tg != nil {
+		out.Telegram = *tg
+	}
+	sanitizeRuntimeConfigForResponse(out)
 	format := strings.ToLower(r.URL.Query().Get("format"))
 	if format == "json" {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=runtime-config-v%d.json", cfg.Version))
-		_ = json.NewEncoder(w).Encode(cfg)
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=runtime-config-v%d.json", out.Version))
+		_ = json.NewEncoder(w).Encode(out)
 		return
 	}
-	b, err := yaml.Marshal(cfg)
+	b, err := yaml.Marshal(out)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	w.Header().Set("Content-Type", "application/yaml")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=runtime-config-v%d.yaml", cfg.Version))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=runtime-config-v%d.yaml", out.Version))
 	_, _ = w.Write(b)
 }
 
@@ -751,17 +756,17 @@ func normalizeDataSources(items []DataSource) []DataSource {
 
 func (a *App) handleTelegram(w http.ResponseWriter, r *http.Request) {
 	u := userFromContext(r.Context())
-	cfg := a.Config()
-	if cfg == nil {
-		http.Error(w, "runtime config unavailable", 500)
-		return
-	}
 	if r.Method == http.MethodGet {
 		if !u.Can(PermConfigRead) {
 			http.Error(w, "forbidden", 403)
 			return
 		}
-		writeJSON(w, sanitizeTelegram(cfg.Telegram))
+		tg, err := a.getTelegramConfig(r.Context())
+		if err != nil {
+			http.Error(w, "telegram config store unavailable: "+err.Error(), 503)
+			return
+		}
+		writeJSON(w, sanitizeTelegram(*tg))
 		return
 	}
 	if r.Method != http.MethodPut && r.Method != http.MethodPost {
@@ -772,16 +777,24 @@ func (a *App) handleTelegram(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden: need permission "+PermTelegramWrite, 403)
 		return
 	}
+	cur, err := a.getTelegramConfig(r.Context())
+	if err != nil {
+		http.Error(w, "telegram config store unavailable: "+err.Error(), 503)
+		return
+	}
 	var tg TelegramConfig
 	if err := json.NewDecoder(r.Body).Decode(&tg); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	preserveTelegramSecrets(&tg, cfg.Telegram)
-	next := cloneConfig(cfg)
-	next.Telegram = tg
-	cr, applied, err := a.proposeConfigChange(r.Context(), *next, "telegram", "更新 Telegram 通知与审批人配置", u, true)
-	writeChangeResponse(w, cr, applied, err)
+	preserveTelegramSecrets(&tg, *cur)
+	saved, err := a.saveTelegramConfig(r.Context(), tg, u.Username)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	_ = a.saveConfigAudit(r.Context(), &ConfigAuditEvent{Kind: "telegram", Category: configChangeCategory("telegram"), Summary: "更新 Telegram 全局配置", Actor: u.Username, CreatedAt: time.Now().UTC(), Status: ChangeApproved})
+	writeJSON(w, map[string]any{"applied": true, "message": "Telegram 配置已写入数据库并立即生效", "telegram": sanitizeTelegram(*saved)})
 }
 
 func (a *App) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
@@ -789,12 +802,13 @@ func (a *App) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
-	cfg := a.Config()
-	if cfg == nil {
-		http.Error(w, "runtime config unavailable", 500)
+	tg, err := a.getTelegramConfig(r.Context())
+	if err != nil {
+		log.Printf("telegram test blocked: db config unavailable err=%v", err)
+		http.Error(w, "telegram config store unavailable: "+err.Error(), 503)
 		return
 	}
-	if !cfg.Telegram.Enabled {
+	if !tg.Enabled {
 		log.Printf("telegram test blocked: telegram global disabled")
 		http.Error(w, "telegram global setting is disabled", 400)
 		return
@@ -813,7 +827,7 @@ func (a *App) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 	botID := strings.TrimSpace(body.BotID)
 	chatID := strings.TrimSpace(body.ChatID)
 	if body.ChatResourceID != "" {
-		for _, c := range cfg.Telegram.Chats {
+		for _, c := range tg.Chats {
 			if c.ID == body.ChatResourceID {
 				chatID = c.ChatID
 				if botID == "" {
@@ -824,7 +838,7 @@ func (a *App) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if body.TelegramUserID != "" {
-		for _, u := range cfg.Telegram.Users {
+		for _, u := range tg.Users {
 			if u.ID == body.TelegramUserID || u.TelegramID == body.TelegramUserID {
 				if !u.Enabled {
 					http.Error(w, "telegram user is disabled", 400)
@@ -836,30 +850,30 @@ func (a *App) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if botID == "" {
-		for _, b := range cfg.Telegram.Bots {
-			if b.Enabled {
+		for _, b := range tg.Bots {
+			if b.Enabled && len(telegramTokenCandidates(b)) > 0 {
 				botID = b.ID
 				break
 			}
 		}
 	}
-	bot := findTelegramBot(cfg, botID)
+	bot := findTelegramBot(tg, botID)
 	if bot == nil || !bot.Enabled {
 		log.Printf("telegram test failed: bot not found or disabled bot_id=%s", botID)
 		http.Error(w, "telegram bot not found or disabled", 400)
 		return
 	}
 	if chatID == "" {
-		for _, c := range cfg.Telegram.Chats {
+		for _, c := range tg.Chats {
 			if c.Enabled && c.BotID == botID {
 				chatID = c.ChatID
 				break
 			}
 		}
 	}
-	token, tokenSource := telegramTokenForBot(*bot)
+	token, tokenSource := telegramTokenForBotKey(*bot, "web-test|"+chatID)
 	if token == "" {
-		log.Printf("telegram test failed: empty token bot_id=%s token_env=%s", bot.ID, bot.TokenEnv)
+		log.Printf("telegram test failed: empty token bot_id=%s token_env=%s token_envs=%v", bot.ID, bot.TokenEnv, bot.TokenEnvs)
 		http.Error(w, "telegram token is empty; 请填写 Bot Token 或确认 token_env 环境变量已挂载到容器", 400)
 		return
 	}
@@ -872,7 +886,7 @@ func (a *App) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 	}
 	if chatID == "" {
 		log.Printf("telegram test token valid without chat: bot_id=%s bot_username=%s source=%s", bot.ID, botUsername, tokenSource)
-		writeJSON(w, map[string]any{"ok": true, "validate_only": true, "bot_id": bot.ID, "bot_username": botUsername, "telegram_enabled": cfg.Telegram.Enabled, "token_source": tokenSource})
+		writeJSON(w, map[string]any{"ok": true, "validate_only": true, "bot_id": bot.ID, "bot_username": botUsername, "telegram_enabled": tg.Enabled, "token_source": tokenSource})
 		return
 	}
 	msg := body.Message
@@ -886,7 +900,7 @@ func (a *App) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("telegram test sent: bot_id=%s bot_username=%s chat_id=%s", bot.ID, botUsername, chatID)
-	writeJSON(w, map[string]any{"ok": true, "bot_id": bot.ID, "bot_username": botUsername, "chat_id": chatID, "telegram_enabled": cfg.Telegram.Enabled, "token_source": tokenSource})
+	writeJSON(w, map[string]any{"ok": true, "bot_id": bot.ID, "bot_username": botUsername, "chat_id": chatID, "telegram_enabled": tg.Enabled, "token_source": tokenSource})
 }
 
 func sanitizeTelegram(tg TelegramConfig) TelegramConfig {
@@ -894,6 +908,11 @@ func sanitizeTelegram(tg TelegramConfig) TelegramConfig {
 	for i := range out.Bots {
 		if out.Bots[i].Token != "" {
 			out.Bots[i].Token = "********"
+		}
+		for j := range out.Bots[i].Tokens {
+			if out.Bots[i].Tokens[j] != "" {
+				out.Bots[i].Tokens[j] = "********"
+			}
 		}
 	}
 	return out
@@ -908,12 +927,27 @@ func preserveTelegramSecrets(next *TelegramConfig, cur TelegramConfig) {
 		byID[b.ID] = b
 	}
 	for i := range next.Bots {
-		if next.Bots[i].Token == "" || next.Bots[i].Token == "********" {
-			if old, ok := byID[next.Bots[i].ID]; ok {
+		if old, ok := byID[next.Bots[i].ID]; ok {
+			if next.Bots[i].Token == "" || next.Bots[i].Token == "********" {
 				next.Bots[i].Token = old.Token
+			}
+			if len(next.Bots[i].Tokens) == 0 || allMasked(next.Bots[i].Tokens) {
+				next.Bots[i].Tokens = old.Tokens
 			}
 		}
 	}
+}
+
+func allMasked(xs []string) bool {
+	if len(xs) == 0 {
+		return false
+	}
+	for _, x := range xs {
+		if strings.TrimSpace(x) != "" && strings.TrimSpace(x) != "********" {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *App) handleTelegramBots(w http.ResponseWriter, r *http.Request) {
@@ -930,9 +964,9 @@ func (a *App) handleTelegramUsers(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleTelegramResource(w http.ResponseWriter, r *http.Request, kind string) {
 	u := userFromContext(r.Context())
-	cfg := a.Config()
-	if cfg == nil {
-		http.Error(w, "runtime config unavailable", 500)
+	cur, err := a.getTelegramConfig(r.Context())
+	if err != nil {
+		http.Error(w, "telegram config store unavailable: "+err.Error(), 503)
 		return
 	}
 	if r.Method == http.MethodGet {
@@ -940,7 +974,7 @@ func (a *App) handleTelegramResource(w http.ResponseWriter, r *http.Request, kin
 			http.Error(w, "forbidden", 403)
 			return
 		}
-		safe := sanitizeTelegram(cfg.Telegram)
+		safe := sanitizeTelegram(*cur)
 		switch kind {
 		case "bots":
 			writeJSON(w, safe.Bots)
@@ -956,7 +990,7 @@ func (a *App) handleTelegramResource(w http.ResponseWriter, r *http.Request, kin
 		return
 	}
 	id := telegramPathID(kind, r.URL.Path)
-	next := cloneConfig(cfg)
+	next := *cur
 	switch r.Method {
 	case http.MethodPost, http.MethodPut:
 		switch kind {
@@ -976,10 +1010,10 @@ func (a *App) handleTelegramResource(w http.ResponseWriter, r *http.Request, kin
 			if item.Name == "" {
 				item.Name = item.ID
 			}
-			if r.Method == http.MethodPost && item.Token == "" && item.TokenEnv == "" {
+			if r.Method == http.MethodPost && item.Token == "" && item.TokenEnv == "" && len(item.Tokens) == 0 && len(item.TokenEnvs) == 0 {
 				item.TokenEnv = "TELEGRAM_BOT_TOKEN"
 			}
-			next.Telegram.Bots = upsertTelegramBot(next.Telegram.Bots, item)
+			next.Bots = upsertTelegramBot(next.Bots, item)
 		case "chats":
 			var item TelegramChat
 			if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
@@ -996,7 +1030,7 @@ func (a *App) handleTelegramResource(w http.ResponseWriter, r *http.Request, kin
 			if item.Name == "" {
 				item.Name = item.ID
 			}
-			next.Telegram.Chats = upsertTelegramChat(next.Telegram.Chats, item)
+			next.Chats = upsertTelegramChat(next.Chats, item)
 		case "users":
 			var item TelegramUser
 			if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
@@ -1013,11 +1047,16 @@ func (a *App) handleTelegramResource(w http.ResponseWriter, r *http.Request, kin
 			if item.DisplayName == "" {
 				item.DisplayName = item.ID
 			}
-			next.Telegram.Users = upsertTelegramUser(next.Telegram.Users, item)
+			next.Users = upsertTelegramUser(next.Users, item)
 		}
-		preserveTelegramSecrets(&next.Telegram, cfg.Telegram)
-		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "telegram", "更新 Telegram "+kind+" 资源", u, true)
-		writeChangeResponse(w, cr, applied, err)
+		preserveTelegramSecrets(&next, *cur)
+		saved, err := a.saveTelegramConfig(r.Context(), next, u.Username)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		_ = a.saveConfigAudit(r.Context(), &ConfigAuditEvent{Kind: "telegram", Category: configChangeCategory("telegram"), Summary: "更新 Telegram " + kind + " 资源", Actor: u.Username, CreatedAt: time.Now().UTC(), Status: ChangeApproved})
+		writeJSON(w, map[string]any{"applied": true, "message": "Telegram 资源已写入数据库并立即生效", "telegram": sanitizeTelegram(*saved)})
 	case http.MethodDelete:
 		if id == "" {
 			http.Error(w, "id is required", 400)
@@ -1025,14 +1064,19 @@ func (a *App) handleTelegramResource(w http.ResponseWriter, r *http.Request, kin
 		}
 		switch kind {
 		case "bots":
-			next.Telegram.Bots = deleteTelegramBot(next.Telegram.Bots, id)
+			next.Bots = deleteTelegramBot(next.Bots, id)
 		case "chats":
-			next.Telegram.Chats = deleteTelegramChat(next.Telegram.Chats, id)
+			next.Chats = deleteTelegramChat(next.Chats, id)
 		case "users":
-			next.Telegram.Users = deleteTelegramUser(next.Telegram.Users, id)
+			next.Users = deleteTelegramUser(next.Users, id)
 		}
-		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "telegram", "删除 Telegram "+kind+" 资源", u, true)
-		writeChangeResponse(w, cr, applied, err)
+		saved, err := a.saveTelegramConfig(r.Context(), next, u.Username)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		_ = a.saveConfigAudit(r.Context(), &ConfigAuditEvent{Kind: "telegram", Category: configChangeCategory("telegram"), Summary: "删除 Telegram " + kind + " 资源", Actor: u.Username, CreatedAt: time.Now().UTC(), Status: ChangeApproved})
+		writeJSON(w, map[string]any{"applied": true, "message": "Telegram 资源已从数据库删除", "telegram": sanitizeTelegram(*saved)})
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
@@ -1043,6 +1087,11 @@ func telegramPathID(kind, p string) string {
 }
 
 func upsertTelegramBot(items []TelegramBot, item TelegramBot) []TelegramBot {
+	cfg := normalizeTelegramConfig(TelegramConfig{Enabled: true, Bots: []TelegramBot{item}})
+	if len(cfg.Bots) == 0 {
+		return items
+	}
+	item = cfg.Bots[0]
 	for i := range items {
 		if items[i].ID == item.ID {
 			items[i] = item
@@ -1052,6 +1101,11 @@ func upsertTelegramBot(items []TelegramBot, item TelegramBot) []TelegramBot {
 	return append(items, item)
 }
 func upsertTelegramChat(items []TelegramChat, item TelegramChat) []TelegramChat {
+	cfg := normalizeTelegramConfig(TelegramConfig{Enabled: true, Chats: []TelegramChat{item}})
+	if len(cfg.Chats) == 0 {
+		return items
+	}
+	item = cfg.Chats[0]
 	for i := range items {
 		if items[i].ID == item.ID {
 			items[i] = item
@@ -1061,6 +1115,11 @@ func upsertTelegramChat(items []TelegramChat, item TelegramChat) []TelegramChat 
 	return append(items, item)
 }
 func upsertTelegramUser(items []TelegramUser, item TelegramUser) []TelegramUser {
+	cfg := normalizeTelegramConfig(TelegramConfig{Enabled: true, Users: []TelegramUser{item}})
+	if len(cfg.Users) == 0 {
+		return items
+	}
+	item = cfg.Users[0]
 	for i := range items {
 		if items[i].ID == item.ID {
 			items[i] = item

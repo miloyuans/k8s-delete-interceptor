@@ -57,6 +57,7 @@ func NewApp(ctx context.Context, bootstrapPath, stateDir string) (*App, error) {
 		if m, err := NewMongoStore(ctx, uri, db); err == nil {
 			mongoStore = m
 			_ = mongoStore.EnsureConfig(ctx, cfg)
+			_ = mongoStore.EnsureTelegramConfig(ctx, cfg.Telegram)
 			if mc, err := mongoStore.GetActiveConfig(ctx); err == nil && mc.Version >= cfg.Version {
 				cfg = mc
 			}
@@ -193,6 +194,10 @@ func (a *App) mongoHealthLoop(ctx context.Context) {
 		m, err := NewMongoStore(ctx, uri, db)
 		if err == nil {
 			a.mongo = m
+			if cfg != nil {
+				_ = a.mongo.EnsureConfig(ctx, cfg)
+				_ = a.mongo.EnsureTelegramConfig(ctx, cfg.Telegram)
+			}
 			log.Printf("mongo reconnected")
 		}
 	}
@@ -244,6 +249,7 @@ func (a *App) reconcileMongoConnection(ctx context.Context, cfg *RuntimeConfig) 
 	a.mongo = m
 	a.mongoURI, a.mongoDatabase = uri, db
 	_ = a.mongo.EnsureConfig(ctx, cfg)
+	_ = a.mongo.EnsureTelegramConfig(ctx, cfg.Telegram)
 	_ = a.mongo.SaveConfig(ctx, cfg, "mongo-reconcile", true)
 	log.Printf("mongo connection reconciled db=%s uri_source=%s", db, mongoURISource(cfg))
 }

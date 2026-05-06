@@ -160,18 +160,24 @@ type SystemProtectionConfig struct {
 }
 
 type TelegramConfig struct {
-	Enabled bool           `json:"enabled" yaml:"enabled" bson:"enabled"`
-	Bots    []TelegramBot  `json:"bots" yaml:"bots" bson:"bots"`
-	Chats   []TelegramChat `json:"chats" yaml:"chats" bson:"chats"`
-	Users   []TelegramUser `json:"users" yaml:"users" bson:"users"`
+	ID        string         `json:"id,omitempty" yaml:"id,omitempty" bson:"id,omitempty"`
+	Enabled   bool           `json:"enabled" yaml:"enabled" bson:"enabled"`
+	Bots      []TelegramBot  `json:"bots" yaml:"bots" bson:"bots"`
+	Chats     []TelegramChat `json:"chats" yaml:"chats" bson:"chats"`
+	Users     []TelegramUser `json:"users" yaml:"users" bson:"users"`
+	Version   int64          `json:"version,omitempty" yaml:"version,omitempty" bson:"version,omitempty"`
+	UpdatedAt time.Time      `json:"updated_at,omitempty" yaml:"updated_at,omitempty" bson:"updated_at,omitempty"`
+	UpdatedBy string         `json:"updated_by,omitempty" yaml:"updated_by,omitempty" bson:"updated_by,omitempty"`
 }
 
 type TelegramBot struct {
-	ID       string `json:"id" yaml:"id" bson:"id"`
-	Name     string `json:"name" yaml:"name" bson:"name"`
-	Enabled  bool   `json:"enabled" yaml:"enabled" bson:"enabled"`
-	Token    string `json:"token,omitempty" yaml:"token,omitempty" bson:"token,omitempty"`
-	TokenEnv string `json:"token_env,omitempty" yaml:"token_env,omitempty" bson:"token_env,omitempty"`
+	ID        string   `json:"id" yaml:"id" bson:"id"`
+	Name      string   `json:"name" yaml:"name" bson:"name"`
+	Enabled   bool     `json:"enabled" yaml:"enabled" bson:"enabled"`
+	Token     string   `json:"token,omitempty" yaml:"token,omitempty" bson:"token,omitempty"`
+	TokenEnv  string   `json:"token_env,omitempty" yaml:"token_env,omitempty" bson:"token_env,omitempty"`
+	Tokens    []string `json:"tokens,omitempty" yaml:"tokens,omitempty" bson:"tokens,omitempty"`
+	TokenEnvs []string `json:"token_envs,omitempty" yaml:"token_envs,omitempty" bson:"token_envs,omitempty"`
 }
 
 type TelegramChat struct {

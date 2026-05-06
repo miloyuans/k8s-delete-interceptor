@@ -257,3 +257,9 @@ If you need a different namespace, service name, or image layout, update:
 - `30-service.yaml`
 - `20-cert-manager.yaml`
 - `50-validatingwebhookconfiguration.yaml`
+
+## Dynamic TLS reload
+
+The webhook process dynamically reloads `/etc/certs/tls.crt` and `/etc/certs/tls.key` when cert-manager rotates the mounted Secret. This prevents the API server from seeing a stale serving certificate after cainjector updates the webhook `caBundle`.
+
+For deeper details and verification commands, see `TLS_CERT_MANAGER_README.md`.

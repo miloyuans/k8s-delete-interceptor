@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -1459,14 +1458,14 @@ func main() {
 	http.HandleFunc("/validate", validate)
 	http.HandleFunc("/healthz", healthz)
 
-	cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+	tlsLoader, err := newDynamicTLSCertificateLoader(*tlsCert, *tlsKey)
 	if err != nil {
 		klog.Fatalf("Failed to load TLS certificate and key from '%s' and '%s': %v", *tlsCert, *tlsKey, err)
 	}
 
 	server := &http.Server{
 		Addr:      ":8443",
-		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+		TLSConfig: tlsLoader.TLSConfig(),
 	}
 
 	listener, err := tls.Listen("tcp", server.Addr, server.TLSConfig)

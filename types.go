@@ -234,6 +234,40 @@ type TelegramMessageRef struct {
 	MessageID int64  `json:"message_id" bson:"message_id"`
 }
 
+const (
+	NotifyKindAdmissionEvent = "admission_event"
+	NotifyKindConfigChange   = "config_change"
+	NotifyStatusPending      = "pending"
+	NotifyStatusSending      = "sending"
+	NotifyStatusSent         = "sent"
+	NotifyStatusFailed       = "failed"
+)
+
+type TelegramNotificationEvent struct {
+	ID            string         `json:"id" bson:"id"`
+	Kind          string         `json:"kind" bson:"kind"`
+	EventID       string         `json:"event_id" bson:"event_id"`
+	ChangeID      string         `json:"change_id,omitempty" bson:"change_id,omitempty"`
+	RuleID        string         `json:"rule_id,omitempty" bson:"rule_id,omitempty"`
+	RuleName      string         `json:"rule_name,omitempty" bson:"rule_name,omitempty"`
+	BotID         string         `json:"bot_id" bson:"bot_id"`
+	ChatID        string         `json:"chat_id" bson:"chat_id"`
+	TargetName    string         `json:"target_name,omitempty" bson:"target_name,omitempty"`
+	Text          string         `json:"text" bson:"text"`
+	ParseMode     string         `json:"parse_mode,omitempty" bson:"parse_mode,omitempty"`
+	ReplyMarkup   map[string]any `json:"reply_markup,omitempty" bson:"reply_markup,omitempty"`
+	Status        string         `json:"status" bson:"status"`
+	Attempts      int            `json:"attempts" bson:"attempts"`
+	MaxAttempts   int            `json:"max_attempts" bson:"max_attempts"`
+	NextAttemptAt time.Time      `json:"next_attempt_at" bson:"next_attempt_at"`
+	ClaimedBy     string         `json:"claimed_by,omitempty" bson:"claimed_by,omitempty"`
+	ClaimedAt     time.Time      `json:"claimed_at,omitempty" bson:"claimed_at,omitempty"`
+	CreatedAt     time.Time      `json:"created_at" bson:"created_at"`
+	SentAt        time.Time      `json:"sent_at,omitempty" bson:"sent_at,omitempty"`
+	MessageID     int64          `json:"message_id,omitempty" bson:"message_id,omitempty"`
+	LastError     string         `json:"last_error,omitempty" bson:"last_error,omitempty"`
+}
+
 type ConfigChangeRequest struct {
 	ID                   string               `json:"id" bson:"id"`
 	EventID              string               `json:"event_id" bson:"event_id"`

@@ -125,6 +125,7 @@ func (a *App) startBackground(ctx context.Context) {
 	go a.spoolFlushLoop(ctx)
 	go a.mongoHealthLoop(ctx)
 	go a.metadataRefreshLoop(ctx)
+	go a.telegramNotificationLoop(ctx)
 }
 
 func (a *App) configSyncLoop(ctx context.Context) {

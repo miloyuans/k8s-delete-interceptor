@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -48,6 +51,7 @@ func (a *App) notifyEvent(ctx context.Context, cfg *RuntimeConfig, ev *Admission
 	}
 	tpl := findTemplate(cfg, bind.TemplateID)
 	if tpl == nil || !tpl.Enabled {
+		log.Printf("telegram notify skipped: template disabled or missing rule=%s template=%s", pd.Rule.ID, bind.TemplateID)
 		return
 	}
 	targets := resolveTelegramTargets(cfg, bind)
@@ -61,23 +65,220 @@ func (a *App) notifyEvent(ctx context.Context, cfg *RuntimeConfig, ev *Admission
 		log.Printf("telegram render template failed: rule=%s template=%s err=%v", pd.Rule.ID, tpl.ID, err)
 		return
 	}
-	for _, target := range targets {
-		bot := findTelegramBot(cfg, target.BotID)
-		if bot == nil || !bot.Enabled {
-			log.Printf("telegram notify skipped: bot not found or disabled bot_id=%s rule=%s", target.BotID, pd.Rule.ID)
-			continue
-		}
-		token, source := telegramTokenForBot(*bot)
-		if token == "" {
-			log.Printf("telegram notify skipped: empty token bot_id=%s token_env=%s rule=%s", bot.ID, bot.TokenEnv, pd.Rule.ID)
-			continue
-		}
-		if err := sendTelegram(ctx, token, target.ChatID, msg, tpl.ParseMode, eventKeyboard(ev)); err != nil {
-			log.Printf("telegram notify failed: bot_id=%s chat_id=%s source=%s rule=%s err=%v", bot.ID, target.ChatID, source, pd.Rule.ID, err)
-		} else {
-			log.Printf("telegram notify sent: bot_id=%s chat_id=%s rule=%s event=%s", bot.ID, target.ChatID, pd.Rule.ID, ev.ID)
+	markup := map[string]any(nil)
+	if kb := eventKeyboard(ev); kb != nil {
+		if m, ok := kb.(map[string]any); ok {
+			markup = m
 		}
 	}
+	queued := 0
+	for _, target := range targets {
+		n := &TelegramNotificationEvent{Kind: NotifyKindAdmissionEvent, EventID: ev.ID, RuleID: pd.Rule.ID, RuleName: pd.Rule.Name, BotID: target.BotID, ChatID: target.ChatID, TargetName: target.Name, Text: msg, ParseMode: tpl.ParseMode, ReplyMarkup: markup, Status: NotifyStatusPending, MaxAttempts: telegramMaxAttempts(), CreatedAt: time.Now().UTC(), NextAttemptAt: time.Now().UTC()}
+		n.ID = notificationID(n.Kind, ev.ID, target.BotID, target.ChatID)
+		if err := a.enqueueTelegramNotification(ctx, n); err != nil {
+			log.Printf("telegram notify enqueue failed: rule=%s event=%s bot_id=%s chat_id=%s err=%v", pd.Rule.ID, ev.ID, target.BotID, target.ChatID, err)
+			continue
+		}
+		queued++
+	}
+	log.Printf("telegram notify queued: rule=%s event=%s targets=%d", pd.Rule.ID, ev.ID, queued)
+}
+
+func notificationID(kind, eventID, botID, chatID string) string {
+	s := strings.Join([]string{kind, eventID, botID, chatID}, "|")
+	h := sha1.Sum([]byte(s))
+	return "ntf_" + hex.EncodeToString(h[:10])
+}
+
+func (a *App) enqueueTelegramNotification(ctx context.Context, ev *TelegramNotificationEvent) error {
+	if ev == nil {
+		return nil
+	}
+	if a.mongo != nil && a.mongo.Healthy() {
+		return a.mongo.EnqueueTelegramNotification(ctx, ev)
+	}
+	// Mongo 是多副本全局队列的唯一共享后端。不可用时保留单 Pod 直发兜底，并明确打日志。
+	log.Printf("telegram notification queue unavailable; sending directly in current pod only: id=%s kind=%s event=%s", ev.ID, ev.Kind, ev.EventID)
+	return a.sendTelegramNotificationNow(ctx, ev)
+}
+
+func (a *App) telegramNotificationLoop(ctx context.Context) {
+	workers := envInt("TELEGRAM_NOTIFY_WORKERS", 1)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > 5 {
+		workers = 5
+	}
+	for i := 0; i < workers; i++ {
+		go a.telegramNotificationWorker(ctx, i)
+	}
+}
+
+func (a *App) telegramNotificationWorker(ctx context.Context, idx int) {
+	worker := fmt.Sprintf("%s-%d", envOr("HOSTNAME", "pod"), idx)
+	minInterval := telegramMinInterval()
+	lease := telegramLease()
+	idle := 2 * time.Second
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if a.mongo == nil || !a.mongo.Healthy() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(idle):
+				continue
+			}
+		}
+		n, err := a.mongo.ClaimTelegramNotification(ctx, worker, lease)
+		if err != nil {
+			log.Printf("telegram notification claim failed worker=%s err=%v", worker, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(idle):
+			}
+			continue
+		}
+		if n == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(idle):
+			}
+			continue
+		}
+		if err := a.sendTelegramNotificationNow(ctx, n); err != nil {
+			delay := telegramRetryDelay(err, n.Attempts)
+			terminal := n.Attempts >= n.MaxAttempts
+			if terminal {
+				log.Printf("telegram notification failed permanently: id=%s kind=%s event=%s attempts=%d err=%v", n.ID, n.Kind, n.EventID, n.Attempts, err)
+			} else {
+				log.Printf("telegram notification failed, will retry: id=%s kind=%s event=%s attempts=%d delay=%s err=%v", n.ID, n.Kind, n.EventID, n.Attempts, delay, err)
+			}
+			_ = a.mongo.FailTelegramNotification(ctx, n, err.Error(), time.Now().UTC().Add(delay), terminal)
+		} else {
+			log.Printf("telegram notification consumed: id=%s kind=%s event=%s bot_id=%s chat_id=%s", n.ID, n.Kind, n.EventID, n.BotID, n.ChatID)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(minInterval):
+		}
+	}
+}
+
+func (a *App) sendTelegramNotificationNow(ctx context.Context, n *TelegramNotificationEvent) error {
+	cfg := a.Config()
+	if cfg == nil || n == nil {
+		return fmt.Errorf("runtime config or notification event unavailable")
+	}
+	if !cfg.Telegram.Enabled {
+		return fmt.Errorf("telegram global setting is disabled")
+	}
+	bot := findTelegramBot(cfg, n.BotID)
+	if bot == nil || !bot.Enabled {
+		return fmt.Errorf("telegram bot not found or disabled: %s", n.BotID)
+	}
+	token, source := telegramTokenForBot(*bot)
+	if token == "" {
+		return fmt.Errorf("telegram token is empty for bot_id=%s token_env=%s", bot.ID, bot.TokenEnv)
+	}
+	text := n.Text
+	markup := n.ReplyMarkup
+	parseMode := n.ParseMode
+	if n.Kind == NotifyKindConfigChange && n.ChangeID != "" {
+		if cr, err := a.getConfigChange(ctx, n.ChangeID); err == nil && cr != nil {
+			text = configChangeTelegramText(cr)
+			web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
+			if web != "" {
+				buttonText := "打开 Web 审批"
+				if cr.Status != ChangePending {
+					buttonText = "打开 Web 查看"
+				}
+				markup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": buttonText, "url": web + "/?change=" + cr.ID}}}}
+			}
+		}
+	}
+	log.Printf("telegram notification sending: id=%s kind=%s event=%s bot_id=%s chat_id=%s source=%s", n.ID, n.Kind, n.EventID, bot.ID, n.ChatID, source)
+	res, err := sendTelegramWithResult(ctx, token, n.ChatID, text, parseMode, markup)
+	if err != nil {
+		return err
+	}
+	if a.mongo != nil && a.mongo.Healthy() {
+		_ = a.mongo.CompleteTelegramNotification(ctx, n.ID, res.MessageID)
+	}
+	if n.Kind == NotifyKindConfigChange && n.ChangeID != "" && res.MessageID > 0 {
+		_ = a.addConfigChangeTelegramRef(ctx, n.ChangeID, TelegramMessageRef{BotID: bot.ID, ChatID: n.ChatID, MessageID: res.MessageID})
+	}
+	return nil
+}
+
+func telegramMaxAttempts() int {
+	n := envInt("TELEGRAM_NOTIFY_MAX_ATTEMPTS", 10)
+	if n < 1 {
+		return 1
+	}
+	if n > 50 {
+		return 50
+	}
+	return n
+}
+
+func telegramMinInterval() time.Duration {
+	v := strings.TrimSpace(os.Getenv("TELEGRAM_NOTIFY_MIN_INTERVAL"))
+	if v == "" {
+		return 1200 * time.Millisecond
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 100*time.Millisecond {
+		return 1200 * time.Millisecond
+	}
+	return d
+}
+
+func telegramLease() time.Duration {
+	v := strings.TrimSpace(os.Getenv("TELEGRAM_NOTIFY_LEASE"))
+	if v == "" {
+		return 2 * time.Minute
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 30*time.Second {
+		return 2 * time.Minute
+	}
+	return d
+}
+
+func telegramRetryDelay(err error, attempts int) time.Duration {
+	msg := err.Error()
+	if i := strings.Index(msg, "retry_after"); i >= 0 {
+		tail := msg[i:]
+		for _, sep := range []string{":", " ", ",", "}"} {
+			tail = strings.ReplaceAll(tail, sep, " ")
+		}
+		parts := strings.Fields(tail)
+		for _, p := range parts {
+			if n, e := strconv.Atoi(p); e == nil && n > 0 {
+				return time.Duration(n+1) * time.Second
+			}
+		}
+	}
+	if attempts < 1 {
+		attempts = 1
+	}
+	sec := 5 * (1 << minInt(attempts-1, 5))
+	return time.Duration(sec) * time.Second
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 type telegramTarget struct {

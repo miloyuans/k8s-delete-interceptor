@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -66,7 +68,7 @@ func (a *App) admit(ctx context.Context, req *admissionv1.AdmissionRequest) *adm
 			ev.RollbackID = rb.ID
 		}
 	}
-	a.recordEventAsync(ev)
+	a.recordEvent(ev)
 	if shouldNotify(pd) {
 		go a.notifyEvent(context.Background(), cfg, ev, pd)
 	}
@@ -90,6 +92,9 @@ func (a *App) buildEvent(cfg *RuntimeConfig, req *admissionv1.AdmissionRequest, 
 }
 
 func eventID(cluster, uid, op, group, res, ns, name string) string {
+	if strings.TrimSpace(uid) == "" {
+		uid = fmt.Sprintf("no_uid_%d", time.Now().UnixNano())
+	}
 	s := strings.Join([]string{cluster, uid, op, group, res, ns, name}, "|")
 	h := sha1.Sum([]byte(s))
 	return fmt.Sprintf("%s_%s_%s_%s_%s", cluster, uid, strings.ToLower(op), res, hex.EncodeToString(h[:8]))
@@ -119,15 +124,44 @@ func shouldCreateRollback(cfg *RuntimeConfig, pd PolicyDecision, ac AdmissionCon
 	}
 }
 
-func (a *App) recordEventAsync(ev *AdmissionEvent) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func (a *App) recordEvent(ev *AdmissionEvent) {
+	if ev == nil {
+		return
+	}
+	if ev.PersistStatus == "" || ev.PersistStatus == "unknown" {
+		ev.PersistStatus = "received"
+	}
+	if err := a.local.SpoolEvent(ev); err != nil {
+		log.Printf("admission event local spool failed: id=%s uid=%s err=%v", ev.ID, ev.RequestUID, err)
+	} else {
+		log.Printf("admission event spooled: id=%s uid=%s resource=%s/%s/%s op=%s", ev.ID, ev.RequestUID, ev.Kind, ev.Namespace, ev.Name, ev.Operation)
+	}
+	if a.mongo != nil && a.mongo.Healthy() {
+		ctx, cancel := context.WithTimeout(context.Background(), eventMongoWriteTimeout())
 		defer cancel()
-		if a.mongo != nil && a.mongo.Healthy() {
-			if err := a.mongo.SaveEvent(ctx, ev); err == nil {
-				return
-			}
+		ev.PersistStatus = "mongo_synced"
+		if err := a.mongo.SaveEvent(ctx, ev); err != nil {
+			ev.PersistStatus = "local_spooled"
+			log.Printf("admission event mongo save failed, kept in local spool: id=%s uid=%s err=%v", ev.ID, ev.RequestUID, err)
+		} else {
+			log.Printf("admission event saved to mongo: id=%s uid=%s", ev.ID, ev.RequestUID)
 		}
-		_ = a.local.SpoolEvent(ev)
-	}()
+	} else {
+		log.Printf("admission event kept in local spool because mongo is unavailable: id=%s uid=%s", ev.ID, ev.RequestUID)
+	}
+}
+
+func eventMongoWriteTimeout() time.Duration {
+	v := strings.TrimSpace(os.Getenv("EVENT_MONGO_WRITE_TIMEOUT"))
+	if v == "" {
+		return 2 * time.Second
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 2 * time.Second
+	}
+	if d > 10*time.Second {
+		return 10 * time.Second
+	}
+	return d
 }

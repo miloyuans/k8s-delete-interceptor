@@ -23,6 +23,7 @@ func (a *App) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/me", a.auth(a.handleMe))
 	mux.HandleFunc("/api/settings", a.auth(a.handleSettings))
 	mux.HandleFunc("/api/metadata", a.require(PermDashboardRead, a.handleMetadata))
+	mux.HandleFunc("/api/events/", a.require(PermEventsRead, a.handleEventYAML))
 	mux.HandleFunc("/api/events", a.require(PermEventsRead, a.handleEvents))
 	mux.HandleFunc("/api/serviceaccounts", a.require(PermSARead, a.handleServiceAccounts))
 	mux.HandleFunc("/api/serviceaccounts/scan", a.require(PermSAScan, a.handleServiceAccountScan))
@@ -175,18 +176,88 @@ func (a *App) handleMetadata(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	q := parseEventQuery(r)
+	merged := []AdmissionEvent{}
+	seen := map[string]bool{}
 	if a.mongo != nil && a.mongo.Healthy() {
 		if events, err := a.mongo.ListEventsByQuery(r.Context(), q); err == nil {
-			writeJSON(w, events)
-			return
+			for _, ev := range events {
+				if ev.ID != "" && !seen[ev.ID] {
+					seen[ev.ID] = true
+					merged = append(merged, ev)
+				}
+			}
+		} else {
+			log.Printf("events mongo query failed, falling back to local spool: err=%v", err)
 		}
 	}
-	events, err := a.local.ListRecentEventsByQuery(q)
+	if localEvents, err := a.local.ListRecentEventsByQuery(q); err == nil {
+		for _, ev := range localEvents {
+			if ev.ID != "" && !seen[ev.ID] {
+				seen[ev.ID] = true
+				merged = append(merged, ev)
+			}
+		}
+	} else if len(merged) == 0 {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].Time.After(merged[j].Time) })
+	limit := q.NormalizedLimit(200)
+	if len(merged) > limit {
+		merged = merged[:limit]
+	}
+	writeJSON(w, merged)
+}
+
+func (a *App) handleEventYAML(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	p := strings.TrimPrefix(r.URL.Path, "/api/events/")
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	if len(parts) != 2 || parts[1] != "yaml" {
+		http.NotFound(w, r)
+		return
+	}
+	ev, err := a.getAdmissionEvent(r.Context(), parts[0])
+	if err != nil {
+		http.Error(w, err.Error(), 404)
+		return
+	}
+	raw := ev.Object
+	if r.URL.Query().Get("old") == "1" || strings.EqualFold(r.URL.Query().Get("object"), "old") {
+		raw = ev.OldObject
+	}
+	if len(raw) == 0 {
+		http.Error(w, "event object is empty", 404)
+		return
+	}
+	var obj any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	b, err := yaml.Marshal(obj)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	writeJSON(w, events)
+	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+	if r.URL.Query().Get("download") == "1" {
+		name := safeFileName(strings.Join([]string{ev.Kind, ev.Namespace, ev.Name, ev.ID}, "-")) + ".yaml"
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", name))
+	}
+	_, _ = w.Write(b)
+}
+
+func (a *App) getAdmissionEvent(ctx context.Context, id string) (*AdmissionEvent, error) {
+	if a.mongo != nil && a.mongo.Healthy() {
+		if ev, err := a.mongo.GetEvent(ctx, id); err == nil {
+			return ev, nil
+		}
+	}
+	return a.local.GetEvent(id)
 }
 
 func (a *App) handleServiceAccounts(w http.ResponseWriter, r *http.Request) {

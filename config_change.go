@@ -378,11 +378,11 @@ func (a *App) notifyConfigChange(ctx context.Context, cr *ConfigChangeRequest) {
 	}
 	text := configChangeTelegramText(cr)
 	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
-	markup := any(nil)
+	markup := map[string]any(nil)
 	if web != "" {
 		markup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "打开 Web 审批", "url": web + "/?change=" + cr.ID}}}}
 	}
-	refs := []TelegramMessageRef{}
+	queued := 0
 	seen := map[string]bool{}
 	for _, chat := range cfg.Telegram.Chats {
 		if !chat.Enabled || chat.ChatID == "" || chat.BotID == "" {
@@ -398,25 +398,43 @@ func (a *App) notifyConfigChange(ctx context.Context, cr *ConfigChangeRequest) {
 			log.Printf("config change telegram skipped: bot disabled or missing bot_id=%s change=%s", chat.BotID, cr.ID)
 			continue
 		}
-		token, source := telegramTokenForBot(*bot)
-		if token == "" {
-			log.Printf("config change telegram skipped: empty token bot_id=%s token_env=%s change=%s", bot.ID, bot.TokenEnv, cr.ID)
+		n := &TelegramNotificationEvent{Kind: NotifyKindConfigChange, EventID: cr.EventID, ChangeID: cr.ID, BotID: bot.ID, ChatID: chat.ChatID, TargetName: chat.Name, Text: text, ReplyMarkup: markup, Status: NotifyStatusPending, MaxAttempts: telegramMaxAttempts(), CreatedAt: time.Now().UTC(), NextAttemptAt: time.Now().UTC()}
+		n.ID = notificationID(n.Kind, cr.EventID, bot.ID, chat.ChatID)
+		if err := a.enqueueTelegramNotification(ctx, n); err != nil {
+			log.Printf("config change telegram enqueue failed: bot_id=%s chat_id=%s change=%s err=%v", bot.ID, chat.ChatID, cr.ID, err)
 			continue
 		}
-		res, err := sendTelegramWithResult(ctx, token, chat.ChatID, text, "", markup)
-		if err != nil {
-			log.Printf("config change telegram failed: bot_id=%s chat_id=%s source=%s change=%s err=%v", bot.ID, chat.ChatID, source, cr.ID, err)
-			continue
-		}
-		refs = append(refs, TelegramMessageRef{BotID: bot.ID, ChatID: chat.ChatID, MessageID: res.MessageID})
-		log.Printf("config change telegram sent: bot_id=%s chat_id=%s message_id=%d change=%s", bot.ID, chat.ChatID, res.MessageID, cr.ID)
+		queued++
 	}
-	if len(refs) > 0 {
-		cr.NotificationMessages = refs
-		if err := a.saveConfigChange(ctx, cr); err != nil {
-			log.Printf("config change telegram message refs save failed: change=%s err=%v", cr.ID, err)
+	log.Printf("config change telegram queued: change=%s event_id=%s targets=%d", cr.ID, cr.EventID, queued)
+}
+
+func (a *App) addConfigChangeTelegramRef(ctx context.Context, id string, ref TelegramMessageRef) error {
+	if strings.TrimSpace(id) == "" || ref.MessageID == 0 || ref.ChatID == "" || ref.BotID == "" {
+		return nil
+	}
+	if a.mongo != nil && a.mongo.Healthy() {
+		if err := a.mongo.AddConfigChangeTelegramRef(ctx, id, ref); err == nil {
+			if cr, e := a.mongo.GetConfigChange(ctx, id); e == nil {
+				_ = a.local.SaveConfigChange(cr)
+				if cr.Status != ChangePending {
+					go a.updateSingleConfigChangeTelegramStatus(context.Background(), cr, ref)
+				}
+			}
+			return nil
 		}
 	}
+	cr, err := a.getConfigChange(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, old := range cr.NotificationMessages {
+		if old.BotID == ref.BotID && old.ChatID == ref.ChatID && old.MessageID == ref.MessageID {
+			return nil
+		}
+	}
+	cr.NotificationMessages = append(cr.NotificationMessages, ref)
+	return a.saveConfigChange(ctx, cr)
 }
 
 func configChangeTelegramText(cr *ConfigChangeRequest) string {
@@ -442,6 +460,35 @@ func configChangeTelegramText(cr *ConfigChangeRequest) string {
 	return fmt.Sprintf("⚙️ 配置变更%s\n事件ID: %s\n类型: %s\n申请人: %s\n版本: v%d -> v%d%s\n摘要: %s\n差异: %s", status, cr.EventID, cr.Kind, cr.CreatedBy, cr.BaseVersion, cr.TargetVersion, decided, cr.Summary, strings.Join(cr.DiffSummary, ", "))
 }
 
+func (a *App) updateSingleConfigChangeTelegramStatus(ctx context.Context, cr *ConfigChangeRequest, ref TelegramMessageRef) {
+	if cr == nil || ref.MessageID == 0 || ref.ChatID == "" || ref.BotID == "" {
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil || !cfg.Telegram.Enabled {
+		return
+	}
+	bot := findTelegramBot(cfg, ref.BotID)
+	if bot == nil || !bot.Enabled {
+		return
+	}
+	token, source := telegramTokenForBot(*bot)
+	if token == "" {
+		return
+	}
+	text := configChangeTelegramText(cr)
+	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
+	markup := any(nil)
+	if web != "" {
+		markup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "打开 Web 查看", "url": web + "/?change=" + cr.ID}}}}
+	}
+	if err := editTelegramMessage(ctx, token, ref.ChatID, ref.MessageID, text, "", markup); err != nil {
+		log.Printf("config change telegram status update failed: bot_id=%s chat_id=%s message_id=%d source=%s change=%s err=%v", bot.ID, ref.ChatID, ref.MessageID, source, cr.ID, err)
+	} else {
+		log.Printf("config change telegram status updated: bot_id=%s chat_id=%s message_id=%d change=%s status=%s", bot.ID, ref.ChatID, ref.MessageID, cr.ID, cr.Status)
+	}
+}
+
 func (a *App) updateConfigChangeTelegramStatus(ctx context.Context, cr *ConfigChangeRequest) {
 	if cr == nil || len(cr.NotificationMessages) == 0 {
 		return
@@ -456,19 +503,9 @@ func (a *App) updateConfigChangeTelegramStatus(ctx context.Context, cr *ConfigCh
 	if web != "" {
 		markup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "打开 Web 查看", "url": web + "/?change=" + cr.ID}}}}
 	}
+	_ = text
+	_ = markup
 	for _, ref := range cr.NotificationMessages {
-		bot := findTelegramBot(cfg, ref.BotID)
-		if bot == nil || !bot.Enabled || ref.MessageID == 0 || ref.ChatID == "" {
-			continue
-		}
-		token, source := telegramTokenForBot(*bot)
-		if token == "" {
-			continue
-		}
-		if err := editTelegramMessage(ctx, token, ref.ChatID, ref.MessageID, text, "", markup); err != nil {
-			log.Printf("config change telegram status update failed: bot_id=%s chat_id=%s message_id=%d source=%s change=%s err=%v", bot.ID, ref.ChatID, ref.MessageID, source, cr.ID, err)
-		} else {
-			log.Printf("config change telegram status updated: bot_id=%s chat_id=%s message_id=%d change=%s status=%s", bot.ID, ref.ChatID, ref.MessageID, cr.ID, cr.Status)
-		}
+		a.updateSingleConfigChangeTelegramStatus(ctx, cr, ref)
 	}
 }

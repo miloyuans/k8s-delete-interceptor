@@ -275,6 +275,32 @@ func (s *LocalStore) ListRecentEventsByQuery(q EventQuery) ([]AdmissionEvent, er
 	return out, nil
 }
 
+func (s *LocalStore) GetEvent(id string) (*AdmissionEvent, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, errors.New("event id is required")
+	}
+	name := safeFileName(id) + ".json"
+	for _, d := range []string{"pending", "processing", "failed", "synced"} {
+		base := filepath.Join(s.root, "spool/admission-events", d)
+		candidates := []string{filepath.Join(base, name)}
+		if d == "processing" {
+			matches, _ := filepath.Glob(filepath.Join(base, "*__"+name))
+			candidates = append(candidates, matches...)
+		}
+		for _, path := range candidates {
+			b, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			var ev AdmissionEvent
+			if json.Unmarshal(b, &ev) == nil && ev.ID == id {
+				return &ev, nil
+			}
+		}
+	}
+	return nil, os.ErrNotExist
+}
+
 func (s *LocalStore) FlushEventsToMongo(ctx context.Context, m *MongoStore, batch int) error {
 	if m == nil || !m.Healthy() {
 		return errors.New("mongo unavailable")
@@ -312,6 +338,7 @@ func (s *LocalStore) FlushEventsToMongo(ctx context.Context, m *MongoStore, batc
 			_ = os.Rename(proc, filepath.Join(s.root, "spool/admission-events/failed", e.Name()))
 			continue
 		}
+		ev.PersistStatus = "mongo_synced"
 		if err := m.SaveEvent(ctx, &ev); err != nil {
 			_ = os.Rename(proc, from)
 			return err

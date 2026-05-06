@@ -75,6 +75,9 @@ func (m *MongoStore) Init(ctx context.Context) error {
 		{"service_account_inventory", mongo.IndexModel{Keys: bson.D{{Key: "namespace", Value: 1}, {Key: "name", Value: 1}}}},
 		{"data_sources", mongo.IndexModel{Keys: bson.D{{Key: "active", Value: 1}}, Options: options.Index().SetName("datasource_active_unique").SetUnique(true).SetPartialFilterExpression(bson.M{"active": true, "enabled": true})}},
 		{"cluster_metadata_snapshots", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
+		{"telegram_notification_events", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
+		{"telegram_notification_events", mongo.IndexModel{Keys: bson.D{{Key: "status", Value: 1}, {Key: "next_attempt_at", Value: 1}, {Key: "created_at", Value: 1}}}},
+		{"telegram_notification_events", mongo.IndexModel{Keys: bson.D{{Key: "kind", Value: 1}, {Key: "event_id", Value: 1}}}},
 	}
 	for _, x := range idx {
 		_, _ = m.db.Collection(x.col).Indexes().CreateOne(ctx, x.model)
@@ -227,6 +230,17 @@ func (m *MongoStore) ClaimConfigChange(ctx context.Context, id, eventID, nextSta
 	return &cr, nil
 }
 
+func (m *MongoStore) AddConfigChangeTelegramRef(ctx context.Context, id string, ref TelegramMessageRef) error {
+	if m == nil {
+		return errors.New("mongo not configured")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := m.db.Collection("config_change_requests").UpdateOne(ctx, bson.M{"id": id}, bson.M{"$addToSet": bson.M{"notification_messages": ref}})
+	m.healthy.Store(err == nil)
+	return err
+}
+
 func (m *MongoStore) ListConfigChanges(ctx context.Context, status string, limit int) ([]ConfigChangeRequest, error) {
 	if m == nil {
 		return nil, errors.New("mongo not configured")
@@ -300,7 +314,7 @@ func (m *MongoStore) SaveEvent(ctx context.Context, ev *AdmissionEvent) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	_, err := m.db.Collection("admission_events").UpdateOne(ctx, bson.M{"id": ev.ID}, bson.M{"$setOnInsert": ev}, options.Update().SetUpsert(true))
+	_, err := m.db.Collection("admission_events").UpdateOne(ctx, bson.M{"id": ev.ID}, bson.M{"$set": ev}, options.Update().SetUpsert(true))
 	m.healthy.Store(err == nil)
 	return err
 }
@@ -352,6 +366,109 @@ func (m *MongoStore) ListEventsByQuery(ctx context.Context, q EventQuery) ([]Adm
 	}
 	m.healthy.Store(true)
 	return out, nil
+}
+
+func (m *MongoStore) GetEvent(ctx context.Context, id string) (*AdmissionEvent, error) {
+	if m == nil {
+		return nil, errors.New("mongo unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var ev AdmissionEvent
+	err := m.db.Collection("admission_events").FindOne(ctx, bson.M{"id": id}).Decode(&ev)
+	m.healthy.Store(err == nil)
+	if err != nil {
+		return nil, err
+	}
+	return &ev, nil
+}
+
+func (m *MongoStore) EnqueueTelegramNotification(ctx context.Context, ev *TelegramNotificationEvent) error {
+	if m == nil || ev == nil {
+		return errors.New("mongo unavailable")
+	}
+	if ev.ID == "" {
+		return errors.New("notification id is required")
+	}
+	now := time.Now().UTC()
+	if ev.CreatedAt.IsZero() {
+		ev.CreatedAt = now
+	}
+	if ev.NextAttemptAt.IsZero() {
+		ev.NextAttemptAt = now
+	}
+	if ev.Status == "" {
+		ev.Status = NotifyStatusPending
+	}
+	if ev.MaxAttempts <= 0 {
+		ev.MaxAttempts = 10
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := m.db.Collection("telegram_notification_events").UpdateOne(ctx, bson.M{"id": ev.ID}, bson.M{"$setOnInsert": ev}, options.Update().SetUpsert(true))
+	m.healthy.Store(err == nil)
+	return err
+}
+
+func (m *MongoStore) ClaimTelegramNotification(ctx context.Context, worker string, lease time.Duration) (*TelegramNotificationEvent, error) {
+	if m == nil {
+		return nil, errors.New("mongo unavailable")
+	}
+	if lease <= 0 {
+		lease = 2 * time.Minute
+	}
+	now := time.Now().UTC()
+	stale := now.Add(-lease)
+	filter := bson.M{"$or": []bson.M{
+		{"status": NotifyStatusPending, "next_attempt_at": bson.M{"$lte": now}},
+		{"status": NotifyStatusPending, "next_attempt_at": bson.M{"$exists": false}},
+		{"status": NotifyStatusSending, "claimed_at": bson.M{"$lte": stale}},
+	}}
+	update := bson.M{"$set": bson.M{"status": NotifyStatusSending, "claimed_by": worker, "claimed_at": now}, "$inc": bson.M{"attempts": 1}}
+	opts := options.FindOneAndUpdate().SetSort(bson.D{{Key: "created_at", Value: 1}}).SetReturnDocument(options.After)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var ev TelegramNotificationEvent
+	err := m.db.Collection("telegram_notification_events").FindOneAndUpdate(ctx, filter, update, opts).Decode(&ev)
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, nil
+		}
+		m.healthy.Store(false)
+		return nil, err
+	}
+	m.healthy.Store(true)
+	return &ev, nil
+}
+
+func (m *MongoStore) CompleteTelegramNotification(ctx context.Context, id string, messageID int64) error {
+	if m == nil {
+		return errors.New("mongo unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := m.db.Collection("telegram_notification_events").UpdateOne(ctx, bson.M{"id": id}, bson.M{"$set": bson.M{"status": NotifyStatusSent, "sent_at": time.Now().UTC(), "message_id": messageID, "last_error": ""}})
+	m.healthy.Store(err == nil)
+	return err
+}
+
+func (m *MongoStore) FailTelegramNotification(ctx context.Context, ev *TelegramNotificationEvent, errMsg string, next time.Time, terminal bool) error {
+	if m == nil || ev == nil {
+		return errors.New("mongo unavailable")
+	}
+	status := NotifyStatusPending
+	if terminal {
+		status = NotifyStatusFailed
+	}
+	set := bson.M{"status": status, "last_error": errMsg, "next_attempt_at": next}
+	if terminal {
+		set["sent_at"] = time.Now().UTC()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := m.db.Collection("telegram_notification_events").UpdateOne(ctx, bson.M{"id": ev.ID}, bson.M{"$set": set})
+	m.healthy.Store(err == nil)
+	return err
 }
 
 func addPatternFilter(filter bson.M, key, value string, exactDefault bool) {

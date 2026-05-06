@@ -193,6 +193,58 @@ func (s *LocalStore) ListRecentEvents(limit int) ([]AdmissionEvent, error) {
 	return out, nil
 }
 
+func (s *LocalStore) ListRecentEventsByQuery(q EventQuery) ([]AdmissionEvent, error) {
+	paths := []string{}
+	for _, d := range []string{"pending", "processing", "failed", "synced"} {
+		_ = filepath.WalkDir(filepath.Join(s.root, "spool/admission-events", d), func(path string, de fs.DirEntry, err error) error {
+			if err == nil && !de.IsDir() && strings.HasSuffix(path, ".json") {
+				paths = append(paths, path)
+			}
+			return nil
+		})
+	}
+	type eventWithModTime struct {
+		event AdmissionEvent
+		mtime time.Time
+	}
+	items := make([]eventWithModTime, 0, len(paths))
+	for _, p := range paths {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var ev AdmissionEvent
+		if json.Unmarshal(b, &ev) != nil || !q.Match(ev) {
+			continue
+		}
+		st, _ := os.Stat(p)
+		var mt time.Time
+		if st != nil {
+			mt = st.ModTime()
+		}
+		items = append(items, eventWithModTime{event: ev, mtime: mt})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		it, jt := items[i].event.Time, items[j].event.Time
+		if it.IsZero() {
+			it = items[i].mtime
+		}
+		if jt.IsZero() {
+			jt = items[j].mtime
+		}
+		return it.After(jt)
+	})
+	limit := q.NormalizedLimit(100)
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	out := make([]AdmissionEvent, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.event)
+	}
+	return out, nil
+}
+
 func (s *LocalStore) FlushEventsToMongo(ctx context.Context, m *MongoStore, batch int) error {
 	if m == nil || !m.Healthy() {
 		return errors.New("mongo unavailable")

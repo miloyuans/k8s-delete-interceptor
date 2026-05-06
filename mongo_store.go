@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"sync/atomic"
 	"time"
 
@@ -146,15 +147,38 @@ func (m *MongoStore) SaveEvent(ctx context.Context, ev *AdmissionEvent) error {
 }
 
 func (m *MongoStore) ListEvents(ctx context.Context, limit int) ([]AdmissionEvent, error) {
+	return m.ListEventsByQuery(ctx, EventQuery{Limit: limit})
+}
+
+func (m *MongoStore) ListEventsByQuery(ctx context.Context, q EventQuery) ([]AdmissionEvent, error) {
 	if m == nil {
 		return nil, errors.New("mongo unavailable")
 	}
-	if limit <= 0 || limit > 1000 {
-		limit = 100
+	filter := bson.M{}
+	if !q.Start.IsZero() || !q.End.IsZero() {
+		timeFilter := bson.M{}
+		if !q.Start.IsZero() {
+			timeFilter["$gte"] = q.Start.UTC()
+		}
+		if !q.End.IsZero() {
+			timeFilter["$lt"] = q.End.UTC()
+		}
+		filter["time"] = timeFilter
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	addExactFilter(filter, "cluster", q.Cluster)
+	addExactFilter(filter, "namespace", q.Namespace)
+	addExactFilter(filter, "kind", q.Kind)
+	addExactFilter(filter, "resource", q.Resource)
+	addExactFilter(filter, "operation", q.Operation)
+	addExactFilter(filter, "decision", q.Decision)
+	addTextFilter(filter, "name", q.Name)
+	addTextFilter(filter, "user", q.User)
+	if q.Allowed != nil {
+		filter["allowed"] = *q.Allowed
+	}
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	cur, err := m.db.Collection("admission_events").Find(ctx, bson.M{}, options.Find().SetLimit(int64(limit)).SetSort(bson.D{{Key: "time", Value: -1}}))
+	cur, err := m.db.Collection("admission_events").Find(ctx, filter, options.Find().SetLimit(int64(q.NormalizedLimit(100))).SetSort(bson.D{{Key: "time", Value: -1}}))
 	if err != nil {
 		m.healthy.Store(false)
 		return nil, err
@@ -169,6 +193,18 @@ func (m *MongoStore) ListEvents(ctx context.Context, limit int) ([]AdmissionEven
 	}
 	m.healthy.Store(true)
 	return out, nil
+}
+
+func addExactFilter(filter bson.M, key, value string) {
+	if value != "" {
+		filter[key] = value
+	}
+}
+
+func addTextFilter(filter bson.M, key, value string) {
+	if value != "" {
+		filter[key] = bson.M{"$regex": regexp.QuoteMeta(value), "$options": "i"}
+	}
 }
 
 func (m *MongoStore) SaveRollback(ctx context.Context, rb *RollbackBackup) error {

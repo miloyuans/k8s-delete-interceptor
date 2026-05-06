@@ -29,6 +29,18 @@ func configApprovalRequired() bool {
 	return v == "" || v == "1" || v == "true" || v == "yes"
 }
 
+func configApprovalRequiredForKind(kind string) bool {
+	if !configApprovalRequired() {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "rules", "sa_mount", "raw_config", "restore":
+		return true
+	default:
+		return false
+	}
+}
+
 func (a *App) proposeConfigChange(ctx context.Context, cfg RuntimeConfig, kind, summary string, user *AuthUser, forceApply bool) (*ConfigChangeRequest, bool, error) {
 	cur := a.Config()
 	base := int64(0)
@@ -44,7 +56,7 @@ func (a *App) proposeConfigChange(ctx context.Context, cfg RuntimeConfig, kind, 
 		createdBy = user.Username
 	}
 	cr := &ConfigChangeRequest{ID: newChangeID(kind, createdBy), Kind: kind, Summary: summary, DiffSummary: diffConfigSummary(cur, &cfg), Status: ChangePending, BaseVersion: base, TargetVersion: cfg.Version, CreatedBy: createdBy, CreatedAt: time.Now().UTC(), Config: cfg}
-	if forceApply || !configApprovalRequired() {
+	if forceApply || !configApprovalRequiredForKind(kind) {
 		if err := a.applyConfig(ctx, &cfg, "web:"+kind); err != nil {
 			return nil, false, err
 		}
@@ -104,7 +116,7 @@ func (a *App) listConfigChanges(ctx context.Context, status string, limit int) (
 
 func sanitizeChanges(xs []ConfigChangeRequest) []ConfigChangeRequest {
 	for i := range xs {
-		xs[i].Config.WebUsers = sanitizeUsers(xs[i].Config.WebUsers)
+		sanitizeRuntimeConfigForResponse(&xs[i].Config)
 	}
 	return xs
 }

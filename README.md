@@ -73,3 +73,24 @@ CONFIG_CHANGE_REQUIRE_APPROVAL='true'
 ```
 
 After a config mutation is submitted, check **变更审批** in the Web Console and approve it with a user that has `config:approve` or `*` permission.
+
+## Web Console UX / RBAC Upgrade Notes
+
+This build adds another round of Web Console improvements:
+
+- Left navigation is icon-free and more compact.
+- Data source health is shown in the top-right action bar instead of the lower-left sidebar.
+- User login, switch-user and logout are grouped into a rounded user menu.
+- Site settings are applied immediately and do not enter the approval workflow.
+- Only business policy changes enter approval by default: rule changes, ServiceAccount policy mounts, full raw runtime config publishing and config version restore.
+- Telegram now has a standalone navigation entry and API endpoints for Bot, Chat and approval-user settings.
+- Cluster preview metadata is persisted and refreshed asynchronously to avoid expensive Kubernetes API calls on every page load.
+
+Useful metadata tuning environment variables:
+
+```bash
+METADATA_REFRESH_INTERVAL=10m      # minimum enforced interval is 2m
+METADATA_REFRESH_TIMEOUT=20s       # capped at 60s
+METADATA_INITIAL_DELAY=20s         # delay before first background refresh after startup
+```
+

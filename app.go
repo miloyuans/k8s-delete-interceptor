@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,6 +25,9 @@ type App struct {
 	dynamicClient   dynamic.Interface
 	discoveryClient discovery.DiscoveryInterface
 	adminToken      string
+	metadataValue   atomic.Value // *ClusterMetadata
+	metadataMu      sync.Mutex
+	metadataRefresh atomic.Bool
 }
 
 func NewApp(ctx context.Context, bootstrapPath, stateDir string) (*App, error) {
@@ -61,6 +65,7 @@ func NewApp(ctx context.Context, bootstrapPath, stateDir string) (*App, error) {
 	a := &App{local: local, mongo: mongoStore, adminToken: os.Getenv("WEB_ADMIN_TOKEN")}
 	a.configValue.Store(cfg)
 	a.initKubeClients()
+	a.loadPersistedMetadata(ctx)
 	return a, nil
 }
 
@@ -116,6 +121,7 @@ func (a *App) startBackground(ctx context.Context) {
 	go a.configSyncLoop(ctx)
 	go a.spoolFlushLoop(ctx)
 	go a.mongoHealthLoop(ctx)
+	go a.metadataRefreshLoop(ctx)
 }
 
 func (a *App) configSyncLoop(ctx context.Context) {

@@ -31,7 +31,7 @@ func NewLocalStore(root string) (*LocalStore, error) {
 	}
 	dirs := []string{
 		"config/versions", "config/lock", "config/changes", "spool/admission-events/pending", "spool/admission-events/processing", "spool/admission-events/synced", "spool/admission-events/failed",
-		"rollback/backups", "rollback/jobs", "rollback/locks", "approvals/pending", "approvals/decided", "tmp",
+		"rollback/backups", "rollback/jobs", "rollback/locks", "approvals/pending", "approvals/decided", "metadata", "tmp",
 	}
 	for _, d := range dirs {
 		if err := os.MkdirAll(filepath.Join(root, d), 0755); err != nil {
@@ -105,6 +105,36 @@ func (s *LocalStore) SaveConfig(cfg *RuntimeConfig, source string) error {
 		return err
 	}
 	return os.Rename(metaTmp, filepath.Join(s.root, "config/current.meta.json"))
+}
+
+func (s *LocalStore) SaveClusterMetadata(md *ClusterMetadata) error {
+	if md == nil {
+		return errors.New("metadata is nil")
+	}
+	b, err := json.MarshalIndent(md, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(s.root, "tmp", fmt.Sprintf("cluster-metadata-%d.tmp", time.Now().UnixNano()))
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
+		return err
+	}
+	if err := fsyncFile(tmp); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(s.root, "metadata/current.json"))
+}
+
+func (s *LocalStore) LoadClusterMetadata() (*ClusterMetadata, error) {
+	b, err := os.ReadFile(filepath.Join(s.root, "metadata/current.json"))
+	if err != nil {
+		return nil, err
+	}
+	var md ClusterMetadata
+	if err := json.Unmarshal(b, &md); err != nil {
+		return nil, err
+	}
+	return &md, nil
 }
 
 func (s *LocalStore) SpoolEvent(ev *AdmissionEvent) error {

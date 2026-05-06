@@ -33,6 +33,7 @@ const (
 	PermConfigRestore   = "config:restore"
 	PermRulesWrite      = "rules:write"
 	PermDatasourceWrite = "datasources:write"
+	PermTelegramWrite   = "telegram:write"
 	PermSettingsWrite   = "settings:write"
 	PermUsersWrite      = "users:write"
 	PermRolesWrite      = "roles:write"

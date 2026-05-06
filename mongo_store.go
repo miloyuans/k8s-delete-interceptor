@@ -74,6 +74,7 @@ func (m *MongoStore) Init(ctx context.Context) error {
 		{"service_account_inventory", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"service_account_inventory", mongo.IndexModel{Keys: bson.D{{Key: "namespace", Value: 1}, {Key: "name", Value: 1}}}},
 		{"data_sources", mongo.IndexModel{Keys: bson.D{{Key: "active", Value: 1}}, Options: options.Index().SetName("datasource_active_unique").SetUnique(true).SetPartialFilterExpression(bson.M{"active": true, "enabled": true})}},
+		{"cluster_metadata_snapshots", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
 	}
 	for _, x := range idx {
 		_, _ = m.db.Collection(x.col).Indexes().CreateOne(ctx, x.model)
@@ -384,6 +385,33 @@ func (m *MongoStore) ListServiceAccountsByNamespace(ctx context.Context, namespa
 		}
 	}
 	return out, nil
+}
+
+func (m *MongoStore) SaveClusterMetadata(ctx context.Context, md *ClusterMetadata) error {
+	if m == nil || md == nil {
+		return errors.New("mongo unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	doc := bson.M{"id": "current", "generated_at": md.GeneratedAt, "metadata": md}
+	_, err := m.db.Collection("cluster_metadata_snapshots").UpdateOne(ctx, bson.M{"id": "current"}, bson.M{"$set": doc}, options.Update().SetUpsert(true))
+	m.healthy.Store(err == nil)
+	return err
+}
+
+func (m *MongoStore) LoadClusterMetadata(ctx context.Context) (*ClusterMetadata, error) {
+	if m == nil {
+		return nil, errors.New("mongo unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var doc struct {
+		Metadata ClusterMetadata `bson:"metadata"`
+	}
+	if err := m.db.Collection("cluster_metadata_snapshots").FindOne(ctx, bson.M{"id": "current"}).Decode(&doc); err != nil {
+		return nil, err
+	}
+	return &doc.Metadata, nil
 }
 
 func (m *MongoStore) Disconnect(ctx context.Context) {

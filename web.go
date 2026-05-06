@@ -39,6 +39,8 @@ func (a *App) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/roles/", a.auth(a.handleRoles))
 	mux.HandleFunc("/api/datasources", a.auth(a.handleDatasources))
 	mux.HandleFunc("/api/datasources/test", a.require(PermDatasourceWrite, a.handleDatasourceTest))
+	mux.HandleFunc("/api/telegram", a.auth(a.handleTelegram))
+	mux.HandleFunc("/api/telegram/test", a.require(PermTelegramWrite, a.handleTelegramTest))
 	mux.HandleFunc("/api/rules", a.auth(a.handleRules))
 	mux.HandleFunc("/api/rules/", a.auth(a.handleRules))
 	mux.HandleFunc("/api/rollback/", a.require(PermRollbackExecute, a.handleRollback))
@@ -132,7 +134,7 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		next := cloneConfig(cfg)
 		next.Web = s
-		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "settings", "更新站点名称、图标、默认时区或主题", userFromContext(r.Context()), false)
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "settings", "更新站点名称、图标、默认时区或主题", userFromContext(r.Context()), true)
 		writeChangeResponse(w, cr, applied, err)
 	default:
 		http.Error(w, "method not allowed", 405)
@@ -140,6 +142,19 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("refresh") == "1" || strings.EqualFold(r.URL.Query().Get("refresh"), "true") {
+		if !userFromContext(r.Context()).Can(PermSAScan) {
+			http.Error(w, "forbidden: need permission "+PermSAScan, 403)
+			return
+		}
+		md, err := a.RefreshMetadata(r.Context(), true)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		writeJSON(w, md)
+		return
+	}
 	writeJSON(w, a.BuildMetadata(r.Context()))
 }
 
@@ -170,12 +185,12 @@ func (a *App) handleServiceAccountScan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
-	items, err := a.ScanServiceAccounts(r.Context())
+	md, err := a.RefreshMetadata(r.Context(), true)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	writeJSON(w, map[string]any{"ok": true, "count": len(items), "items": items})
+	writeJSON(w, map[string]any{"ok": true, "count": len(md.ServiceAccounts), "items": md.ServiceAccounts, "metadata": md})
 }
 
 func (a *App) handleServiceAccountMount(w http.ResponseWriter, r *http.Request) {
@@ -349,7 +364,7 @@ func (a *App) handleConfigChangeAction(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		cr.Config.WebUsers = sanitizeUsers(cr.Config.WebUsers)
+		sanitizeRuntimeConfigForResponse(&cr.Config)
 		writeJSON(w, map[string]any{"ok": true, "change": cr})
 	})(w, r)
 }
@@ -405,7 +420,7 @@ func (a *App) handleUsers(w http.ResponseWriter, r *http.Request) {
 			}
 			next.WebUsers = append(next.WebUsers, WebUser{Username: username, DisplayName: body.DisplayName, PasswordHash: hashPassword(username, body.Password), Roles: body.Roles, Enabled: body.Enabled, CreatedAt: now, UpdatedAt: now})
 		}
-		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "users", "创建或更新 Web 用户", userFromContext(r.Context()), false)
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "users", "创建或更新 Web 用户", userFromContext(r.Context()), true)
 		writeChangeResponse(w, cr, applied, err)
 	case http.MethodDelete:
 		username := strings.Trim(pathID("/api/users", r.URL.Path), "/")
@@ -421,7 +436,7 @@ func (a *App) handleUsers(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		next.WebUsers = filtered
-		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "users", "删除 Web 用户", userFromContext(r.Context()), false)
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "users", "删除 Web 用户", userFromContext(r.Context()), true)
 		writeChangeResponse(w, cr, applied, err)
 	default:
 		http.Error(w, "method not allowed", 405)
@@ -468,7 +483,7 @@ func (a *App) handleRoles(w http.ResponseWriter, r *http.Request) {
 		if !updated {
 			next.WebRoles = append(next.WebRoles, role)
 		}
-		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "roles", "创建或更新 Web 角色权限", u, false)
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "roles", "创建或更新 Web 角色权限", u, true)
 		writeChangeResponse(w, cr, applied, err)
 	case http.MethodDelete:
 		id := strings.Trim(pathID("/api/roles", r.URL.Path), "/")
@@ -480,7 +495,7 @@ func (a *App) handleRoles(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		next.WebRoles = filtered
-		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "roles", "删除 Web 角色", u, false)
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "roles", "删除 Web 角色", u, true)
 		writeChangeResponse(w, cr, applied, err)
 	default:
 		http.Error(w, "method not allowed", 405)
@@ -513,8 +528,126 @@ func (a *App) handleDatasources(w http.ResponseWriter, r *http.Request) {
 	}
 	next := cloneConfig(cfg)
 	next.DataSources = items
-	cr, applied, err := a.proposeConfigChange(r.Context(), *next, "datasources", "更新数据源配置", u, false)
+	cr, applied, err := a.proposeConfigChange(r.Context(), *next, "datasources", "更新数据源配置", u, true)
 	writeChangeResponse(w, cr, applied, err)
+}
+
+func (a *App) handleTelegram(w http.ResponseWriter, r *http.Request) {
+	u := userFromContext(r.Context())
+	cfg := a.Config()
+	if cfg == nil {
+		http.Error(w, "runtime config unavailable", 500)
+		return
+	}
+	if r.Method == http.MethodGet {
+		if !u.Can(PermConfigRead) {
+			http.Error(w, "forbidden", 403)
+			return
+		}
+		writeJSON(w, sanitizeTelegram(cfg.Telegram))
+		return
+	}
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	if !u.Can(PermTelegramWrite) {
+		http.Error(w, "forbidden: need permission "+PermTelegramWrite, 403)
+		return
+	}
+	var tg TelegramConfig
+	if err := json.NewDecoder(r.Body).Decode(&tg); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	preserveTelegramSecrets(&tg, cfg.Telegram)
+	next := cloneConfig(cfg)
+	next.Telegram = tg
+	cr, applied, err := a.proposeConfigChange(r.Context(), *next, "telegram", "更新 Telegram 通知与审批人配置", u, true)
+	writeChangeResponse(w, cr, applied, err)
+}
+
+func (a *App) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		http.Error(w, "runtime config unavailable", 500)
+		return
+	}
+	var body struct {
+		BotID   string `json:"bot_id"`
+		ChatID  string `json:"chat_id"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	bot := findTelegramBot(cfg, body.BotID)
+	if bot == nil || !bot.Enabled {
+		http.Error(w, "telegram bot not found or disabled", 400)
+		return
+	}
+	chatID := strings.TrimSpace(body.ChatID)
+	if chatID == "" {
+		for _, c := range cfg.Telegram.Chats {
+			if c.Enabled && c.BotID == body.BotID {
+				chatID = c.ChatID
+				break
+			}
+		}
+	}
+	if chatID == "" {
+		http.Error(w, "chat_id is required", 400)
+		return
+	}
+	token := bot.Token
+	if token == "" && bot.TokenEnv != "" {
+		token = envOr(bot.TokenEnv, "")
+	}
+	if token == "" {
+		http.Error(w, "telegram token is empty", 400)
+		return
+	}
+	msg := body.Message
+	if msg == "" {
+		msg = "K8s Delete Interceptor Telegram test message"
+	}
+	if err := sendTelegram(r.Context(), token, chatID, msg, "", nil); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func sanitizeTelegram(tg TelegramConfig) TelegramConfig {
+	out := tg
+	for i := range out.Bots {
+		if out.Bots[i].Token != "" {
+			out.Bots[i].Token = "********"
+		}
+	}
+	return out
+}
+
+func preserveTelegramSecrets(next *TelegramConfig, cur TelegramConfig) {
+	if next == nil {
+		return
+	}
+	byID := map[string]TelegramBot{}
+	for _, b := range cur.Bots {
+		byID[b.ID] = b
+	}
+	for i := range next.Bots {
+		if next.Bots[i].Token == "" || next.Bots[i].Token == "********" {
+			if old, ok := byID[next.Bots[i].ID]; ok {
+				next.Bots[i].Token = old.Token
+			}
+		}
+	}
 }
 
 func (a *App) handleRules(w http.ResponseWriter, r *http.Request) {
@@ -771,13 +904,21 @@ func sanitizeUsers(users []WebUser) []WebUser {
 	return out
 }
 
+func sanitizeRuntimeConfigForResponse(cfg *RuntimeConfig) {
+	if cfg == nil {
+		return
+	}
+	cfg.WebUsers = sanitizeUsers(cfg.WebUsers)
+	cfg.Telegram = sanitizeTelegram(cfg.Telegram)
+}
+
 func writeChangeResponse(w http.ResponseWriter, cr *ConfigChangeRequest, applied bool, err error) {
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	if cr != nil {
-		cr.Config.WebUsers = sanitizeUsers(cr.Config.WebUsers)
+		sanitizeRuntimeConfigForResponse(&cr.Config)
 	}
 	writeJSON(w, map[string]any{"ok": true, "applied": applied, "change": cr})
 }

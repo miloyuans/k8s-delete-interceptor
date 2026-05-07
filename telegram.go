@@ -474,7 +474,7 @@ func (a *App) sendTelegramNotificationNow(ctx context.Context, n *TelegramNotifi
 		if !ok {
 			log.Printf("telegram notification dropped stale: id=%s event=%s rule=%s reason=%s", n.ID, n.EventID, n.RuleID, reason)
 			if a.mongo != nil && a.mongo.Healthy() {
-				_ = a.mongo.DeleteTelegramNotifications(ctx, []string{n.ID}, "stale admission notification: "+reason)
+				_, _ = a.mongo.DeleteTelegramNotifications(ctx, []string{n.ID}, "stale admission notification: "+reason)
 			}
 			return nil
 		}

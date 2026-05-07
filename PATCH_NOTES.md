@@ -45,3 +45,8 @@
 - 新增持久化设置 `telegram_queue_cleanup_ttl`，默认 `24h`。超过该时间仍处于 `pending/sending/failed` 的通知队列会被删除，避免长期堆积。
 - Web「站点设置」增加“无用通知队列 TTL”配置项。
 - 过期清理只删除未完成队列，不删除已发送交互消息；已发送记录仍按热库/冷库生命周期归档和彻底清理。
+
+## v9 - Build Fix
+
+- Fixed `telegram.go` compile error caused by assigning the two-value result of `DeleteTelegramNotifications` to a single blank identifier.
+- Changed stale admission notification cleanup call to discard both return values: `_, _ = ...`.

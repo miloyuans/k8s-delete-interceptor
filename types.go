@@ -259,6 +259,7 @@ type TelegramMessageRef struct {
 const (
 	NotifyKindAdmissionEvent = "admission_event"
 	NotifyKindConfigChange   = "config_change"
+	NotifyKindSystemEvent    = "system_event"
 	NotifyStatusPending      = "pending"
 	NotifyStatusSending      = "sending"
 	NotifyStatusSent         = "sent"

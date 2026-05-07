@@ -20,6 +20,27 @@ import (
 
 const defaultAdmissionApprovalTTLSeconds = 12 * 60 * 60
 
+const admissionApprovalSystemExecutorID = "system:telegram-exec"
+
+func isSystemExecutionApprovalGrant(grant *AdmissionApprovalGrant) bool {
+	return grant != nil && grant.ApprovedByID == admissionApprovalSystemExecutorID
+}
+
+func interceptorServiceAccountUser() string {
+	ns := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+	if ns == "" {
+		ns = "webhook-system"
+	}
+	sa := strings.TrimSpace(os.Getenv("SERVICE_ACCOUNT_NAME"))
+	if sa == "" {
+		sa = strings.TrimSpace(os.Getenv("INTERCEPTOR_SERVICE_ACCOUNT"))
+	}
+	if sa == "" {
+		sa = "delete-interceptor"
+	}
+	return "system:serviceaccount:" + ns + ":" + sa
+}
+
 type AdmissionApprovalGrant struct {
 	ID                 string    `json:"id" bson:"id"`
 	EventID            string    `json:"event_id" bson:"event_id"`
@@ -238,7 +259,7 @@ func (m *MongoStore) SaveAdmissionApprovalGrant(ctx context.Context, grant *Admi
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	_, err := m.db.Collection("admission_approval_grants").UpdateOne(ctx, bson.M{"id": grant.ID}, bson.M{"$setOnInsert": grant}, options.Update().SetUpsert(true))
+	_, err := m.db.Collection("admission_approval_grants").UpdateOne(ctx, bson.M{"id": grant.ID}, bson.M{"$set": grant}, options.Update().SetUpsert(true))
 	m.healthy.Store(err == nil)
 	return err
 }

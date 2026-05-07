@@ -64,12 +64,20 @@ func (a *App) admit(ctx context.Context, req *admissionv1.AdmissionRequest) *adm
 	pd := decide(cfg, ac)
 	log.Printf("admission policy decided: uid=%s op=%s group=%q resource=%s kind=%s ns=%s name=%s user=%s decision=%s allowed=%v rule=%s scopes=%v reason=%s", req.UID, ac.Operation, ac.APIGroup, ac.Resource, ac.Kind, ac.Namespace, ac.Name, ac.User, pd.Decision, pd.Allowed, ruleIDForLog(pd), pd.ScopeIDs, pd.Reason)
 	approvalConsumed := false
+	systemExecutionApproval := false
 	if pd.Decision == DecisionRequireApproval {
 		if grant, err := a.consumeAdmissionApproval(ctx, cfg, ac, pd); err == nil && grant != nil {
 			approvalConsumed = true
-			pd.Decision = DecisionAllowNotify
-			pd.Allowed = true
-			pd.Reason = fmt.Sprintf("已审批放行，审批人: %s，原事件: %s", grant.ApprovedBy, grant.EventID)
+			if isSystemExecutionApprovalGrant(grant) {
+				systemExecutionApproval = true
+				pd.Decision = DecisionAuditOnly
+				pd.Allowed = true
+				pd.Reason = fmt.Sprintf("Telegram 已审批，系统代执行，审批人: %s，原事件: %s", grant.ApprovedBy, grant.EventID)
+			} else {
+				pd.Decision = DecisionAllowNotify
+				pd.Allowed = true
+				pd.Reason = fmt.Sprintf("已审批放行，审批人: %s，原事件: %s", grant.ApprovedBy, grant.EventID)
+			}
 		} else if err != nil {
 			log.Printf("admission approval lookup failed: uid=%s key=%s err=%v", req.UID, admissionApprovalKeyForContext(cfg, ac, pd), err)
 		}
@@ -87,13 +95,13 @@ func (a *App) admit(ctx context.Context, req *admissionv1.AdmissionRequest) *adm
 	} else if err != nil {
 		log.Printf("admission duplicate lookup failed: uid=%s fingerprint=%s err=%v", req.UID, ev.Fingerprint, err)
 	}
-	if shouldCreateRollback(cfg, pd, ac) {
+	if !systemExecutionApproval && shouldCreateRollback(cfg, pd, ac) {
 		if rb, err := a.createRollbackBackup(ctx, cfg, ev, ac, pd); err == nil && rb != nil {
 			ev.RollbackID = rb.ID
 		}
 	}
 	a.recordEvent(ev)
-	if shouldNotify(pd) {
+	if !systemExecutionApproval && shouldNotify(pd) {
 		go a.notifyEvent(context.Background(), cfg, ev, pd)
 	}
 	return admissionResponseForDecision(pd)

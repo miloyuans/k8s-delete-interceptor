@@ -31,6 +31,7 @@ func NewLocalStore(root string) (*LocalStore, error) {
 	}
 	dirs := []string{
 		"config/versions", "config/lock", "config/changes", "config/audits", "spool/admission-events/pending", "spool/admission-events/processing", "spool/admission-events/synced", "spool/admission-events/failed",
+		"spool/system-notifications/pending", "spool/system-notifications/sent",
 		"rollback/backups", "rollback/manifests", "rollback/jobs", "rollback/locks", "approvals/pending", "approvals/decided", "metadata", "tmp",
 	}
 	for _, d := range dirs {

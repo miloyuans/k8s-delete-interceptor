@@ -55,6 +55,9 @@ func main() {
 	}()
 
 	<-ctx.Done()
+	notifyCtx, notifyCancel := context.WithTimeout(context.Background(), 8*time.Second)
+	app.emitShutdownNotification(notifyCtx)
+	notifyCancel()
 	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = tlsServer.Shutdown(shutdown)

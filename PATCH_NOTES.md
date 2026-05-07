@@ -33,3 +33,14 @@
 - 已执行 `gofmt -w *.go`。
 - 已用 Go parser 解析所有 Go 文件，语法通过。
 - 当前容器无法解析 `proxy.golang.org`，`go test ./...` 停在依赖下载 / go.sum 阶段；在有网络环境执行 `go mod tidy && go test ./...` 可完成完整构建验证。
+
+## v3 patch
+
+- Telegram 删除审批通过后会立即代执行 DELETE：审批回调先为本服务账号写入短 TTL 的系统执行授权，再调用 Kubernetes Dynamic Client 删除目标资源，避免 Admission Webhook 自己拦截自己的代执行请求。
+- 系统代执行产生的二次 Admission 事件仅审计，不再重复触发 Telegram 通知和回滚备份，减少重复事件噪音。
+- 非 DELETE 类审批仍保留一次性重试授权，不虚假承诺可安全复放 UPDATE/CREATE。
+- Telegram 状态更新中的查询关键字改成编号列表：event / rollback / fingerprint。
+- Telegram 模板里的用户展示改为短用户名，例如 system:serviceaccount:kube-system:admin-milo 展示为 admin-milo。
+- 状态更新里的 Web 链接改成 Markdown 超链：事件详细地址。
+- 新增服务启动、关闭、Mongo 异常、Mongo 恢复通知。Mongo 不可用时通知会先落本地 PVC 队列，恢复后写入 Telegram 队列补发。
+- 新增本地 system-notifications 队列目录，部署清单增加 SERVICE_ACCOUNT_NAME 环境变量，方便系统代执行授权匹配实际 ServiceAccount。

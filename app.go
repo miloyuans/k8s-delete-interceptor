@@ -131,6 +131,13 @@ func (a *App) startBackground(ctx context.Context) {
 	go a.telegramNotificationLoop(ctx)
 	go a.telegramCallbackPollingLoop(ctx)
 	go a.retentionMaintenanceLoop(ctx)
+	go func() {
+		waitContext(ctx, 2*time.Second)
+		a.emitStartupNotification(context.Background())
+		if a.mongo == nil || !a.mongo.Healthy() {
+			a.emitMongoStatusNotification(context.Background(), false, "startup mongo is unavailable")
+		}
+	}()
 }
 
 func (a *App) configSyncLoop(ctx context.Context) {
@@ -170,6 +177,7 @@ func (a *App) spoolFlushLoop(ctx context.Context) {
 		}
 		if a.mongo != nil && a.mongo.Healthy() {
 			_ = a.local.FlushEventsToMongo(ctx, a.mongo, 200)
+			_ = a.flushSystemNotifications(ctx)
 		}
 	}
 }
@@ -177,6 +185,7 @@ func (a *App) spoolFlushLoop(ctx context.Context) {
 func (a *App) mongoHealthLoop(ctx context.Context) {
 	t := time.NewTicker(15 * time.Second)
 	defer t.Stop()
+	lastHealthy := a.mongo != nil && a.mongo.Healthy()
 	for {
 		select {
 		case <-ctx.Done():
@@ -184,8 +193,25 @@ func (a *App) mongoHealthLoop(ctx context.Context) {
 		case <-t.C:
 		}
 		if a.mongo != nil {
-			_ = a.mongo.Ping(ctx)
-			continue
+			err := a.mongo.Ping(ctx)
+			nowHealthy := err == nil && a.mongo.Healthy()
+			if lastHealthy && !nowHealthy {
+				detail := ""
+				if err != nil {
+					detail = err.Error()
+				}
+				log.Printf("mongo became unavailable: %s", detail)
+				a.emitMongoStatusNotification(context.Background(), false, detail)
+			}
+			if !lastHealthy && nowHealthy {
+				log.Printf("mongo recovered")
+				a.emitMongoStatusNotification(context.Background(), true, "")
+				_ = a.flushSystemNotifications(ctx)
+			}
+			lastHealthy = nowHealthy
+			if nowHealthy {
+				continue
+			}
 		}
 		cfg := a.Config()
 		if cfg == nil {
@@ -198,11 +224,17 @@ func (a *App) mongoHealthLoop(ctx context.Context) {
 		m, err := NewMongoStore(ctx, uri, db)
 		if err == nil {
 			a.mongo = m
-			if cfg != nil {
-				_ = a.mongo.EnsureConfig(ctx, cfg)
-				_ = a.mongo.EnsureTelegramConfig(ctx, cfg.Telegram)
-			}
+			a.mongoURI, a.mongoDatabase = uri, db
+			_ = a.mongo.EnsureConfig(ctx, cfg)
+			_ = a.mongo.EnsureTelegramConfig(ctx, cfg.Telegram)
+			lastHealthy = true
 			log.Printf("mongo reconnected")
+			a.emitMongoStatusNotification(context.Background(), true, "")
+			_ = a.flushSystemNotifications(ctx)
+		} else if lastHealthy {
+			lastHealthy = false
+			log.Printf("mongo reconnect failed after healthy state: %v", err)
+			a.emitMongoStatusNotification(context.Background(), false, err.Error())
 		}
 	}
 }

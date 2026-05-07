@@ -697,7 +697,7 @@ func renderTemplate(cfg *RuntimeConfig, tg *TelegramConfig, ev *AdmissionEvent, 
 	if web != "" {
 		eventURL = webURL(web, "/events", map[string]string{"event": ev.ID})
 	}
-	actorDisplay := ev.User
+	actorDisplay := compactActorName(ev.User)
 	approvers := []string{}
 	if pd.Rule != nil {
 		for _, id := range pd.Rule.Approval.ApproverTelegramUsers {
@@ -723,6 +723,23 @@ func renderTemplate(cfg *RuntimeConfig, tg *TelegramConfig, ev *AdmissionEvent, 
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+func compactActorName(user string) string {
+	u := strings.TrimSpace(user)
+	if u == "" {
+		return ""
+	}
+	for _, sep := range []string{":", "/"} {
+		parts := strings.Split(u, sep)
+		if len(parts) > 1 {
+			last := strings.TrimSpace(parts[len(parts)-1])
+			if last != "" {
+				u = last
+			}
+		}
+	}
+	return u
 }
 
 func operationCN(op string) string {
@@ -1043,14 +1060,18 @@ func eventSearchKey(ev *AdmissionEvent) string {
 	if ev == nil {
 		return ""
 	}
-	parts := []string{"查询关键字: `event:" + ev.ID + "`"}
+	items := []string{"`event:" + ev.ID + "`"}
 	if ev.RollbackID != "" {
-		parts = append(parts, "`rollback:"+ev.RollbackID+"`")
+		items = append(items, "`rollback:"+ev.RollbackID+"`")
 	}
 	if ev.Fingerprint != "" {
-		parts = append(parts, "`fp:"+ev.Fingerprint+"`")
+		items = append(items, "`fp:"+ev.Fingerprint+"`")
 	}
-	return strings.Join(parts, " ")
+	lines := []string{"查询关键字:"}
+	for i, item := range items {
+		lines = append(lines, fmt.Sprintf("%d、%s", i+1, item))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func eventStatusText(base string, ev *AdmissionEvent, status string) string {
@@ -1061,8 +1082,9 @@ func eventStatusText(base string, ev *AdmissionEvent, status string) string {
 	if key := eventSearchKey(ev); key != "" {
 		out += "\n" + key
 	}
-	if web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/"); web != "" {
-		out += "\nWeb: " + webURL(web, "/events", map[string]string{"event": ev.ID})
+	if web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/"); web != "" && ev != nil {
+		url := webURL(web, "/events", map[string]string{"event": ev.ID})
+		out += "\nWeb: [事件详细地址](" + url + ")"
 	}
 	return out
 }
@@ -1235,13 +1257,30 @@ func (a *App) handleEventTelegramCallback(ctx context.Context, token, chatID str
 			_ = answerTelegramCallback(ctx, token, callbackID, "未授权的事件审批人", true)
 			return
 		}
-		grant, err := a.createAdmissionApprovalGrant(ctx, ev, actor, telegramCallbackUserID(cb))
-		if err != nil {
-			_ = answerTelegramCallback(ctx, token, callbackID, "审批授权保存失败: "+err.Error(), true)
+		action, execErr := a.executeApprovedAdmissionAction(ctx, ev, actor)
+		if execErr == nil && action.Executed {
+			ev.Decision = DecisionAllowNotify
+			ev.Allowed = true
+			ev.Reason = fmt.Sprintf("Telegram 已审批并执行%s，审批人: %s", operationCN(ev.Operation), actor)
+			ev.ChangeSummary = strings.TrimSpace(ev.ChangeSummary)
+			a.saveAdmissionEventState(ctx, ev)
+			_ = answerTelegramCallback(ctx, token, callbackID, "已审批并执行完成", false)
+			go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("✅ 已审批放行并执行完成\n审批人: %s\n执行结果: %s", actor, action.Message))
+			return
+		}
+		grant, grantErr := a.createAdmissionApprovalGrant(ctx, ev, actor, telegramCallbackUserID(cb))
+		if grantErr != nil {
+			_ = answerTelegramCallback(ctx, token, callbackID, "审批已通过，但执行失败且重试授权保存失败: "+grantErr.Error(), true)
+			go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("⚠️ 已审批，但集群执行失败且重试授权保存失败\n审批人: %s\n错误: %v", actor, execErr))
+			return
+		}
+		if execErr != nil {
+			_ = answerTelegramCallback(ctx, token, callbackID, "审批已保存，但执行失败: "+execErr.Error(), true)
+			go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("⚠️ 已审批，但集群执行失败\n审批人: %s\n错误: %s\n一次性重试授权有效期至: %s", actor, execErr.Error(), grant.ExpiresAt.Format(time.RFC3339)))
 			return
 		}
 		_ = answerTelegramCallback(ctx, token, callbackID, "已授权一次性重试", false)
-		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("✅ 已审批放行\n审批人: %s\n有效期至: %s\n请原用户在有效期内重试原命令", actor, grant.ExpiresAt.Format(time.RFC3339)))
+		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("✅ 已审批放行\n审批人: %s\n有效期至: %s\n%s", actor, grant.ExpiresAt.Format(time.RFC3339), action.Message))
 	case "reject":
 		if ev.Decision != DecisionRequireApproval || ev.Allowed {
 			_ = answerTelegramCallback(ctx, token, callbackID, "该事件不在待审批状态", true)

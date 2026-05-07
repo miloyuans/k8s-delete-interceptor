@@ -392,13 +392,14 @@ func defaultPersistenceSettings() PersistenceSettings {
 		TelegramInteractionTTL:  "12h",
 		DeleteApprovalTimeout:   "12h",
 		DuplicateEventWindow:    "30s",
+		TelegramQueueCleanupTTL: "24h",
 		ArchiveBatchSize:        500,
 		TelegramCallbackPolling: true,
 	}
 }
 
 func normalizePersistenceSettings(p PersistenceSettings) PersistenceSettings {
-	if !p.Enabled && p.ActiveDataTTL == "" && p.ColdDataTTL == "" && p.TelegramInteractionTTL == "" && p.DeleteApprovalTimeout == "" {
+	if !p.Enabled && p.ActiveDataTTL == "" && p.ColdDataTTL == "" && p.TelegramInteractionTTL == "" && p.DeleteApprovalTimeout == "" && p.TelegramQueueCleanupTTL == "" {
 		p = defaultPersistenceSettings()
 	}
 	if p.ActiveDataTTL == "" {
@@ -418,6 +419,12 @@ func normalizePersistenceSettings(p PersistenceSettings) PersistenceSettings {
 	}
 	if p.DuplicateEventWindow == "" {
 		p.DuplicateEventWindow = "30s"
+	}
+	if p.TelegramQueueCleanupTTL == "" {
+		p.TelegramQueueCleanupTTL = p.ActiveDataTTL
+		if p.TelegramQueueCleanupTTL == "" {
+			p.TelegramQueueCleanupTTL = "24h"
+		}
 	}
 	if p.ArchiveBatchSize <= 0 {
 		p.ArchiveBatchSize = 500

@@ -57,10 +57,6 @@ func decide(cfg *RuntimeConfig, ac AdmissionContext) PolicyDecision {
 	for _, s := range scopes {
 		scopeIDs = append(scopeIDs, s.ID)
 	}
-	if len(scopes) == 0 {
-		dec := defaultDecisionFor(cfg, ac.Operation)
-		return PolicyDecision{Decision: dec, Allowed: decisionAllowed(dec), Reason: "资源未命中策略范围，默认只审计", ScopeMatched: false, ChangeClass: changeClass, ChangeSummary: summary}
-	}
 	rules := append([]PolicyRule(nil), cfg.Rules...)
 	sort.SliceStable(rules, func(i, j int) bool { return rules[i].Priority < rules[j].Priority })
 	for i := range rules {
@@ -71,7 +67,8 @@ func decide(cfg *RuntimeConfig, ac AdmissionContext) PolicyDecision {
 		if !matchAnyFold(r.Operations, ac.Operation) {
 			continue
 		}
-		if len(r.ScopeIDs) > 0 && !intersects(r.ScopeIDs, scopeIDs) {
+		ruleScopeIDs := matchingScopeIDsForRule(cfg, *r, ac)
+		if len(r.ScopeIDs) > 0 && len(ruleScopeIDs) == 0 {
 			continue
 		}
 		if len(r.ActorGroupIDs) > 0 {
@@ -96,10 +93,16 @@ func decide(cfg *RuntimeConfig, ac AdmissionContext) PolicyDecision {
 		if reason == "" {
 			reason = "matched rule " + r.Name
 		}
-		return PolicyDecision{Decision: dec, Allowed: decisionAllowed(dec), Reason: reason, Rule: r, ScopeMatched: true, ScopeIDs: scopeIDs, ChangeClass: changeClass, ChangeSummary: summary}
+		return PolicyDecision{Decision: dec, Allowed: decisionAllowed(dec), Reason: reason, Rule: r, ScopeMatched: len(ruleScopeIDs) > 0 || len(r.ScopeIDs) == 0, ScopeIDs: ruleScopeIDs, ChangeClass: changeClass, ChangeSummary: summary}
 	}
 	dec := defaultDecisionFor(cfg, ac.Operation)
-	return PolicyDecision{Decision: dec, Allowed: decisionAllowed(dec), Reason: "资源在策略范围内，但未命中具体规则，默认只审计", ScopeMatched: true, ScopeIDs: scopeIDs, ChangeClass: changeClass, ChangeSummary: summary}
+	reason := "资源未命中策略范围，默认只审计"
+	scopeMatched := false
+	if len(scopeIDs) > 0 {
+		reason = "资源在策略范围内，但未命中具体规则，默认只审计"
+		scopeMatched = true
+	}
+	return PolicyDecision{Decision: dec, Allowed: decisionAllowed(dec), Reason: reason, ScopeMatched: scopeMatched, ScopeIDs: scopeIDs, ChangeClass: changeClass, ChangeSummary: summary}
 }
 
 func isInterceptorServiceAccountDelete(ac AdmissionContext) bool {
@@ -138,28 +141,76 @@ func decisionAllowed(d string) bool {
 
 func matchingScopes(cfg *RuntimeConfig, ac AdmissionContext) []ResourceScope {
 	out := []ResourceScope{}
+	refs := referencedScopeIDs(cfg)
 	for _, s := range cfg.ResourceScopes {
-		if !s.Enabled {
-			continue
-		}
-		if !matchPatterns(s.APIGroups, ac.APIGroup) {
-			continue
-		}
-		if !matchPatterns(s.Resources, ac.Resource) {
-			continue
-		}
-		if !matchPatterns(s.Kinds, ac.Kind) {
-			continue
-		}
-		if !matchPatterns(s.Namespaces, namespaceOrCluster(ac.Namespace)) {
-			continue
-		}
-		if !matchPatterns(s.Names, nameOrWildcard(ac.Name)) {
+		if !refs[s.ID] || !resourceScopeMatches(s, ac) {
 			continue
 		}
 		out = append(out, s)
 	}
 	return out
+}
+
+func referencedScopeIDs(cfg *RuntimeConfig) map[string]bool {
+	refs := map[string]bool{}
+	if cfg == nil {
+		return refs
+	}
+	for _, r := range cfg.Rules {
+		if !r.Enabled {
+			continue
+		}
+		for _, id := range r.ScopeIDs {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				refs[id] = true
+			}
+		}
+	}
+	return refs
+}
+
+func matchingScopeIDsForRule(cfg *RuntimeConfig, r PolicyRule, ac AdmissionContext) []string {
+	if cfg == nil || len(r.ScopeIDs) == 0 {
+		return nil
+	}
+	want := map[string]bool{}
+	for _, id := range r.ScopeIDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			want[id] = true
+		}
+	}
+	out := []string{}
+	for _, s := range cfg.ResourceScopes {
+		if !want[s.ID] || !resourceScopeMatches(s, ac) {
+			continue
+		}
+		out = append(out, s.ID)
+	}
+	return out
+}
+
+func resourceScopeMatches(s ResourceScope, ac AdmissionContext) bool {
+	if !s.Enabled {
+		return false
+	}
+	if !matchPatterns(s.APIGroups, ac.APIGroup) {
+		return false
+	}
+	if !matchPatterns(s.Resources, ac.Resource) {
+		return false
+	}
+	if !matchPatterns(s.Kinds, ac.Kind) {
+		return false
+	}
+	if !matchPatterns(s.Namespaces, namespaceOrCluster(ac.Namespace)) {
+		return false
+	}
+	if !matchPatterns(s.Names, nameOrWildcard(ac.Name)) {
+		return false
+	}
+	return true
 }
 
 func matchActorGroups(cfg *RuntimeConfig, ids []string, ac AdmissionContext) bool {

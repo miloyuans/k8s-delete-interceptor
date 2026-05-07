@@ -131,6 +131,7 @@ func (a *App) startBackground(ctx context.Context) {
 	go a.telegramNotificationLoop(ctx)
 	go a.telegramCallbackPollingLoop(ctx)
 	go a.retentionMaintenanceLoop(ctx)
+	go a.telegramQueueCleanupLoop(ctx)
 	go func() {
 		waitContext(ctx, 2*time.Second)
 		a.emitStartupNotification(context.Background())

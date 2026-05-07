@@ -258,6 +258,7 @@ func (a *App) telegramNotificationLoop(ctx context.Context) {
 	idle := envDuration("TELEGRAM_NOTIFY_IDLE_POLL", 2*time.Second)
 	lease := telegramLease()
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	lastQueueCleanup := time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -268,7 +269,16 @@ func (a *App) telegramNotificationLoop(ctx context.Context) {
 			waitContext(ctx, idle)
 			continue
 		}
-		pending, err := a.mongo.CountRunnableTelegramNotifications(ctx, time.Now().UTC())
+		now := time.Now().UTC()
+		if lastQueueCleanup.IsZero() || now.Sub(lastQueueCleanup) >= 30*time.Second {
+			lastQueueCleanup = now
+			if stats, err := a.cleanupUselessTelegramQueue(ctx, a.Config()); err != nil {
+				log.Printf("telegram dispatcher cleanup failed owner=%s err=%v", owner, err)
+			} else if telegramQueueCleanupStatsNonZero(stats) {
+				log.Printf("telegram dispatcher cleanup completed owner=%s stale_admission=%d expired_queue=%d", owner, stats.StaleAdmission, stats.ExpiredQueue)
+			}
+		}
+		pending, err := a.mongo.CountRunnableTelegramNotifications(ctx, now)
 		if err != nil {
 			log.Printf("telegram dispatcher probe failed owner=%s err=%v", owner, err)
 			waitContext(ctx, idle)
@@ -455,10 +465,31 @@ func (a *App) sendTelegramNotificationNow(ctx context.Context, n *TelegramNotifi
 			}
 		}
 	} else if n.Kind == NotifyKindAdmissionEvent && n.EventID != "" {
-		if ev, err := a.getAdmissionEvent(ctx, n.EventID); err == nil && ev != nil {
-			if kb := eventKeyboardFor(ev, n.ID); kb != nil {
-				markup = kb
+		ev, err := a.getAdmissionEvent(ctx, n.EventID)
+		if err != nil || ev == nil {
+			return fmt.Errorf("admission event unavailable for notification event=%s: %v", n.EventID, err)
+		}
+		cfg := a.Config()
+		pd, ok, reason := admissionNotificationPolicyStillApplies(cfg, n, ev)
+		if !ok {
+			log.Printf("telegram notification dropped stale: id=%s event=%s rule=%s reason=%s", n.ID, n.EventID, n.RuleID, reason)
+			if a.mongo != nil && a.mongo.Healthy() {
+				_ = a.mongo.DeleteTelegramNotifications(ctx, []string{n.ID}, "stale admission notification: "+reason)
 			}
+			return nil
+		}
+		if pd.Rule != nil {
+			if tpl := findTemplate(cfg, pd.Rule.Notify.TemplateID); tpl != nil && tpl.Enabled {
+				if rendered, e := renderTemplate(cfg, tg, ev, pd, *tpl); e == nil {
+					text = rendered
+					parseMode = tpl.ParseMode
+				} else {
+					log.Printf("telegram notification rerender failed: id=%s event=%s template=%s err=%v", n.ID, n.EventID, tpl.ID, e)
+				}
+			}
+		}
+		if kb := eventKeyboardFor(ev, n.ID); kb != nil {
+			markup = kb
 		}
 	}
 	log.Printf("telegram notification sending: id=%s kind=%s event=%s bot_id=%s chat_id=%s source=%s", n.ID, n.Kind, n.EventID, bot.ID, n.ChatID, source)
@@ -694,6 +725,43 @@ func resolveTelegramTargets(tg *TelegramConfig, bind NotificationBinding) []tele
 		}
 	}
 	return out
+}
+
+func admissionNotificationPolicyStillApplies(cfg *RuntimeConfig, n *TelegramNotificationEvent, ev *AdmissionEvent) (PolicyDecision, bool, string) {
+	if cfg == nil {
+		return PolicyDecision{}, false, "runtime config unavailable"
+	}
+	if n == nil || ev == nil {
+		return PolicyDecision{}, false, "notification or event unavailable"
+	}
+	ac := admissionContextFromStoredEvent(ev)
+	pd := decide(cfg, ac)
+	if !shouldNotify(pd) || pd.Rule == nil || !pd.Rule.Notify.Enabled {
+		return pd, false, "current policy no longer requires telegram notification"
+	}
+	if strings.TrimSpace(n.RuleID) != "" && pd.Rule.ID != n.RuleID {
+		return pd, false, fmt.Sprintf("rule changed: queued=%s current=%s", n.RuleID, pd.Rule.ID)
+	}
+	if strings.TrimSpace(ev.RuleID) != "" && pd.Rule.ID != ev.RuleID {
+		return pd, false, fmt.Sprintf("event rule changed: event=%s current=%s", ev.RuleID, pd.Rule.ID)
+	}
+	return pd, true, ""
+}
+
+func admissionContextFromStoredEvent(ev *AdmissionEvent) AdmissionContext {
+	objMap := map[string]any{}
+	oldMap := map[string]any{}
+	if len(ev.Object) > 0 {
+		_ = json.Unmarshal(ev.Object, &objMap)
+	}
+	if len(ev.OldObject) > 0 {
+		_ = json.Unmarshal(ev.OldObject, &oldMap)
+	}
+	return AdmissionContext{
+		Operation: ev.Operation, APIGroup: ev.APIGroup, APIVersion: ev.APIVersion, Resource: ev.Resource, SubResource: ev.SubResource,
+		Kind: ev.Kind, Namespace: ev.Namespace, Name: ev.Name, User: ev.User, Groups: ev.Groups,
+		Object: objMap, OldObject: oldMap, ObjectRaw: ev.Object, OldObjectRaw: ev.OldObject, RequestUID: ev.RequestUID,
+	}
 }
 
 func renderTemplate(cfg *RuntimeConfig, tg *TelegramConfig, ev *AdmissionEvent, pd PolicyDecision, tpl NotificationTemplate) (string, error) {

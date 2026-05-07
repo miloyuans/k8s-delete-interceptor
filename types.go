@@ -228,6 +228,7 @@ type PersistenceSettings struct {
 	TelegramInteractionTTL  string `json:"telegram_interaction_ttl" yaml:"telegram_interaction_ttl" bson:"telegram_interaction_ttl"`
 	DeleteApprovalTimeout   string `json:"delete_approval_timeout" yaml:"delete_approval_timeout" bson:"delete_approval_timeout"`
 	DuplicateEventWindow    string `json:"duplicate_event_window" yaml:"duplicate_event_window" bson:"duplicate_event_window"`
+	TelegramQueueCleanupTTL string `json:"telegram_queue_cleanup_ttl" yaml:"telegram_queue_cleanup_ttl" bson:"telegram_queue_cleanup_ttl"`
 	ArchiveBatchSize        int    `json:"archive_batch_size" yaml:"archive_batch_size" bson:"archive_batch_size"`
 	TelegramCallbackPolling bool   `json:"telegram_callback_polling" yaml:"telegram_callback_polling" bson:"telegram_callback_polling"`
 }

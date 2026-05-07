@@ -19,6 +19,8 @@ import (
 	"sync"
 	"text/template"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 type telegramSendMessageRequest struct {
@@ -34,6 +36,34 @@ type telegramEditMessageRequest struct {
 	Text        string `json:"text"`
 	ParseMode   string `json:"parse_mode,omitempty"`
 	ReplyMarkup any    `json:"reply_markup,omitempty"`
+}
+
+type telegramCallbackAnswerRequest struct {
+	CallbackQueryID string `json:"callback_query_id"`
+	Text            string `json:"text,omitempty"`
+	ShowAlert       bool   `json:"show_alert,omitempty"`
+}
+
+type telegramUpdate struct {
+	UpdateID      int64                  `json:"update_id"`
+	CallbackQuery *telegramCallbackQuery `json:"callback_query"`
+}
+
+type telegramCallbackQuery struct {
+	ID   string `json:"id"`
+	From struct {
+		ID        int64  `json:"id"`
+		Username  string `json:"username"`
+		FirstName string `json:"first_name"`
+		LastName  string `json:"last_name"`
+	} `json:"from"`
+	Message struct {
+		MessageID int64 `json:"message_id"`
+		Chat      struct {
+			ID int64 `json:"id"`
+		} `json:"chat"`
+	} `json:"message"`
+	Data string `json:"data"`
 }
 
 type telegramSendResult struct {
@@ -409,13 +439,8 @@ func (a *App) sendTelegramNotificationNow(ctx context.Context, n *TelegramNotifi
 	if n.Kind == NotifyKindConfigChange && n.ChangeID != "" {
 		if cr, err := a.getConfigChange(ctx, n.ChangeID); err == nil && cr != nil {
 			text = configChangeTelegramText(cr)
-			web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
-			if web != "" {
-				buttonText := "打开 Web 审批"
-				if cr.Status != ChangePending {
-					buttonText = "打开 Web 查看"
-				}
-				markup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": buttonText, "url": web + "/?change=" + cr.ID}}}}
+			if kb := configChangeKeyboard(cr, n.ID); kb != nil {
+				markup = kb
 			}
 		}
 	}
@@ -670,7 +695,7 @@ func renderTemplate(cfg *RuntimeConfig, tg *TelegramConfig, ev *AdmissionEvent, 
 		}
 	}
 	data := map[string]string{
-		"cluster": escapeForMode(ev.Cluster, tpl.ParseMode), "operation": escapeForMode(ev.Operation, tpl.ParseMode), "kind": escapeForMode(ev.Kind, tpl.ParseMode),
+		"cluster": escapeForMode(ev.Cluster, tpl.ParseMode), "operation": escapeForMode(ev.Operation, tpl.ParseMode), "operation_cn": escapeForMode(operationCN(ev.Operation), tpl.ParseMode), "kind": escapeForMode(ev.Kind, tpl.ParseMode),
 		"namespace": escapeForMode(ev.Namespace, tpl.ParseMode), "name": escapeForMode(ev.Name, tpl.ParseMode), "resource": escapeForMode(ev.Resource, tpl.ParseMode),
 		"user": escapeForMode(ev.User, tpl.ParseMode), "actor_display": escapeForMode(actorDisplay, tpl.ParseMode), "rule_name": escapeForMode(ev.RuleName, tpl.ParseMode),
 		"reason": escapeForMode(ev.Reason, tpl.ParseMode), "change_class": escapeForMode(ev.ChangeClass, tpl.ParseMode), "change_summary": escapeForMode(ev.ChangeSummary, tpl.ParseMode),
@@ -686,6 +711,19 @@ func renderTemplate(cfg *RuntimeConfig, tg *TelegramConfig, ev *AdmissionEvent, 
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+func operationCN(op string) string {
+	switch strings.ToUpper(strings.TrimSpace(op)) {
+	case "CREATE":
+		return "创建"
+	case "UPDATE":
+		return "更新"
+	case "DELETE":
+		return "删除"
+	default:
+		return op
+	}
 }
 
 func telegramMention(u TelegramUser, mode string) string {
@@ -939,20 +977,265 @@ func webURL(base, path string, params map[string]string) string {
 }
 
 func eventKeyboardFor(ev *AdmissionEvent, notificationID string) any {
-	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
-	if web == "" {
+	return eventKeyboardForStatus(ev, notificationID, "")
+}
+
+func eventKeyboardForStatus(ev *AdmissionEvent, notificationID, status string) any {
+	if ev == nil || notificationID == "" {
 		return nil
 	}
-	buttons := [][]map[string]string{{{"text": "打开 Web 详情", "url": webURL(web, "/events", map[string]string{"event": ev.ID, "ntf": notificationID})}}}
-	if ev.RollbackID != "" {
-		buttons = append(buttons, []map[string]string{{"text": "查看回滚", "url": webURL(web, "/events", map[string]string{"event": ev.ID, "rollback": ev.RollbackID, "ntf": notificationID})}})
+	buttons := [][]map[string]string{}
+	if ev.RollbackID != "" && !strings.Contains(status, "回滚已执行") {
+		buttons = append(buttons, []map[string]string{{"text": "执行回滚", "callback_data": "ev:rollback:" + notificationID}})
 	}
+	buttons = append(buttons, []map[string]string{{"text": "下载 YAML", "callback_data": "ev:yaml:" + notificationID}})
 	return map[string]any{"inline_keyboard": buttons}
 }
 
+func configChangeKeyboard(cr *ConfigChangeRequest, notificationID string) any {
+	if cr == nil || notificationID == "" {
+		return nil
+	}
+	rows := [][]map[string]string{}
+	if cr.Status == ChangePending {
+		rows = append(rows, []map[string]string{{"text": "✅ 同意变更", "callback_data": "cfg:approve:" + notificationID}, {"text": "❌ 拒绝变更", "callback_data": "cfg:reject:" + notificationID}})
+	}
+	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
+	if web != "" {
+		rows = append(rows, []map[string]string{{"text": "打开 Web 查看", "url": webURL(web, "/changes", map[string]string{"change": cr.ID, "ntf": notificationID})}})
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	return map[string]any{"inline_keyboard": rows}
+}
+
 func (a *App) handleTelegramWebhook(w http.ResponseWriter, r *http.Request) {
-	// 当前版本将 Telegram 作为通知与跳转入口，审批/回滚统一落到 Web Console。
-	// 保留此入口，后续可把 callback_data 接入 approval 状态机。
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+		return
+	}
+	var up telegramUpdate
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&up); err != nil {
+		log.Printf("telegram webhook decode failed: %v", err)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+		return
+	}
+	if up.CallbackQuery != nil {
+		go a.handleTelegramCallback(context.Background(), up.CallbackQuery)
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
+}
+
+func (a *App) handleTelegramCallback(ctx context.Context, cb *telegramCallbackQuery) {
+	if cb == nil {
+		return
+	}
+	parts := strings.Split(cb.Data, ":")
+	if len(parts) != 3 {
+		log.Printf("telegram callback ignored: unexpected data=%q", cb.Data)
+		return
+	}
+	kind, action, notificationID := parts[0], parts[1], parts[2]
+	n, err := a.mongo.GetTelegramNotification(ctx, notificationID)
+	if err != nil || n == nil {
+		log.Printf("telegram callback notification not found: data=%s err=%v", cb.Data, err)
+		return
+	}
+	tg, err := a.getTelegramConfig(ctx)
+	if err != nil || !tg.Enabled {
+		log.Printf("telegram callback skipped: telegram config unavailable notification=%s err=%v", notificationID, err)
+		return
+	}
+	bot := findTelegramBot(tg, n.BotID)
+	if bot == nil || !bot.Enabled {
+		log.Printf("telegram callback skipped: bot unavailable bot_id=%s notification=%s", n.BotID, notificationID)
+		return
+	}
+	token, _ := telegramTokenForBotKey(*bot, notificationID+"|callback")
+	if token == "" {
+		log.Printf("telegram callback skipped: token empty bot_id=%s notification=%s", n.BotID, notificationID)
+		return
+	}
+	actor := telegramCallbackActor(cb)
+	chatID := n.ChatID
+	if chatID == "" && cb.Message.Chat.ID != 0 {
+		chatID = strconv.FormatInt(cb.Message.Chat.ID, 10)
+	}
+	switch kind {
+	case "cfg":
+		a.handleConfigChangeTelegramCallback(ctx, token, n, action, actor, cb.ID)
+	case "ev":
+		a.handleEventTelegramCallback(ctx, token, chatID, n, action, actor, cb.ID)
+	default:
+		_ = answerTelegramCallback(ctx, token, cb.ID, "未知操作", true)
+	}
+}
+
+func telegramCallbackActor(cb *telegramCallbackQuery) string {
+	if cb == nil {
+		return "telegram:unknown"
+	}
+	if cb.From.Username != "" {
+		return "@" + strings.TrimPrefix(cb.From.Username, "@")
+	}
+	name := strings.TrimSpace(cb.From.FirstName + " " + cb.From.LastName)
+	if name != "" {
+		return name
+	}
+	if cb.From.ID != 0 {
+		return "telegram:" + strconv.FormatInt(cb.From.ID, 10)
+	}
+	return "telegram:unknown"
+}
+
+func (a *App) handleConfigChangeTelegramCallback(ctx context.Context, token string, n *TelegramNotificationEvent, action, actor, callbackID string) {
+	cr, err := a.getConfigChange(ctx, n.ChangeID)
+	if err != nil || cr == nil {
+		_ = answerTelegramCallback(ctx, token, callbackID, "配置变更不存在", true)
+		return
+	}
+	if cr.Status != ChangePending {
+		_ = answerTelegramCallback(ctx, token, callbackID, "该变更已处理: "+cr.Status, true)
+		go a.updateConfigChangeTelegramStatus(context.Background(), cr)
+		return
+	}
+	user := &AuthUser{Username: "telegram:" + actor, DisplayName: actor, Roles: []string{"telegram_approver"}, Permissions: []string{PermConfigApprove}}
+	var next *ConfigChangeRequest
+	if action == "approve" {
+		next, err = a.approveConfigChange(ctx, cr.ID, cr.EventID, "telegram approved by "+actor, user)
+	} else if action == "reject" {
+		next, err = a.rejectConfigChange(ctx, cr.ID, cr.EventID, "telegram rejected by "+actor, user)
+	} else {
+		_ = answerTelegramCallback(ctx, token, callbackID, "未知审批动作", true)
+		return
+	}
+	if err != nil {
+		_ = answerTelegramCallback(ctx, token, callbackID, "处理失败: "+err.Error(), true)
+		return
+	}
+	_ = answerTelegramCallback(ctx, token, callbackID, "处理完成: "+next.Status, false)
+	go a.updateConfigChangeTelegramStatus(context.Background(), next)
+}
+
+func (a *App) handleEventTelegramCallback(ctx context.Context, token, chatID string, n *TelegramNotificationEvent, action, actor, callbackID string) {
+	ev, err := a.getAdmissionEvent(ctx, n.EventID)
+	if err != nil || ev == nil {
+		_ = answerTelegramCallback(ctx, token, callbackID, "事件不存在", true)
+		return
+	}
+	switch action {
+	case "yaml":
+		yml, err := a.eventYAMLString(ctx, ev, false)
+		if err != nil {
+			_ = answerTelegramCallback(ctx, token, callbackID, "YAML 生成失败: "+err.Error(), true)
+			return
+		}
+		if len(yml) > 3500 {
+			yml = yml[:3500] + "\n# YAML 内容较长，已截断；完整内容请在 Web 历史事件里下载。"
+		}
+		msg := fmt.Sprintf("📄 YAML 导出\n事件: `%s`\n资源: `%s/%s/%s`\n\n```yaml\n%s\n```", ev.ID, ev.Kind, ev.Namespace, ev.Name, yml)
+		if err := sendTelegram(ctx, token, chatID, msg, "Markdown", nil); err != nil {
+			_ = answerTelegramCallback(ctx, token, callbackID, "发送 YAML 失败: "+err.Error(), true)
+			return
+		}
+		_ = answerTelegramCallback(ctx, token, callbackID, "YAML 已发送", false)
+		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("📄 %s 已下载 YAML", actor))
+	case "rollback":
+		if ev.RollbackID == "" {
+			_ = answerTelegramCallback(ctx, token, callbackID, "该事件没有回滚备份", true)
+			return
+		}
+		res, err := a.executeRollback(ctx, ev.RollbackID, false)
+		if err != nil {
+			_ = answerTelegramCallback(ctx, token, callbackID, "回滚失败: "+err.Error(), true)
+			go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("❌ %s 执行回滚失败: %s", actor, err.Error()))
+			return
+		}
+		_ = answerTelegramCallback(ctx, token, callbackID, "回滚已执行", true)
+		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("✅ 回滚已执行\n执行人: %s\n结果: %s", actor, res))
+	default:
+		_ = answerTelegramCallback(ctx, token, callbackID, "未知事件动作", true)
+	}
+}
+
+func (a *App) eventYAMLString(ctx context.Context, ev *AdmissionEvent, old bool) (string, error) {
+	if ev == nil {
+		return "", fmt.Errorf("event is nil")
+	}
+	raw := ev.Object
+	if old {
+		raw = ev.OldObject
+	}
+	if len(raw) == 0 {
+		return "", fmt.Errorf("event object is empty")
+	}
+	var obj any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return "", err
+	}
+	b, err := yaml.Marshal(obj)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func (a *App) updateEventTelegramStatus(ctx context.Context, ev *AdmissionEvent, status string) {
+	if ev == nil || a.mongo == nil || !a.mongo.Healthy() {
+		return
+	}
+	ns, err := a.mongo.ListTelegramNotificationsByEvent(ctx, ev.ID)
+	if err != nil {
+		log.Printf("event telegram status update list failed: event=%s err=%v", ev.ID, err)
+		return
+	}
+	tg, err := a.getTelegramConfig(ctx)
+	if err != nil || !tg.Enabled {
+		return
+	}
+	for _, n := range ns {
+		if n.MessageID == 0 || n.ChatID == "" || n.BotID == "" {
+			continue
+		}
+		bot := findTelegramBot(tg, n.BotID)
+		if bot == nil || !bot.Enabled {
+			continue
+		}
+		token, _ := telegramTokenForBotKey(*bot, n.ID+"|status")
+		if token == "" {
+			continue
+		}
+		text := n.Text + "\n\n" + status
+		markup := eventKeyboardForStatus(ev, n.ID, status)
+		if err := editTelegramMessage(ctx, token, n.ChatID, n.MessageID, text, n.ParseMode, markup); err != nil {
+			log.Printf("event telegram status update failed: event=%s notification=%s err=%v", ev.ID, n.ID, err)
+		}
+	}
+}
+
+func answerTelegramCallback(ctx context.Context, token, callbackID, text string, alert bool) error {
+	if token == "" || callbackID == "" {
+		return nil
+	}
+	payload := telegramCallbackAnswerRequest{CallbackQueryID: callbackID, Text: text, ShowAlert: alert}
+	b, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://api.telegram.org/bot%s/answerCallbackQuery", token), bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("telegram answerCallbackQuery status %s: %s", resp.Status, strings.TrimSpace(string(detail)))
+	}
+	return nil
 }

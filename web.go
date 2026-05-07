@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -191,11 +192,14 @@ func (a *App) handleMetadata(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	q := parseEventQuery(r)
 	merged := []AdmissionEvent{}
 	seen := map[string]bool{}
+	mongoOK := false
 	if a.mongo != nil && a.mongo.Healthy() {
 		if events, err := a.mongo.ListEventsByQuery(r.Context(), q); err == nil {
+			mongoOK = true
 			for _, ev := range events {
 				if ev.ID != "" && !seen[ev.ID] {
 					seen[ev.ID] = true
@@ -206,23 +210,55 @@ func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 			log.Printf("events mongo query failed, falling back to local spool: err=%v", err)
 		}
 	}
-	if localEvents, err := a.local.ListRecentEventsByQuery(q); err == nil {
-		for _, ev := range localEvents {
-			if ev.ID != "" && !seen[ev.ID] {
-				seen[ev.ID] = true
-				merged = append(merged, ev)
+	includeLocal := shouldIncludeLocalEvents(r, mongoOK, q, len(merged))
+	if includeLocal {
+		if localEvents, err := a.local.ListRecentEventsByQuery(q); err == nil {
+			for _, ev := range localEvents {
+				if ev.ID != "" && !seen[ev.ID] {
+					seen[ev.ID] = true
+					merged = append(merged, ev)
+				}
 			}
+		} else if len(merged) == 0 {
+			http.Error(w, err.Error(), 500)
+			return
+		} else {
+			log.Printf("events local spool query skipped after error: err=%v", err)
 		}
-	} else if len(merged) == 0 {
-		http.Error(w, err.Error(), 500)
-		return
 	}
 	sort.Slice(merged, func(i, j int) bool { return merged[i].Time.After(merged[j].Time) })
 	limit := q.NormalizedLimit(200)
 	if len(merged) > limit {
 		merged = merged[:limit]
 	}
+	log.Printf("events query completed: mongo_ok=%v include_local=%v count=%d limit=%d elapsed=%s id=%s ns=%s resource=%s user=%s", mongoOK, includeLocal, len(merged), limit, time.Since(start), q.ID, q.Namespace, q.Resource, q.User)
 	writeJSON(w, merged)
+}
+
+func shouldIncludeLocalEvents(r *http.Request, mongoOK bool, q EventQuery, mongoCount int) bool {
+	v := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("include_local")))
+	if v == "1" || v == "true" || v == "yes" {
+		return true
+	}
+	if v == "0" || v == "false" || v == "no" {
+		return false
+	}
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("EVENT_QUERY_INCLUDE_LOCAL")))
+	if mode == "always" || mode == "true" || mode == "1" {
+		return true
+	}
+	if mode == "never" || mode == "false" || mode == "0" {
+		return false
+	}
+	// Default: avoid walking large local spool directories on every history query.
+	// Use local spool only when Mongo is unavailable, direct event lookup misses, or Mongo returned no rows.
+	if !mongoOK {
+		return true
+	}
+	if q.ID != "" && mongoCount == 0 {
+		return true
+	}
+	return false
 }
 
 func (a *App) handleEventYAML(w http.ResponseWriter, r *http.Request) {

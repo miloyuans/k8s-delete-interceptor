@@ -400,8 +400,12 @@ func (a *App) notifyConfigChange(ctx context.Context, cr *ConfigChangeRequest) {
 		}
 		n := &TelegramNotificationEvent{Kind: NotifyKindConfigChange, EventID: cr.EventID, ChangeID: cr.ID, BotID: bot.ID, ChatID: chat.ChatID, TargetName: chat.Name, Text: text, Status: NotifyStatusPending, MaxAttempts: telegramMaxAttempts(), CreatedAt: time.Now().UTC(), NextAttemptAt: time.Now().UTC()}
 		n.ID = notificationID(n.Kind, cr.EventID, bot.ID, chat.ChatID)
-		if web != "" {
-			n.ReplyMarkup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "打开 Web 审批", "url": webURL(web, "/changes", map[string]string{"change": cr.ID, "ntf": n.ID})}}}}
+		if web != "" || cr.Status == ChangePending {
+			if kb := configChangeKeyboard(cr, n.ID); kb != nil {
+				if m, ok := kb.(map[string]any); ok {
+					n.ReplyMarkup = m
+				}
+			}
 		}
 		if err := a.enqueueTelegramNotification(ctx, n); err != nil {
 			log.Printf("config change telegram enqueue failed: bot_id=%s chat_id=%s change=%s err=%v", bot.ID, chat.ChatID, cr.ID, err)
@@ -492,18 +496,45 @@ func (a *App) updateSingleConfigChangeTelegramText(ctx context.Context, cr *Conf
 	if token == "" {
 		return
 	}
-	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
-	markup := any(nil)
-	if web != "" {
-		if buttonText == "" {
-			buttonText = "打开 Web 查看"
+	_ = buttonText
+	markup := configChangeKeyboard(cr, "")
+	if markup == nil {
+		web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
+		if web != "" {
+			markup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "打开 Web 查看", "url": webURL(web, "/changes", map[string]string{"change": cr.ID})}}}}
 		}
-		markup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": buttonText, "url": webURL(web, "/changes", map[string]string{"change": cr.ID})}}}}
 	}
 	if err := editTelegramMessage(ctx, token, ref.ChatID, ref.MessageID, text, "", markup); err != nil {
 		log.Printf("config change telegram status update failed: bot_id=%s chat_id=%s message_id=%d source=%s change=%s err=%v", bot.ID, ref.ChatID, ref.MessageID, source, cr.ID, err)
 	} else {
 		log.Printf("config change telegram status updated: bot_id=%s chat_id=%s message_id=%d change=%s status=%s", bot.ID, ref.ChatID, ref.MessageID, cr.ID, cr.Status)
+	}
+}
+
+func (a *App) updateSingleConfigChangeTelegramTextWithMarkup(ctx context.Context, cr *ConfigChangeRequest, ref TelegramMessageRef, text string, markup any) {
+	if cr == nil || ref.MessageID == 0 || ref.ChatID == "" || ref.BotID == "" {
+		return
+	}
+	tg, err := a.getTelegramConfig(ctx)
+	if err != nil || !tg.Enabled {
+		return
+	}
+	bot := findTelegramBot(tg, ref.BotID)
+	if bot == nil || !bot.Enabled {
+		return
+	}
+	token, source := telegramTokenForBotKey(*bot, cr.ID+"|"+ref.ChatID)
+	if token == "" {
+		return
+	}
+	if markup == nil {
+		web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
+		if web != "" {
+			markup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "打开 Web 查看", "url": webURL(web, "/changes", map[string]string{"change": cr.ID})}}}}
+		}
+	}
+	if err := editTelegramMessage(ctx, token, ref.ChatID, ref.MessageID, text, "", markup); err != nil {
+		log.Printf("config change telegram viewed update failed: bot_id=%s chat_id=%s message_id=%d source=%s change=%s err=%v", bot.ID, ref.ChatID, ref.MessageID, source, cr.ID, err)
 	}
 }
 
@@ -515,21 +546,20 @@ func (a *App) updateConfigChangeTelegramViewed(ctx context.Context, changeID, vi
 	if err != nil || cr == nil || cr.Status != ChangePending {
 		return
 	}
-	refs := cr.NotificationMessages
-	if len(refs) == 0 && a.mongo != nil && a.mongo.Healthy() {
-		if ns, e := a.mongo.ListTelegramNotificationsByChange(ctx, changeID); e == nil {
+	text := configChangeTelegramTextWithView(cr, viewedBy)
+	if a.mongo != nil && a.mongo.Healthy() {
+		if ns, e := a.mongo.ListTelegramNotificationsByChange(ctx, changeID); e == nil && len(ns) > 0 {
 			for _, n := range ns {
-				if n.MessageID > 0 {
-					refs = append(refs, TelegramMessageRef{BotID: n.BotID, ChatID: n.ChatID, MessageID: n.MessageID})
+				if n.MessageID == 0 {
+					continue
 				}
+				ref := TelegramMessageRef{BotID: n.BotID, ChatID: n.ChatID, MessageID: n.MessageID}
+				a.updateSingleConfigChangeTelegramTextWithMarkup(ctx, cr, ref, text, configChangeKeyboard(cr, n.ID))
 			}
+			return
 		}
 	}
-	if len(refs) == 0 {
-		return
-	}
-	text := configChangeTelegramTextWithView(cr, viewedBy)
-	for _, ref := range refs {
+	for _, ref := range cr.NotificationMessages {
 		a.updateSingleConfigChangeTelegramText(ctx, cr, ref, text, "打开 Web 查看")
 	}
 }

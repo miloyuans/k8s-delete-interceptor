@@ -124,7 +124,24 @@ func ensureBuiltInConfigObjects(c *RuntimeConfig) {
 		c.NotificationTemplates = append(c.NotificationTemplates, tpl)
 	}
 	ensureScope(ResourceScope{ID: "internal_mongo_assets", Name: "内置 Mongo 系统资产", Enabled: true, APIGroups: []string{"*"}, Resources: []string{"*"}, Kinds: []string{"*"}, Namespaces: []string{"*"}, Names: []string{"delete-interceptor-mongodb*", "*mongodb*"}})
-	ensureTemplate(NotificationTemplate{ID: "tpl_create_notify", Name: "重要创建通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🆕 *K8s 资源创建*\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: {{.actor_display}}\n规则: `{{.rule_name}}`\n原因: {{.reason}}\nWeb: {{.event_url}}"})
+	ensureTemplate(NotificationTemplate{ID: "tpl_create_notify", Name: "重要创建通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🆕 *K8s 创建操作审计通知*\n动作: ✅ 放行\n集群: `{{.cluster}}`\n资源类型: `{{.kind}}`\n资源名称: `{{.name}}`\n命名空间: `{{.namespace}}`\n用户: {{.actor_display}}\n操作: 创建\n原因: {{.reason}}\n请求ID: `{{.request_uid}}`\n{{.time}}"})
+	// Migrate legacy built-in templates that embedded fixed Web event URLs.
+	// Admission event notifications should rely on Telegram callback buttons instead;
+	// only config-change approval messages carry an optional Web review link.
+	if strings.ToLower(envOr("TEMPLATE_AUTO_MIGRATE_WEB_LINKS", "true")) != "false" {
+		builtins := map[string]NotificationTemplate{}
+		for _, tpl := range defaultNotificationTemplates() {
+			builtins[tpl.ID] = tpl
+		}
+		for i := range c.NotificationTemplates {
+			if tpl, ok := builtins[c.NotificationTemplates[i].ID]; ok && strings.Contains(c.NotificationTemplates[i].Body, "event_url") {
+				c.NotificationTemplates[i].Name = tpl.Name
+				c.NotificationTemplates[i].Channel = tpl.Channel
+				c.NotificationTemplates[i].ParseMode = tpl.ParseMode
+				c.NotificationTemplates[i].Body = tpl.Body
+			}
+		}
+	}
 	for i := range c.ResourceScopes {
 		if scopeNeedsCoreAPIGroup(c.ResourceScopes[i]) && !stringSliceContains(c.ResourceScopes[i].APIGroups, "") && !stringSliceContains(c.ResourceScopes[i].APIGroups, "*") {
 			c.ResourceScopes[i].APIGroups = append([]string{""}, c.ResourceScopes[i].APIGroups...)
@@ -298,10 +315,10 @@ func defaultActors() []ActorGroup {
 
 func defaultTemplates() []NotificationTemplate {
 	return []NotificationTemplate{
-		{ID: "tpl_delete_approval", Name: "删除审批通知", Channel: "telegram", ParseMode: "MarkdownV2", Enabled: true, Body: "🚨 *K8s 删除审批*\n*集群*: `{{.cluster}}`\n*资源*: `{{.kind}}/{{.namespace}}/{{.name}}`\n*用户*: {{.actor_display}}\n*规则*: `{{.rule_name}}`\n*原因*: {{.reason}}\n*审批人*: {{.approvers_mentions}}\n*Web*: {{.event_url}}\n*请求ID*: `{{.request_uid}}`"},
-		{ID: "tpl_update_notify", Name: "重要更新通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "📝 *K8s 重要更新*\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: {{.actor_display}}\n变更: {{.change_summary}}\nWeb: {{.event_url}}"},
-		{ID: "tpl_create_notify", Name: "重要创建通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🆕 *K8s 资源创建*\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: {{.actor_display}}\n规则: `{{.rule_name}}`\n原因: {{.reason}}\nWeb: {{.event_url}}"},
-		{ID: "tpl_block", Name: "拦截通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "⛔ *K8s 请求已拦截*\n集群: `{{.cluster}}`\n操作: `{{.operation}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: {{.actor_display}}\n原因: {{.reason}}\nWeb: {{.event_url}}"},
+		{ID: "tpl_delete_approval", Name: "删除审批通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🚨 *K8s 删除操作审批通知*\n动作: ⏳ 待审批\n集群: `{{.cluster}}`\n资源类型: `{{.kind}}`\n资源名称: `{{.name}}`\n命名空间: `{{.namespace}}`\n用户: {{.actor_display}}\n操作: 删除\n规则: `{{.rule_name}}`\n原因: {{.reason}}\n审批人: {{.approvers_mentions}}\n请求ID: `{{.request_uid}}`\n{{.time}}"},
+		{ID: "tpl_update_notify", Name: "重要更新通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "📝 *K8s 更新操作审计通知*\n动作: ✅ 放行\n集群: `{{.cluster}}`\n资源类型: `{{.kind}}`\n资源名称: `{{.name}}`\n命名空间: `{{.namespace}}`\n用户: {{.actor_display}}\n操作: 更新\n变更详情: {{.change_summary}}\n请求ID: `{{.request_uid}}`\n{{.time}}"},
+		{ID: "tpl_create_notify", Name: "重要创建通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🆕 *K8s 创建操作审计通知*\n动作: ✅ 放行\n集群: `{{.cluster}}`\n资源类型: `{{.kind}}`\n资源名称: `{{.name}}`\n命名空间: `{{.namespace}}`\n用户: {{.actor_display}}\n操作: 创建\n原因: {{.reason}}\n请求ID: `{{.request_uid}}`\n{{.time}}"},
+		{ID: "tpl_block", Name: "拦截通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "⛔ *K8s 操作拦截通知*\n动作: ⛔ 拦截\n集群: `{{.cluster}}`\n资源类型: `{{.kind}}`\n资源名称: `{{.name}}`\n命名空间: `{{.namespace}}`\n用户: {{.actor_display}}\n操作: {{.operation_cn}}\n原因: {{.reason}}\n请求ID: `{{.request_uid}}`\n{{.time}}"},
 	}
 }
 

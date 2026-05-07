@@ -642,6 +642,29 @@ func (m *MongoStore) ListTelegramNotificationsByChange(ctx context.Context, chan
 	return out, nil
 }
 
+func (m *MongoStore) ListTelegramNotificationsByEvent(ctx context.Context, eventID string) ([]TelegramNotificationEvent, error) {
+	if m == nil {
+		return nil, errors.New("mongo unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cur, err := m.db.Collection("telegram_notification_events").Find(ctx, bson.M{"event_id": eventID, "status": NotifyStatusSent}, options.Find().SetSort(bson.D{{Key: "sent_at", Value: 1}}))
+	if err != nil {
+		m.healthy.Store(false)
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	out := []TelegramNotificationEvent{}
+	for cur.Next(ctx) {
+		var ev TelegramNotificationEvent
+		if cur.Decode(&ev) == nil {
+			out = append(out, ev)
+		}
+	}
+	m.healthy.Store(true)
+	return out, nil
+}
+
 func (m *MongoStore) CompleteTelegramNotification(ctx context.Context, id string, messageID int64) error {
 	if m == nil {
 		return errors.New("mongo unavailable")

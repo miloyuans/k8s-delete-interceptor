@@ -1064,7 +1064,7 @@ func eventSearchKey(ev *AdmissionEvent) string {
 	if ev == nil || strings.TrimSpace(ev.ID) == "" {
 		return ""
 	}
-	return "查询关键字:\n1、`" + ev.ID + "`"
+	return "事件ID: `" + ev.ID + "`"
 }
 
 func eventStatusText(base string, ev *AdmissionEvent, status string) string {
@@ -1072,7 +1072,7 @@ func eventStatusText(base string, ev *AdmissionEvent, status string) string {
 	if strings.TrimSpace(status) != "" {
 		out += "\n\n" + strings.TrimSpace(status)
 	}
-	if key := eventSearchKey(ev); key != "" && !strings.Contains(out, "查询关键字") {
+	if key := eventSearchKey(ev); key != "" && !strings.Contains(out, ev.ID) {
 		out += "\n" + key
 	}
 	if web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/"); web != "" && ev != nil && !strings.Contains(out, "事件详情") {
@@ -1251,37 +1251,21 @@ func (a *App) handleEventTelegramCallback(ctx context.Context, token, chatID str
 			return
 		}
 		action, execErr := a.executeApprovedAdmissionAction(ctx, ev, actor)
-		if execErr == nil && action.Executed {
-			finalEv := ev
-			if fresh, loadErr := a.getAdmissionEvent(ctx, ev.ID); loadErr == nil && fresh != nil {
-				finalEv = fresh
-			}
-			if !finalEv.Final {
-				finalEv.Decision = DecisionAllowNotify
-				finalEv.Allowed = true
-				finalEv.Final = true
-				finalEv.LifecycleStage = "approved_executed"
-				finalEv.Reason = fmt.Sprintf("审批放行并执行完成，审批人: %s，事件ID: %s", compactActorName(actor), finalEv.ID)
-				finalEv.ChangeSummary = strings.TrimSpace(finalEv.ChangeSummary)
-				a.saveAdmissionEventState(ctx, finalEv)
-			}
-			_ = answerTelegramCallback(ctx, token, callbackID, "已审批并执行完成", false)
-			go a.updateEventTelegramStatus(context.Background(), finalEv, fmt.Sprintf("✅ 已审批放行并执行完成\n1、审批人: `%s`\n2、事件ID: `%s`\n3、执行结果: `%s`", compactActorName(actor), finalEv.ID, action.Message))
+		if execErr != nil {
+			_ = answerTelegramCallback(ctx, token, callbackID, "审批预检失败: "+execErr.Error(), true)
 			return
 		}
 		grant, grantErr := a.createAdmissionApprovalGrant(ctx, ev, actor, telegramCallbackUserID(cb))
 		if grantErr != nil {
-			_ = answerTelegramCallback(ctx, token, callbackID, "审批已通过，但执行失败且重试授权保存失败: "+grantErr.Error(), true)
-			go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("⚠️ 已审批，但集群执行失败且重试授权保存失败\n1、审批人: `%s`\n2、事件ID: `%s`\n3、错误: `%v`", compactActorName(actor), ev.ID, execErr))
+			_ = answerTelegramCallback(ctx, token, callbackID, "审批授权保存失败: "+grantErr.Error(), true)
+			go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("⚠️ 审批授权保存失败\n审批人: `%s`\n事件ID: `%s`\n错误: `%s`", compactActorName(actor), ev.ID, grantErr.Error()))
 			return
 		}
-		if execErr != nil {
-			_ = answerTelegramCallback(ctx, token, callbackID, "审批已保存，但执行失败: "+execErr.Error(), true)
-			go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("⚠️ 已审批，但集群执行失败\n1、审批人: `%s`\n2、事件ID: `%s`\n3、错误: `%s`\n4、重试授权有效期: `%s`", compactActorName(actor), ev.ID, execErr.Error(), grant.ExpiresAt.Format(time.RFC3339)))
-			return
-		}
-		_ = answerTelegramCallback(ctx, token, callbackID, "已授权一次性重试", false)
-		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("✅ 已审批放行\n1、审批人: `%s`\n2、事件ID: `%s`\n3、有效期: `%s`\n4、说明: `%s`", compactActorName(actor), ev.ID, grant.ExpiresAt.Format(time.RFC3339), action.Message))
+		ev.LifecycleStage = "approval_granted"
+		ev.Reason = fmt.Sprintf("审批放行，等待原用户重试，审批人: %s，事件ID: %s", compactActorName(actor), ev.ID)
+		a.saveAdmissionEventState(ctx, ev)
+		_ = answerTelegramCallback(ctx, token, callbackID, "已审批，请原用户重试同一删除命令", false)
+		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("✅ 已审批放行\n审批人: `%s`\n事件ID: `%s`\n有效期: `%s`\n说明: `%s`", compactActorName(actor), ev.ID, approvalGrantTTLText(grant), action.Message))
 	case "reject":
 		if ev.Decision != DecisionRequireApproval || ev.Allowed {
 			_ = answerTelegramCallback(ctx, token, callbackID, "该事件不在待审批状态", true)
@@ -1296,7 +1280,7 @@ func (a *App) handleEventTelegramCallback(ctx context.Context, token, chatID str
 		ev.LifecycleStage = "approval_rejected"
 		ev.Reason = fmt.Sprintf("审批拒绝，处理人: %s，事件ID: %s", compactActorName(actor), ev.ID)
 		a.saveAdmissionEventState(ctx, ev)
-		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("❌ 已拒绝\n1、处理人: `%s`\n2、事件ID: `%s`", compactActorName(actor), ev.ID))
+		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("❌ 已拒绝\n处理人: `%s`\n事件ID: `%s`", compactActorName(actor), ev.ID))
 	case "yaml":
 		yml, err := a.eventYAMLString(ctx, ev, false)
 		if err != nil {
@@ -1312,7 +1296,7 @@ func (a *App) handleEventTelegramCallback(ctx context.Context, token, chatID str
 			return
 		}
 		_ = answerTelegramCallback(ctx, token, callbackID, "YAML 已发送", false)
-		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("📄 YAML 已下载\n1、用户: `%s`\n2、事件ID: `%s`", compactActorName(actor), ev.ID))
+		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("📄 YAML 已下载\n用户: `%s`\n事件ID: `%s`", compactActorName(actor), ev.ID))
 	case "rollback":
 		if !telegramCanExecuteRollback(tg, cb) {
 			_ = answerTelegramCallback(ctx, token, callbackID, "未授权执行回滚", true)
@@ -1329,11 +1313,11 @@ func (a *App) handleEventTelegramCallback(ctx context.Context, token, chatID str
 		res, err := a.executeRollback(ctx, ev.RollbackID, false)
 		if err != nil {
 			_ = answerTelegramCallback(ctx, token, callbackID, "回滚失败: "+err.Error(), true)
-			go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("❌ 回滚执行失败\n1、执行人: `%s`\n2、事件ID: `%s`\n3、错误: `%s`", compactActorName(actor), ev.ID, err.Error()))
+			go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("❌ 回滚执行失败\n执行人: `%s`\n事件ID: `%s`\n错误: `%s`", compactActorName(actor), ev.ID, err.Error()))
 			return
 		}
 		_ = answerTelegramCallback(ctx, token, callbackID, "回滚已执行", true)
-		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("✅ 回滚已执行\n1、执行人: `%s`\n2、事件ID: `%s`\n3、结果: `%s`", compactActorName(actor), ev.ID, res))
+		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("✅ 回滚已执行\n执行人: `%s`\n事件ID: `%s`\n结果: `%s`", compactActorName(actor), ev.ID, res))
 	default:
 		_ = answerTelegramCallback(ctx, token, callbackID, "未知事件动作", true)
 	}

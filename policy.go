@@ -46,6 +46,9 @@ func decide(cfg *RuntimeConfig, ac AdmissionContext) PolicyDecision {
 	if isInternalMongoDelete(cfg, ac) {
 		return PolicyDecision{Decision: DecisionBlock, Allowed: false, Reason: "内置 MongoDB 系统资源禁止直接删除", ScopeMatched: true, ScopeIDs: []string{"system_internal_mongodb"}, ChangeClass: changeClass, ChangeSummary: summary}
 	}
+	if isInterceptorServiceAccountDelete(ac) {
+		return PolicyDecision{Decision: DecisionBlock, Allowed: false, Reason: "审计服务账号禁止代执行集群删除操作", ScopeMatched: true, ScopeIDs: []string{"system_self"}, ChangeClass: changeClass, ChangeSummary: summary}
+	}
 	if isWebhookSelfMaintenance(cfg, ac) {
 		return PolicyDecision{Decision: DecisionAuditOnly, Allowed: true, Reason: "webhook 自身维护资源，仅审计", ScopeMatched: true, ScopeIDs: []string{"system_self"}, ChangeClass: changeClass, ChangeSummary: summary}
 	}
@@ -92,6 +95,13 @@ func decide(cfg *RuntimeConfig, ac AdmissionContext) PolicyDecision {
 	}
 	dec := defaultDecisionFor(cfg, ac.Operation)
 	return PolicyDecision{Decision: dec, Allowed: decisionAllowed(dec), Reason: "资源在策略范围内，但未命中具体规则，默认只审计", ScopeMatched: true, ScopeIDs: scopeIDs, ChangeClass: changeClass, ChangeSummary: summary}
+}
+
+func isInterceptorServiceAccountDelete(ac AdmissionContext) bool {
+	if !strings.EqualFold(strings.TrimSpace(ac.Operation), "DELETE") {
+		return false
+	}
+	return strings.TrimSpace(ac.User) != "" && strings.TrimSpace(ac.User) == interceptorServiceAccountUser()
 }
 
 func defaultDecisionFor(cfg *RuntimeConfig, op string) string {

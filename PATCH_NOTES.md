@@ -36,20 +36,19 @@
 
 ## v3 patch
 
-- Telegram 删除审批通过后会立即代执行 DELETE：审批回调先为本服务账号写入短 TTL 的系统执行授权，再调用 Kubernetes Dynamic Client 删除目标资源，避免 Admission Webhook 自己拦截自己的代执行请求。
-- 系统代执行产生的二次 Admission 事件仅审计，不再重复触发 Telegram 通知和回滚备份，减少重复事件噪音。
+- 历史 v3 曾尝试由服务账号代执行 DELETE；v5 已废弃该方案，改为一次性授权原用户重试。
 - 非 DELETE 类审批仍保留一次性重试授权，不虚假承诺可安全复放 UPDATE/CREATE。
 - Telegram 状态更新中的查询关键字改成编号列表：event / rollback / fingerprint。
 - Telegram 模板里的用户展示改为短用户名，例如 system:serviceaccount:kube-system:admin-milo 展示为 admin-milo。
 - 状态更新里的 Web 链接改成 Markdown 超链：事件详细地址。
 - 新增服务启动、关闭、Mongo 异常、Mongo 恢复通知。Mongo 不可用时通知会先落本地 PVC 队列，恢复后写入 Telegram 队列补发。
-- 新增本地 system-notifications 队列目录，部署清单增加 SERVICE_ACCOUNT_NAME 环境变量，方便系统代执行授权匹配实际 ServiceAccount。
+- 新增本地 system-notifications 队列目录；SERVICE_ACCOUNT_NAME 仅用于识别并阻断审计服务账号代删行为。
 
 ## v4 事件与 Telegram 交互优化
 
 - 新增短事件 ID：`ev_<time>_<random>`，用于 Web 查询和 Telegram 快速定位。
 - 历史事件默认只展示 `final=true` 的真实集群执行事件；审批等待、拒绝、拦截等未实际执行的事件只作为内部审批状态保存，直接按事件 ID 查询时仍可定位。
-- Telegram 审批放行后，系统代执行产生的 Admission 事件复用原事件 ID，并覆盖为最终事件，避免一笔删除出现多条历史记录。
+- Telegram 审批放行后不再代执行；原用户重试时 Admission 事件复用原事件 ID，并覆盖为最终事件，避免一笔删除出现多条历史记录。
 - 修复审批放行后原 pending 事件覆盖最终回滚信息的问题：执行完成后优先重新读取最终事件，不再用旧 pending 状态覆盖 rollback_id。
 - Telegram 通知内容压缩为编号列表，查询关键字只保留事件 ID，事件详情以 Markdown 超链展示。
 - 回滚通知按钮改为底部一行并排：`回滚` 与 `下载 YAML`。
@@ -58,3 +57,43 @@
 - 时区下拉补齐 AWS 常用核心全球时区并去重。
 - 顶部状态和刷新按钮改为紧凑图标化展示；用户菜单尺寸自适应小屏。
 - 启动成功通知改为优先直接发送，Mongo 不可用时仍可基于本地配置尝试发送，失败则进入本地队列等待恢复后补发。
+
+## v5 本轮升级说明
+
+### Admission 审批执行边界
+- 删除审批通过后不再由审计服务自身的 Kubernetes ServiceAccount 代执行 DELETE。
+- Telegram/Web 审批只创建短期一次性授权，原始用户或原始自动化 ServiceAccount 必须在有效期内重新执行同一条删除命令。
+- Webhook 在原用户重试时消费授权、复用原事件 ID，并只记录这一次真实执行的集群操作。
+- 审计服务 ServiceAccount 发起 DELETE 会被默认硬阻断，避免审计程序获得或滥用集群删除能力。
+
+### Telegram 通知文案
+- 所有内置 Admission 通知模板移除 “1、2、3” 编号展示。
+- 创建通知改为展示事件 ID，不再展示 Kubernetes Admission request UID。
+- 状态变更文案改为“字段: 值”的简洁格式。
+- 删除审批通过后的文案明确提示“请原用户在有效期内重新执行删除命令”。
+
+### 默认规则边界
+- 控制器 ServiceAccount 发起的 Pod CREATE/DELETE 默认只审计，不通知。
+- 重要资源 CREATE/UPDATE/DELETE 默认只对 human_admins 组触发通知/审批；其他自动化和控制器账号默认按兜底规则只审计。
+- human_admins 默认包含人工用户和 admin-* / *-admin 形式的运维 ServiceAccount。
+- 重要资源范围扩展到 ServiceAccount、Role、RoleBinding、ClusterRole、ClusterRoleBinding、PVC、Namespace 等常见关键资源。
+
+### Web UI
+- 历史事件默认查询 Limit 调整为 500。
+- 历史事件筛选和结果字体、间距下调，提升小窗口可视范围。
+- 时区选择补充 UTC±N / Etc/GMT 选项，并保留全球核心 IANA 时区。
+
+### Mongo 冷库权限
+冷库不会预先创建空数据库；MongoDB 会在第一次成功写入冷库集合时自动创建。若日志出现 `not authorized on <db>_cold`，请给当前 `MONGO_URI` 使用的用户同时授予热库和冷库 readWrite 权限。
+
+示例 Mongo Shell 命令：
+
+```javascript
+use admin
+db.grantRolesToUser("<mongo-user>", [
+  { role: "readWrite", db: "k8s_delete_interceptor" },
+  { role: "readWrite", db: "k8s_delete_interceptor_cold" }
+])
+```
+
+如果你自定义了 `MONGO_DATABASE` 或站点设置里的 `cold_database`，把上面的库名替换为实际热库和冷库名称。

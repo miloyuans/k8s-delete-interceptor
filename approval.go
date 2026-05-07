@@ -20,12 +20,6 @@ import (
 
 const defaultAdmissionApprovalTTLSeconds = 12 * 60 * 60
 
-const admissionApprovalSystemExecutorID = "system:telegram-exec"
-
-func isSystemExecutionApprovalGrant(grant *AdmissionApprovalGrant) bool {
-	return grant != nil && grant.ApprovedByID == admissionApprovalSystemExecutorID
-}
-
 func interceptorServiceAccountUser() string {
 	ns := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
 	if ns == "" {

@@ -88,7 +88,7 @@ func (a *App) retentionMaintenanceLoop(ctx context.Context) {
 			}
 			stats, err := a.mongo.ArchiveAndPurgeOperationalData(ctx, cfg)
 			if err != nil {
-				log.Printf("data retention failed: %v", err)
+				log.Printf("data retention failed: %v", retentionErrorWithHint(cfg, err))
 			} else if retentionStatsNonZero(stats) {
 				log.Printf("data retention completed: archived=%v purged=%v", stats.Archived, stats.Purged)
 			}
@@ -100,6 +100,31 @@ func (a *App) retentionMaintenanceLoop(ctx context.Context) {
 		default:
 		}
 	}
+}
+
+func retentionErrorWithHint(cfg *RuntimeConfig, err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if !strings.Contains(strings.ToLower(msg), "unauthorized") && !strings.Contains(strings.ToLower(msg), "not authorized") {
+		return err
+	}
+	warmDB := envOr("MONGO_DATABASE", "k8s_delete_interceptor")
+	coldDB := warmDB + "_cold"
+	if cfg != nil {
+		for _, ds := range cfg.DataSources {
+			if ds.Active && strings.TrimSpace(ds.Database) != "" {
+				warmDB = strings.TrimSpace(ds.Database)
+			}
+		}
+		if strings.TrimSpace(cfg.Persistence.ColdDatabase) != "" {
+			coldDB = strings.TrimSpace(cfg.Persistence.ColdDatabase)
+		} else {
+			coldDB = warmDB + "_cold"
+		}
+	}
+	return fmt.Errorf("%w；冷库归档需要 Mongo 用户同时拥有热库 %s 的 readWrite 和冷库 %s 的 readWrite 权限。Mongo 不会预先创建空库，首次写入冷库时会自动创建；请给当前 MONGO_URI 用户补充冷库权限后重试", err, warmDB, coldDB)
 }
 
 func retentionStatsNonZero(s RetentionRunStats) bool {
@@ -156,13 +181,11 @@ func (m *MongoStore) ArchiveAndPurgeOperationalData(ctx context.Context, cfg *Ru
 		archived, err := m.archiveWarmCollection(ctx, cold, c.Name, c.TimeField, warmBefore, batch, now)
 		stats.Archived[c.Name] = archived
 		if err != nil {
-			m.healthy.Store(false)
 			return stats, err
 		}
 		purged, err := m.purgeColdCollection(ctx, cold, c.Name, now.Add(-coldTTL))
 		stats.Purged[c.Name] = purged
 		if err != nil {
-			m.healthy.Store(false)
 			return stats, err
 		}
 	}

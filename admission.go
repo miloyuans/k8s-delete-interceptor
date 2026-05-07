@@ -65,22 +65,16 @@ func (a *App) admit(ctx context.Context, req *admissionv1.AdmissionRequest) *adm
 	log.Printf("admission policy decided: uid=%s op=%s group=%q resource=%s kind=%s ns=%s name=%s user=%s decision=%s allowed=%v rule=%s scopes=%v reason=%s", req.UID, ac.Operation, ac.APIGroup, ac.Resource, ac.Kind, ac.Namespace, ac.Name, ac.User, pd.Decision, pd.Allowed, ruleIDForLog(pd), pd.ScopeIDs, pd.Reason)
 
 	approvalConsumed := false
-	systemExecutionApproval := false
 	approvedEventID := ""
+	approvedBy := ""
 	if pd.Decision == DecisionRequireApproval {
 		if grant, err := a.consumeAdmissionApproval(ctx, cfg, ac, pd); err == nil && grant != nil {
 			approvalConsumed = true
 			approvedEventID = strings.TrimSpace(grant.EventID)
-			if isSystemExecutionApprovalGrant(grant) {
-				systemExecutionApproval = true
-				pd.Decision = DecisionAllowNotify
-				pd.Allowed = true
-				pd.Reason = fmt.Sprintf("审批放行后系统代执行，审批人: %s，事件ID: %s", compactActorName(grant.ApprovedBy), grant.EventID)
-			} else {
-				pd.Decision = DecisionAllowNotify
-				pd.Allowed = true
-				pd.Reason = fmt.Sprintf("审批放行后用户重试执行，审批人: %s，事件ID: %s", compactActorName(grant.ApprovedBy), grant.EventID)
-			}
+			approvedBy = compactActorName(grant.ApprovedBy)
+			pd.Decision = DecisionAllowNotify
+			pd.Allowed = true
+			pd.Reason = fmt.Sprintf("审批授权已由原用户执行，审批人: %s，事件ID: %s", approvedBy, grant.EventID)
 		} else if err != nil {
 			log.Printf("admission approval lookup failed: uid=%s key=%s err=%v", req.UID, admissionApprovalKeyForContext(cfg, ac, pd), err)
 		}
@@ -123,7 +117,10 @@ func (a *App) admit(ctx context.Context, req *admissionv1.AdmissionRequest) *adm
 
 	// 非最终事件仍会落库作为 Telegram/Web 审批内部状态，但历史事件默认只展示 Final=true 的真实集群执行事件。
 	a.recordEvent(ev)
-	if !approvalConsumed && !systemExecutionApproval && shouldNotify(pd) {
+	if approvalConsumed {
+		status := fmt.Sprintf("✅ 审批授权已执行完成\n审批人: `%s`\n事件ID: `%s`\n执行用户: `%s`", approvedBy, ev.ID, compactActorName(ev.User))
+		go a.updateEventTelegramStatus(context.Background(), ev, status)
+	} else if shouldNotify(pd) {
 		go a.notifyEvent(context.Background(), cfg, ev, pd)
 	}
 	return admissionResponseForDecision(pd)

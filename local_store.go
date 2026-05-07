@@ -31,7 +31,7 @@ func NewLocalStore(root string) (*LocalStore, error) {
 	}
 	dirs := []string{
 		"config/versions", "config/lock", "config/changes", "config/audits", "spool/admission-events/pending", "spool/admission-events/processing", "spool/admission-events/synced", "spool/admission-events/failed",
-		"rollback/backups", "rollback/jobs", "rollback/locks", "approvals/pending", "approvals/decided", "metadata", "tmp",
+		"rollback/backups", "rollback/manifests", "rollback/jobs", "rollback/locks", "approvals/pending", "approvals/decided", "metadata", "tmp",
 	}
 	for _, d := range dirs {
 		if err := os.MkdirAll(filepath.Join(root, d), 0755); err != nil {
@@ -160,6 +160,12 @@ func (s *LocalStore) SpoolEvent(ev *AdmissionEvent) error {
 func (s *LocalStore) SaveRollback(rb *RollbackBackup) error {
 	if rb.ID == "" {
 		return errors.New("rollback id is required")
+	}
+	if rb.ExecutionStatus == "" {
+		rb.ExecutionStatus = "pending"
+	}
+	if err := s.SaveRollbackManifest(rb); err != nil {
+		return err
 	}
 	b, err := json.MarshalIndent(rb, "", "  ")
 	if err != nil {

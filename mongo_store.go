@@ -69,6 +69,8 @@ func (m *MongoStore) Init(ctx context.Context) error {
 		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "time", Value: -1}}}},
 		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "cluster", Value: 1}, {Key: "namespace", Value: 1}, {Key: "kind", Value: 1}, {Key: "name", Value: 1}, {Key: "operation", Value: 1}, {Key: "decision", Value: 1}}}},
+		{"admission_approval_grants", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
+		{"admission_approval_grants", mongo.IndexModel{Keys: bson.D{{Key: "expires_at", Value: 1}, {Key: "consumed", Value: 1}}}},
 		{"rollback_backups", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"rollback_backups", mongo.IndexModel{Keys: bson.D{{Key: "request_uid", Value: 1}}}},
 		{"service_account_inventory", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},

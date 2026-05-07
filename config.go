@@ -313,6 +313,10 @@ func defaultActors() []ActorGroup {
 	}
 }
 
+func defaultNotificationTemplates() []NotificationTemplate {
+	return defaultTemplates()
+}
+
 func defaultTemplates() []NotificationTemplate {
 	return []NotificationTemplate{
 		{ID: "tpl_delete_approval", Name: "删除审批通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🚨 *K8s 删除操作审批通知*\n动作: ⏳ 待审批\n集群: `{{.cluster}}`\n资源类型: `{{.kind}}`\n资源名称: `{{.name}}`\n命名空间: `{{.namespace}}`\n用户: {{.actor_display}}\n操作: 删除\n规则: `{{.rule_name}}`\n原因: {{.reason}}\n审批人: {{.approvers_mentions}}\n请求ID: `{{.request_uid}}`\n{{.time}}"},

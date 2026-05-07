@@ -434,7 +434,7 @@ func (a *App) sendTelegramNotificationNow(ctx context.Context, n *TelegramNotifi
 		return fmt.Errorf("telegram token is empty for bot_id=%s token_env=%s", bot.ID, bot.TokenEnv)
 	}
 	text := n.Text
-	markup := n.ReplyMarkup
+	var markup any = n.ReplyMarkup
 	parseMode := n.ParseMode
 	if n.Kind == NotifyKindConfigChange && n.ChangeID != "" {
 		if cr, err := a.getConfigChange(ctx, n.ChangeID); err == nil && cr != nil {
@@ -985,7 +985,10 @@ func eventKeyboardForStatus(ev *AdmissionEvent, notificationID, status string) a
 		return nil
 	}
 	buttons := [][]map[string]string{}
-	if ev.RollbackID != "" && !strings.Contains(status, "回滚已执行") {
+	if ev.Decision == DecisionRequireApproval && !ev.Allowed && !strings.Contains(status, "审批") {
+		buttons = append(buttons, []map[string]string{{"text": "✅ 审批放行", "callback_data": "ev:approve:" + notificationID}, {"text": "❌ 拒绝", "callback_data": "ev:reject:" + notificationID}})
+	}
+	if ev.Allowed && ev.RollbackID != "" && !strings.Contains(status, "回滚已执行") {
 		buttons = append(buttons, []map[string]string{{"text": "执行回滚", "callback_data": "ev:rollback:" + notificationID}})
 	}
 	buttons = append(buttons, []map[string]string{{"text": "下载 YAML", "callback_data": "ev:yaml:" + notificationID}})
@@ -1040,6 +1043,10 @@ func (a *App) handleTelegramCallback(ctx context.Context, cb *telegramCallbackQu
 		return
 	}
 	kind, action, notificationID := parts[0], parts[1], parts[2]
+	if a.mongo == nil || !a.mongo.Healthy() {
+		log.Printf("telegram callback skipped: mongo unavailable data=%s", cb.Data)
+		return
+	}
 	n, err := a.mongo.GetTelegramNotification(ctx, notificationID)
 	if err != nil || n == nil {
 		log.Printf("telegram callback notification not found: data=%s err=%v", cb.Data, err)
@@ -1067,9 +1074,9 @@ func (a *App) handleTelegramCallback(ctx context.Context, cb *telegramCallbackQu
 	}
 	switch kind {
 	case "cfg":
-		a.handleConfigChangeTelegramCallback(ctx, token, n, action, actor, cb.ID)
+		a.handleConfigChangeTelegramCallback(ctx, token, n, action, actor, cb.ID, tg, cb)
 	case "ev":
-		a.handleEventTelegramCallback(ctx, token, chatID, n, action, actor, cb.ID)
+		a.handleEventTelegramCallback(ctx, token, chatID, n, action, actor, cb.ID, tg, cb)
 	default:
 		_ = answerTelegramCallback(ctx, token, cb.ID, "未知操作", true)
 	}
@@ -1092,7 +1099,7 @@ func telegramCallbackActor(cb *telegramCallbackQuery) string {
 	return "telegram:unknown"
 }
 
-func (a *App) handleConfigChangeTelegramCallback(ctx context.Context, token string, n *TelegramNotificationEvent, action, actor, callbackID string) {
+func (a *App) handleConfigChangeTelegramCallback(ctx context.Context, token string, n *TelegramNotificationEvent, action, actor, callbackID string, tg *TelegramConfig, cb *telegramCallbackQuery) {
 	cr, err := a.getConfigChange(ctx, n.ChangeID)
 	if err != nil || cr == nil {
 		_ = answerTelegramCallback(ctx, token, callbackID, "配置变更不存在", true)
@@ -1101,6 +1108,10 @@ func (a *App) handleConfigChangeTelegramCallback(ctx context.Context, token stri
 	if cr.Status != ChangePending {
 		_ = answerTelegramCallback(ctx, token, callbackID, "该变更已处理: "+cr.Status, true)
 		go a.updateConfigChangeTelegramStatus(context.Background(), cr)
+		return
+	}
+	if !telegramCanApproveConfigChange(tg, cb) {
+		_ = answerTelegramCallback(ctx, token, callbackID, "未授权的 Telegram 审批人", true)
 		return
 	}
 	user := &AuthUser{Username: "telegram:" + actor, DisplayName: actor, Roles: []string{"telegram_approver"}, Permissions: []string{PermConfigApprove}}
@@ -1121,13 +1132,42 @@ func (a *App) handleConfigChangeTelegramCallback(ctx context.Context, token stri
 	go a.updateConfigChangeTelegramStatus(context.Background(), next)
 }
 
-func (a *App) handleEventTelegramCallback(ctx context.Context, token, chatID string, n *TelegramNotificationEvent, action, actor, callbackID string) {
+func (a *App) handleEventTelegramCallback(ctx context.Context, token, chatID string, n *TelegramNotificationEvent, action, actor, callbackID string, tg *TelegramConfig, cb *telegramCallbackQuery) {
 	ev, err := a.getAdmissionEvent(ctx, n.EventID)
 	if err != nil || ev == nil {
 		_ = answerTelegramCallback(ctx, token, callbackID, "事件不存在", true)
 		return
 	}
 	switch action {
+	case "approve":
+		if ev.Decision != DecisionRequireApproval || ev.Allowed {
+			_ = answerTelegramCallback(ctx, token, callbackID, "该事件不在待审批状态", true)
+			return
+		}
+		rule := findRuleByID(a.Config(), ev.RuleID)
+		if !telegramCanApproveAdmissionEvent(tg, cb, rule) {
+			_ = answerTelegramCallback(ctx, token, callbackID, "未授权的事件审批人", true)
+			return
+		}
+		grant, err := a.createAdmissionApprovalGrant(ctx, ev, actor, telegramCallbackUserID(cb))
+		if err != nil {
+			_ = answerTelegramCallback(ctx, token, callbackID, "审批授权保存失败: "+err.Error(), true)
+			return
+		}
+		_ = answerTelegramCallback(ctx, token, callbackID, "已授权一次性重试", false)
+		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("✅ 已审批放行\n审批人: %s\n有效期至: %s\n请原用户在有效期内重试原命令", actor, grant.ExpiresAt.Format(time.RFC3339)))
+	case "reject":
+		if ev.Decision != DecisionRequireApproval || ev.Allowed {
+			_ = answerTelegramCallback(ctx, token, callbackID, "该事件不在待审批状态", true)
+			return
+		}
+		rule := findRuleByID(a.Config(), ev.RuleID)
+		if !telegramCanApproveAdmissionEvent(tg, cb, rule) {
+			_ = answerTelegramCallback(ctx, token, callbackID, "未授权的事件审批人", true)
+			return
+		}
+		_ = answerTelegramCallback(ctx, token, callbackID, "已拒绝", false)
+		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("❌ 已拒绝\n处理人: %s", actor))
 	case "yaml":
 		yml, err := a.eventYAMLString(ctx, ev, false)
 		if err != nil {
@@ -1145,6 +1185,14 @@ func (a *App) handleEventTelegramCallback(ctx context.Context, token, chatID str
 		_ = answerTelegramCallback(ctx, token, callbackID, "YAML 已发送", false)
 		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("📄 %s 已下载 YAML", actor))
 	case "rollback":
+		if !telegramCanExecuteRollback(tg, cb) {
+			_ = answerTelegramCallback(ctx, token, callbackID, "未授权执行回滚", true)
+			return
+		}
+		if !ev.Allowed {
+			_ = answerTelegramCallback(ctx, token, callbackID, "该请求未实际放行，不能执行回滚", true)
+			return
+		}
 		if ev.RollbackID == "" {
 			_ = answerTelegramCallback(ctx, token, callbackID, "该事件没有回滚备份", true)
 			return
@@ -1168,6 +1216,9 @@ func (a *App) eventYAMLString(ctx context.Context, ev *AdmissionEvent, old bool)
 	}
 	raw := ev.Object
 	if old {
+		raw = ev.OldObject
+	}
+	if len(raw) == 0 && !old {
 		raw = ev.OldObject
 	}
 	if len(raw) == 0 {

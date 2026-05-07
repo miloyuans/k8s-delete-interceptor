@@ -63,7 +63,21 @@ func (a *App) admit(ctx context.Context, req *admissionv1.AdmissionRequest) *adm
 	}
 	pd := decide(cfg, ac)
 	log.Printf("admission policy decided: uid=%s op=%s group=%q resource=%s kind=%s ns=%s name=%s user=%s decision=%s allowed=%v rule=%s scopes=%v reason=%s", req.UID, ac.Operation, ac.APIGroup, ac.Resource, ac.Kind, ac.Namespace, ac.Name, ac.User, pd.Decision, pd.Allowed, ruleIDForLog(pd), pd.ScopeIDs, pd.Reason)
+	approvalConsumed := false
+	if pd.Decision == DecisionRequireApproval {
+		if grant, err := a.consumeAdmissionApproval(ctx, cfg, ac, pd); err == nil && grant != nil {
+			approvalConsumed = true
+			pd.Decision = DecisionAllowNotify
+			pd.Allowed = true
+			pd.Reason = fmt.Sprintf("已审批放行，审批人: %s，原事件: %s", grant.ApprovedBy, grant.EventID)
+		} else if err != nil {
+			log.Printf("admission approval lookup failed: uid=%s key=%s err=%v", req.UID, admissionApprovalKeyForContext(cfg, ac, pd), err)
+		}
+	}
 	ev := a.buildEvent(cfg, req, ac, pd)
+	if approvalConsumed {
+		ev.Reason = pd.Reason
+	}
 	if shouldCreateRollback(cfg, pd, ac) {
 		if rb, err := a.createRollbackBackup(ctx, cfg, ev, ac, pd); err == nil && rb != nil {
 			ev.RollbackID = rb.ID

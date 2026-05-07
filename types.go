@@ -364,8 +364,14 @@ type RollbackBackup struct {
 	Namespace        string          `json:"namespace" bson:"namespace"`
 	Name             string          `json:"name" bson:"name"`
 	SourceObject     json.RawMessage `json:"source_object" bson:"source_object"`
+	ManifestFile     string          `json:"manifest_file,omitempty" bson:"manifest_file,omitempty"`
+	ManifestSHA256   string          `json:"manifest_sha256,omitempty" bson:"manifest_sha256,omitempty"`
 	CreatedObjectUID string          `json:"created_object_uid,omitempty" bson:"created_object_uid,omitempty"`
 	DryRunRequired   bool            `json:"dry_run_required" bson:"dry_run_required"`
+	ExecutionStatus  string          `json:"execution_status,omitempty" bson:"execution_status,omitempty"`
+	ExecutionError   string          `json:"execution_error,omitempty" bson:"execution_error,omitempty"`
+	ExecutedAt       time.Time       `json:"executed_at,omitempty" bson:"executed_at,omitempty"`
+	ExecutedBy       string          `json:"executed_by,omitempty" bson:"executed_by,omitempty"`
 }
 
 type ServiceAccountInfo struct {

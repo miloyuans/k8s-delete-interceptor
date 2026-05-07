@@ -7,6 +7,7 @@ import (
 )
 
 type EventQuery struct {
+	ID        string
 	Limit     int
 	Start     time.Time
 	End       time.Time
@@ -35,6 +36,9 @@ func (q EventQuery) NormalizedLimit(def int) int {
 }
 
 func (q EventQuery) Match(ev AdmissionEvent) bool {
+	if q.ID != "" && !matchPattern(ev.ID, q.ID, true) && !matchPattern(ev.RequestUID, q.ID, true) {
+		return false
+	}
 	if !q.Start.IsZero() && ev.Time.Before(q.Start) {
 		return false
 	}

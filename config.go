@@ -100,6 +100,70 @@ func applyRuntimeDefaults(c *RuntimeConfig) {
 	if len(c.WebUsers) == 0 {
 		c.WebUsers = defaultWebUsers()
 	}
+	ensureBuiltInConfigObjects(c)
+}
+
+func ensureBuiltInConfigObjects(c *RuntimeConfig) {
+	if c == nil {
+		return
+	}
+	ensureScope := func(scope ResourceScope) {
+		for i := range c.ResourceScopes {
+			if c.ResourceScopes[i].ID == scope.ID {
+				return
+			}
+		}
+		c.ResourceScopes = append(c.ResourceScopes, scope)
+	}
+	ensureTemplate := func(tpl NotificationTemplate) {
+		for i := range c.NotificationTemplates {
+			if c.NotificationTemplates[i].ID == tpl.ID {
+				return
+			}
+		}
+		c.NotificationTemplates = append(c.NotificationTemplates, tpl)
+	}
+	ensureScope(ResourceScope{ID: "internal_mongo_assets", Name: "内置 Mongo 系统资产", Enabled: true, APIGroups: []string{"*"}, Resources: []string{"*"}, Kinds: []string{"*"}, Namespaces: []string{"*"}, Names: []string{"delete-interceptor-mongodb*", "*mongodb*"}})
+	ensureTemplate(NotificationTemplate{ID: "tpl_create_notify", Name: "重要创建通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🆕 *K8s 资源创建*\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: {{.actor_display}}\n规则: `{{.rule_name}}`\n原因: {{.reason}}\nWeb: {{.event_url}}"})
+	for i := range c.ResourceScopes {
+		if scopeNeedsCoreAPIGroup(c.ResourceScopes[i]) && !stringSliceContains(c.ResourceScopes[i].APIGroups, "") && !stringSliceContains(c.ResourceScopes[i].APIGroups, "*") {
+			c.ResourceScopes[i].APIGroups = append([]string{""}, c.ResourceScopes[i].APIGroups...)
+		}
+	}
+	for i := range c.Rules {
+		if c.Rules[i].ID == "internal_mongo_delete_protection" {
+			// Older generated configs used broad core scopes here, which would block
+			// all normal deletes once core API group matching is fixed. Keep this rule
+			// only for Mongo assets; label-based hard protection is still enforced in code.
+			c.Rules[i].ScopeIDs = []string{"internal_mongo_assets"}
+			c.Rules[i].Reason = "内置 MongoDB 属于系统核心数据源，禁止直接删除"
+		}
+	}
+}
+
+func scopeNeedsCoreAPIGroup(s ResourceScope) bool {
+	coreResources := map[string]bool{"configmaps": true, "secrets": true, "services": true, "namespaces": true, "persistentvolumeclaims": true, "pods": true}
+	coreKinds := map[string]bool{"ConfigMap": true, "Secret": true, "Service": true, "Namespace": true, "PersistentVolumeClaim": true, "Pod": true}
+	for _, r := range s.Resources {
+		if coreResources[strings.ToLower(strings.TrimSpace(r))] {
+			return true
+		}
+	}
+	for _, k := range s.Kinds {
+		if coreKinds[strings.TrimSpace(k)] {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSliceContains(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
 }
 
 func validateRuntimeConfig(c *RuntimeConfig) error {
@@ -215,6 +279,7 @@ func defaultRuntimeConfig() *RuntimeConfig {
 
 func defaultScopes() []ResourceScope {
 	return []ResourceScope{
+		{ID: "internal_mongo_assets", Name: "内置 Mongo 系统资产", Enabled: true, APIGroups: []string{"*"}, Resources: []string{"*"}, Kinds: []string{"*"}, Namespaces: []string{"*"}, Names: []string{"delete-interceptor-mongodb*", "*mongodb*"}},
 		{ID: "workload_core", Name: "核心工作负载", Enabled: true, APIGroups: []string{"apps"}, Resources: []string{"deployments", "statefulsets", "daemonsets"}, Kinds: []string{"Deployment", "StatefulSet", "DaemonSet"}, Namespaces: []string{"*"}, Names: []string{"*"}},
 		{ID: "service_network_core", Name: "服务与入口", Enabled: true, APIGroups: []string{"", "networking.k8s.io"}, Resources: []string{"services", "ingresses"}, Kinds: []string{"Service", "Ingress"}, Namespaces: []string{"*"}, Names: []string{"*"}},
 		{ID: "config_secret_core", Name: "配置与密钥", Enabled: true, APIGroups: []string{""}, Resources: []string{"configmaps", "secrets", "persistentvolumeclaims"}, Kinds: []string{"ConfigMap", "Secret", "PersistentVolumeClaim"}, Namespaces: []string{"*"}, Names: []string{"*"}},
@@ -234,18 +299,20 @@ func defaultActors() []ActorGroup {
 func defaultTemplates() []NotificationTemplate {
 	return []NotificationTemplate{
 		{ID: "tpl_delete_approval", Name: "删除审批通知", Channel: "telegram", ParseMode: "MarkdownV2", Enabled: true, Body: "🚨 *K8s 删除审批*\n*集群*: `{{.cluster}}`\n*资源*: `{{.kind}}/{{.namespace}}/{{.name}}`\n*用户*: {{.actor_display}}\n*规则*: `{{.rule_name}}`\n*原因*: {{.reason}}\n*审批人*: {{.approvers_mentions}}\n*Web*: {{.event_url}}\n*请求ID*: `{{.request_uid}}`"},
-		{ID: "tpl_update_notify", Name: "重要更新通知", Channel: "telegram", ParseMode: "MarkdownV2", Enabled: true, Body: "📝 *K8s 重要更新*\n*集群*: `{{.cluster}}`\n*资源*: `{{.kind}}/{{.namespace}}/{{.name}}`\n*用户*: {{.actor_display}}\n*变更*: {{.change_summary}}\n*Web*: {{.event_url}}"},
-		{ID: "tpl_block", Name: "拦截通知", Channel: "telegram", ParseMode: "MarkdownV2", Enabled: true, Body: "⛔ *K8s 请求已拦截*\n*集群*: `{{.cluster}}`\n*操作*: `{{.operation}}`\n*资源*: `{{.kind}}/{{.namespace}}/{{.name}}`\n*用户*: {{.actor_display}}\n*原因*: {{.reason}}\n*Web*: {{.event_url}}"},
+		{ID: "tpl_update_notify", Name: "重要更新通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "📝 *K8s 重要更新*\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: {{.actor_display}}\n变更: {{.change_summary}}\nWeb: {{.event_url}}"},
+		{ID: "tpl_create_notify", Name: "重要创建通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🆕 *K8s 资源创建*\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: {{.actor_display}}\n规则: `{{.rule_name}}`\n原因: {{.reason}}\nWeb: {{.event_url}}"},
+		{ID: "tpl_block", Name: "拦截通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "⛔ *K8s 请求已拦截*\n集群: `{{.cluster}}`\n操作: `{{.operation}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: {{.actor_display}}\n原因: {{.reason}}\nWeb: {{.event_url}}"},
 	}
 }
 
 func defaultRules() []PolicyRule {
 	return []PolicyRule{
-		{ID: "internal_mongo_delete_protection", Name: "内置 Mongo 硬保护", Enabled: true, Priority: 1, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core"}, Operations: []string{"DELETE"}, Decision: DecisionBlock, Reason: "内置 MongoDB 属于系统核心数据源，禁止直接删除", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_block"}},
+		{ID: "internal_mongo_delete_protection", Name: "内置 Mongo 硬保护", Enabled: true, Priority: 1, ScopeIDs: []string{"internal_mongo_assets"}, Operations: []string{"DELETE"}, Decision: DecisionBlock, Reason: "内置 MongoDB 属于系统核心数据源，禁止直接删除", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_block"}},
 		{ID: "pod_controller_lifecycle_audit", Name: "控制器 Pod 生命周期只审计", Enabled: true, Priority: 20, ScopeIDs: []string{"pod_lifecycle"}, Operations: []string{"DELETE"}, ActorGroupIDs: []string{"cluster_controllers"}, Decision: DecisionAuditOnly, Reason: "控制器或节点维护 Pod 生命周期，仅审计", ControllerSafe: ControllerSafeRule{RequireOwnerReference: true, RequireControllerOwnerReference: true, AllowedOwnerKinds: []string{"ReplicaSet", "DaemonSet", "StatefulSet", "Job"}, RequireNodeUserMatchesPodNode: true}},
 		{ID: "workload_restart_silent", Name: "工作负载重启只审计", Enabled: true, Priority: 30, ScopeIDs: []string{"workload_core"}, Operations: []string{"UPDATE"}, ChangeClasses: []string{"workload_restart", "no_effective_change", "managed_fields_only", "status_only", "metadata_only"}, Decision: DecisionAuditOnly, Reason: "低风险或无有效变化更新，仅审计"},
 		{ID: "core_delete_approval", Name: "核心资源删除审批", Enabled: true, Priority: 50, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core", "cluster_core"}, Operations: []string{"DELETE"}, Decision: DecisionRequireApproval, Reason: "核心资源删除需要审批", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_delete_approval"}, Approval: ApprovalBinding{Enabled: true, Mode: "both", TTLSeconds: 300, FailWhenStoreDown: true}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackRestoreOldObject, ShowInWeb: true, ShowInTelegram: true}},
-		{ID: "important_update_notify", Name: "重要资源有效更新通知", Enabled: true, Priority: 60, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core"}, Operations: []string{"UPDATE"}, ChangeClasses: []string{"image_changed", "env_changed", "volume_changed", "scale_only", "service_selector_changed", "service_port_changed", "ingress_backend_changed", "configmap_data_changed", "secret_data_changed", "spec_changed"}, Decision: DecisionAllowNotify, Reason: "重要资源发生有效更新", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_update_notify"}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackRestoreOldObject, ShowInWeb: true, ShowInTelegram: false}},
+		{ID: "important_update_notify", Name: "重要资源有效更新通知", Enabled: true, Priority: 60, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core"}, Operations: []string{"UPDATE"}, ChangeClasses: []string{"image_changed", "env_changed", "volume_changed", "scale_only", "service_selector_changed", "service_port_changed", "ingress_backend_changed", "configmap_data_changed", "secret_data_changed", "spec_changed"}, Decision: DecisionAllowNotify, Reason: "重要资源发生有效更新，已记录回滚和 YAML", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_update_notify"}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackRestoreOldObject, ShowInWeb: true, ShowInTelegram: false}},
+		{ID: "important_create_notify", Name: "重要资源创建记录", Enabled: true, Priority: 70, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core"}, Operations: []string{"CREATE"}, Decision: DecisionAllowNotify, Reason: "重要资源创建已放行并记录", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_create_notify"}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackDeleteCreatedObject, ShowInWeb: true, ShowInTelegram: false}},
 	}
 }
 

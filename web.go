@@ -45,6 +45,7 @@ func (a *App) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/datasources", a.auth(a.handleDatasources))
 	mux.HandleFunc("/api/datasources/", a.auth(a.handleDatasources))
 	mux.HandleFunc("/api/datasources/test", a.require(PermDatasourceWrite, a.handleDatasourceTest))
+	mux.HandleFunc("/api/telegram/notifications/", a.auth(a.handleTelegramNotificationView))
 	mux.HandleFunc("/api/telegram", a.auth(a.handleTelegram))
 	mux.HandleFunc("/api/telegram/bots", a.auth(a.handleTelegramBots))
 	mux.HandleFunc("/api/telegram/bots/", a.auth(a.handleTelegramBots))
@@ -63,12 +64,27 @@ func (a *App) RegisterRoutes(mux *http.ServeMux) {
 }
 
 func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+	if !isWebRoute(r.URL.Path) {
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(indexHTML))
+}
+
+func isWebRoute(path string) bool {
+	if path == "/" {
+		return true
+	}
+	if strings.HasPrefix(path, "/api/") || path == "/validate" || strings.HasPrefix(path, "/telegram/") {
+		return false
+	}
+	switch strings.Trim(path, "/") {
+	case "dashboard", "events", "actorgroups", "serviceaccounts", "rules", "datasources", "telegram", "templates", "changes", "users", "settings", "export":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -752,6 +768,37 @@ func normalizeDataSources(items []DataSource) []DataSource {
 		}
 	}
 	return items
+}
+
+func (a *App) handleTelegramNotificationView(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	u := userFromContext(r.Context())
+	if !u.Can(PermEventsRead) && !u.Can(PermConfigRead) {
+		http.Error(w, "forbidden", 403)
+		return
+	}
+	p := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/telegram/notifications/"), "/")
+	parts := strings.Split(p, "/")
+	if len(parts) != 2 || parts[1] != "view" || strings.TrimSpace(parts[0]) == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if a.mongo == nil || !a.mongo.Healthy() {
+		http.Error(w, "telegram notification store unavailable", 503)
+		return
+	}
+	n, err := a.mongo.MarkTelegramNotificationViewed(r.Context(), parts[0], u.Username)
+	if err != nil {
+		http.Error(w, err.Error(), 404)
+		return
+	}
+	if n.Kind == NotifyKindConfigChange && n.ChangeID != "" {
+		go a.updateConfigChangeTelegramViewed(context.Background(), n.ChangeID, u.Username)
+	}
+	writeJSON(w, map[string]any{"ok": true, "notification": n})
 }
 
 func (a *App) handleTelegram(w http.ResponseWriter, r *http.Request) {
@@ -1578,7 +1625,7 @@ func normalizeRuleRequest(req RuleEditRequest) RuleEditRequest {
 	if len(req.Kinds) == 0 && req.Kind != "" {
 		req.Kinds = []string{req.Kind}
 	}
-	req.APIGroups = keepEmptyCoreGroup(dedupeTrim(req.APIGroups))
+	req.APIGroups = dedupeTrimAPIGroup(req.APIGroups)
 	req.Resources = dedupeTrim(req.Resources)
 	req.Kinds = dedupeTrim(req.Kinds)
 	req.Namespaces = dedupeTrim(req.Namespaces)
@@ -1721,6 +1768,23 @@ func dedupeTrim(xs []string) []string {
 	return out
 }
 
+func dedupeTrimAPIGroup(xs []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, x := range xs {
+		x = strings.TrimSpace(x)
+		if x == "core" || x == "<core>" || strings.EqualFold(x, "core/v1") {
+			x = ""
+		}
+		if seen[x] {
+			continue
+		}
+		seen[x] = true
+		out = append(out, x)
+	}
+	return out
+}
+
 func keepEmptyCoreGroup(xs []string) []string {
 	if len(xs) == 0 {
 		return xs
@@ -1809,7 +1873,7 @@ func (a *App) handleDatasourceTest(w http.ResponseWriter, r *http.Request) {
 
 func parseEventQuery(r *http.Request) EventQuery {
 	qv := r.URL.Query()
-	q := EventQuery{Limit: parseLimit(r, 200), Cluster: strings.TrimSpace(qv.Get("cluster")), Namespace: strings.TrimSpace(qv.Get("namespace")), Kind: strings.TrimSpace(qv.Get("kind")), Resource: strings.TrimSpace(qv.Get("resource")), Name: strings.TrimSpace(qv.Get("name")), User: strings.TrimSpace(qv.Get("user")), Operation: strings.ToUpper(strings.TrimSpace(qv.Get("operation"))), Decision: strings.TrimSpace(qv.Get("decision"))}
+	q := EventQuery{ID: strings.TrimSpace(firstNonEmpty(qv.Get("id"), qv.Get("event_id"), qv.Get("event"))), Limit: parseLimit(r, 200), Cluster: strings.TrimSpace(qv.Get("cluster")), Namespace: strings.TrimSpace(qv.Get("namespace")), Kind: strings.TrimSpace(qv.Get("kind")), Resource: strings.TrimSpace(qv.Get("resource")), Name: strings.TrimSpace(qv.Get("name")), User: strings.TrimSpace(qv.Get("user")), Operation: strings.ToUpper(strings.TrimSpace(qv.Get("operation"))), Decision: strings.TrimSpace(qv.Get("decision"))}
 	if v := strings.TrimSpace(qv.Get("allowed")); v != "" {
 		b := v == "true" || v == "1" || strings.EqualFold(v, "yes")
 		q.Allowed = &b
@@ -1821,6 +1885,15 @@ func parseEventQuery(r *http.Request) EventQuery {
 		q.Start, q.End = q.End, q.Start
 	}
 	return q
+}
+
+func firstNonEmpty(xs ...string) string {
+	for _, x := range xs {
+		if strings.TrimSpace(x) != "" {
+			return x
+		}
+	}
+	return ""
 }
 
 func parseWebTime(v, tz string, endOfDate bool) time.Time {

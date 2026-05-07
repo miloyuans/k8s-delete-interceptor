@@ -271,6 +271,9 @@ type TelegramNotificationEvent struct {
 	CreatedAt     time.Time      `json:"created_at" bson:"created_at"`
 	SentAt        time.Time      `json:"sent_at,omitempty" bson:"sent_at,omitempty"`
 	MessageID     int64          `json:"message_id,omitempty" bson:"message_id,omitempty"`
+	ViewedAt      time.Time      `json:"viewed_at,omitempty" bson:"viewed_at,omitempty"`
+	ViewedBy      string         `json:"viewed_by,omitempty" bson:"viewed_by,omitempty"`
+	ViewCount     int            `json:"view_count,omitempty" bson:"view_count,omitempty"`
 	LastError     string         `json:"last_error,omitempty" bson:"last_error,omitempty"`
 }
 

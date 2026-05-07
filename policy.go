@@ -263,7 +263,20 @@ func matchPatterns(patterns []string, value string) bool {
 		return true
 	}
 	for _, p := range patterns {
+		p = strings.TrimSpace(p)
+		// Kubernetes core API group is represented by an empty string.
+		// Do not skip empty patterns, otherwise ConfigMap/Secret/Service/Namespace
+		// scopes never match AdmissionRequest.Resource.Group == "".
 		if p == "" {
+			if value == "" {
+				return true
+			}
+			continue
+		}
+		if p == "core" || p == "<core>" {
+			if value == "" {
+				return true
+			}
 			continue
 		}
 		if p == "*" {

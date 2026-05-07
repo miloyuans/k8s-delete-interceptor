@@ -87,7 +87,6 @@ func (m *MongoStore) Init(ctx context.Context) error {
 	return nil
 }
 
-
 func (m *MongoStore) EnsureTelegramConfig(ctx context.Context, cfg TelegramConfig) error {
 	if m == nil {
 		return errors.New("mongo not configured")
@@ -184,7 +183,9 @@ func (m *MongoStore) AcquireTelegramDispatchLock(ctx context.Context, owner stri
 	opts := options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	var doc struct{ Owner string `bson:"owner"` }
+	var doc struct {
+		Owner string `bson:"owner"`
+	}
 	err := m.db.Collection("telegram_worker_locks").FindOneAndUpdate(ctx, filter, update, opts).Decode(&doc)
 	if err != nil {
 		if mongo.IsDuplicateKeyError(err) {
@@ -470,6 +471,9 @@ func (m *MongoStore) ListEventsByQuery(ctx context.Context, q EventQuery) ([]Adm
 		return nil, errors.New("mongo unavailable")
 	}
 	filter := bson.M{}
+	if q.ID != "" {
+		filter["$or"] = []bson.M{{"id": q.ID}, {"request_uid": q.ID}}
+	}
 	if !q.Start.IsZero() || !q.End.IsZero() {
 		timeFilter := bson.M{}
 		if !q.Start.IsZero() {
@@ -581,6 +585,61 @@ func (m *MongoStore) ClaimTelegramNotification(ctx context.Context, worker strin
 	}
 	m.healthy.Store(true)
 	return &ev, nil
+}
+
+func (m *MongoStore) GetTelegramNotification(ctx context.Context, id string) (*TelegramNotificationEvent, error) {
+	if m == nil {
+		return nil, errors.New("mongo unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var ev TelegramNotificationEvent
+	err := m.db.Collection("telegram_notification_events").FindOne(ctx, bson.M{"id": id}).Decode(&ev)
+	m.healthy.Store(err == nil)
+	if err != nil {
+		return nil, err
+	}
+	return &ev, nil
+}
+
+func (m *MongoStore) MarkTelegramNotificationViewed(ctx context.Context, id, viewedBy string) (*TelegramNotificationEvent, error) {
+	if m == nil {
+		return nil, errors.New("mongo unavailable")
+	}
+	now := time.Now().UTC()
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	update := bson.M{"$set": bson.M{"viewed_at": now, "viewed_by": viewedBy}, "$inc": bson.M{"view_count": 1}}
+	var ev TelegramNotificationEvent
+	err := m.db.Collection("telegram_notification_events").FindOneAndUpdate(ctx, bson.M{"id": id}, update, options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(&ev)
+	m.healthy.Store(err == nil)
+	if err != nil {
+		return nil, err
+	}
+	return &ev, nil
+}
+
+func (m *MongoStore) ListTelegramNotificationsByChange(ctx context.Context, changeID string) ([]TelegramNotificationEvent, error) {
+	if m == nil {
+		return nil, errors.New("mongo unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cur, err := m.db.Collection("telegram_notification_events").Find(ctx, bson.M{"change_id": changeID, "status": NotifyStatusSent}, options.Find().SetSort(bson.D{{Key: "sent_at", Value: 1}}))
+	if err != nil {
+		m.healthy.Store(false)
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	out := []TelegramNotificationEvent{}
+	for cur.Next(ctx) {
+		var ev TelegramNotificationEvent
+		if cur.Decode(&ev) == nil {
+			out = append(out, ev)
+		}
+	}
+	m.healthy.Store(true)
+	return out, nil
 }
 
 func (m *MongoStore) CompleteTelegramNotification(ctx context.Context, id string, messageID int64) error {

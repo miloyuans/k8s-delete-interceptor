@@ -12,6 +12,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -177,16 +178,15 @@ func (a *App) notifyEvent(ctx context.Context, cfg *RuntimeConfig, ev *Admission
 		log.Printf("telegram render template failed: rule=%s template=%s err=%v", pd.Rule.ID, tpl.ID, err)
 		return
 	}
-	markup := map[string]any(nil)
-	if kb := eventKeyboard(ev); kb != nil {
-		if m, ok := kb.(map[string]any); ok {
-			markup = m
-		}
-	}
 	queued := 0
 	for _, target := range targets {
-		n := &TelegramNotificationEvent{Kind: NotifyKindAdmissionEvent, EventID: ev.ID, RuleID: pd.Rule.ID, RuleName: pd.Rule.Name, BotID: target.BotID, ChatID: target.ChatID, TargetName: target.Name, Text: msg, ParseMode: tpl.ParseMode, ReplyMarkup: markup, Status: NotifyStatusPending, MaxAttempts: telegramMaxAttempts(), CreatedAt: time.Now().UTC(), NextAttemptAt: time.Now().UTC()}
+		n := &TelegramNotificationEvent{Kind: NotifyKindAdmissionEvent, EventID: ev.ID, RuleID: pd.Rule.ID, RuleName: pd.Rule.Name, BotID: target.BotID, ChatID: target.ChatID, TargetName: target.Name, Text: msg, ParseMode: tpl.ParseMode, Status: NotifyStatusPending, MaxAttempts: telegramMaxAttempts(), CreatedAt: time.Now().UTC(), NextAttemptAt: time.Now().UTC()}
 		n.ID = notificationID(n.Kind, ev.ID, target.BotID, target.ChatID)
+		if kb := eventKeyboardFor(ev, n.ID); kb != nil {
+			if m, ok := kb.(map[string]any); ok {
+				n.ReplyMarkup = m
+			}
+		}
 		if err := a.enqueueTelegramNotification(ctx, n); err != nil {
 			log.Printf("telegram notify enqueue failed: rule=%s event=%s bot_id=%s chat_id=%s err=%v", pd.Rule.ID, ev.ID, target.BotID, target.ChatID, err)
 			continue
@@ -658,7 +658,7 @@ func renderTemplate(cfg *RuntimeConfig, tg *TelegramConfig, ev *AdmissionEvent, 
 	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
 	eventURL := ""
 	if web != "" {
-		eventURL = web + "/?event=" + ev.ID
+		eventURL = webURL(web, "/events", map[string]string{"event": ev.ID})
 	}
 	actorDisplay := ev.User
 	approvers := []string{}
@@ -918,14 +918,34 @@ func validateTelegramBotToken(ctx context.Context, token string) (string, error)
 	return out.Result.Username, nil
 }
 
-func eventKeyboard(ev *AdmissionEvent) any {
+func webURL(base, path string, params map[string]string) string {
+	base = strings.TrimRight(base, "/")
+	if base == "" {
+		return ""
+	}
+	if path == "" {
+		path = "/"
+	}
+	v := url.Values{}
+	for k, val := range params {
+		if strings.TrimSpace(val) != "" {
+			v.Set(k, val)
+		}
+	}
+	if enc := v.Encode(); enc != "" {
+		return base + path + "?" + enc
+	}
+	return base + path
+}
+
+func eventKeyboardFor(ev *AdmissionEvent, notificationID string) any {
 	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
 	if web == "" {
 		return nil
 	}
-	buttons := [][]map[string]string{{{"text": "打开 Web 详情", "url": web + "/?event=" + ev.ID}}}
+	buttons := [][]map[string]string{{{"text": "打开 Web 详情", "url": webURL(web, "/events", map[string]string{"event": ev.ID, "ntf": notificationID})}}}
 	if ev.RollbackID != "" {
-		buttons = append(buttons, []map[string]string{{"text": "查看回滚", "url": web + "/?rollback=" + ev.RollbackID}})
+		buttons = append(buttons, []map[string]string{{"text": "查看回滚", "url": webURL(web, "/events", map[string]string{"event": ev.ID, "rollback": ev.RollbackID, "ntf": notificationID})}})
 	}
 	return map[string]any{"inline_keyboard": buttons}
 }

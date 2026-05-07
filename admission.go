@@ -62,6 +62,7 @@ func (a *App) admit(ctx context.Context, req *admissionv1.AdmissionRequest) *adm
 		Object: objMap, OldObject: oldMap, ObjectRaw: req.Object.Raw, OldObjectRaw: req.OldObject.Raw, RequestUID: string(req.UID),
 	}
 	pd := decide(cfg, ac)
+	log.Printf("admission policy decided: uid=%s op=%s group=%q resource=%s kind=%s ns=%s name=%s user=%s decision=%s allowed=%v rule=%s scopes=%v reason=%s", req.UID, ac.Operation, ac.APIGroup, ac.Resource, ac.Kind, ac.Namespace, ac.Name, ac.User, pd.Decision, pd.Allowed, ruleIDForLog(pd), pd.ScopeIDs, pd.Reason)
 	ev := a.buildEvent(cfg, req, ac, pd)
 	if shouldCreateRollback(cfg, pd, ac) {
 		if rb, err := a.createRollbackBackup(ctx, cfg, ev, ac, pd); err == nil && rb != nil {
@@ -79,6 +80,13 @@ func (a *App) admit(ctx context.Context, req *admissionv1.AdmissionRequest) *adm
 		return &admissionv1.AdmissionResponse{Allowed: false, Result: &metav1.Status{Reason: metav1.StatusReasonForbidden, Message: pd.Reason}}
 	}
 	return &admissionv1.AdmissionResponse{Allowed: true}
+}
+
+func ruleIDForLog(pd PolicyDecision) string {
+	if pd.Rule == nil {
+		return ""
+	}
+	return pd.Rule.ID
 }
 
 func (a *App) buildEvent(cfg *RuntimeConfig, req *admissionv1.AdmissionRequest, ac AdmissionContext, pd PolicyDecision) *AdmissionEvent {

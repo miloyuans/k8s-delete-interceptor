@@ -47,6 +47,7 @@ type AdmissionApprovalGrant struct {
 	Kind               string    `json:"kind" bson:"kind"`
 	Namespace          string    `json:"namespace" bson:"namespace"`
 	Name               string    `json:"name" bson:"name"`
+	ResourceUID        string    `json:"resource_uid,omitempty" bson:"resource_uid,omitempty"`
 	User               string    `json:"user" bson:"user"`
 	ApprovedBy         string    `json:"approved_by" bson:"approved_by"`
 	ApprovedByID       string    `json:"approved_by_id,omitempty" bson:"approved_by_id,omitempty"`
@@ -57,7 +58,7 @@ type AdmissionApprovalGrant struct {
 	ConsumedRequestUID string    `json:"consumed_request_uid,omitempty" bson:"consumed_request_uid,omitempty"`
 }
 
-func admissionApprovalKey(cluster, operation, apiGroup, resource, namespace, name, user, ruleID string) string {
+func admissionApprovalKey(cluster, operation, apiGroup, resource, namespace, name, resourceUID, user, ruleID string) string {
 	parts := []string{
 		strings.TrimSpace(cluster),
 		strings.ToUpper(strings.TrimSpace(operation)),
@@ -65,6 +66,7 @@ func admissionApprovalKey(cluster, operation, apiGroup, resource, namespace, nam
 		strings.ToLower(strings.TrimSpace(resource)),
 		strings.TrimSpace(namespace),
 		strings.TrimSpace(name),
+		strings.TrimSpace(resourceUID),
 		strings.TrimSpace(user),
 		strings.TrimSpace(ruleID),
 	}
@@ -81,14 +83,14 @@ func admissionApprovalKeyForContext(cfg *RuntimeConfig, ac AdmissionContext, pd 
 	if pd.Rule != nil {
 		ruleID = pd.Rule.ID
 	}
-	return admissionApprovalKey(cluster, ac.Operation, ac.APIGroup, ac.Resource, ac.Namespace, ac.Name, ac.User, ruleID)
+	return admissionApprovalKey(cluster, ac.Operation, ac.APIGroup, ac.Resource, ac.Namespace, ac.Name, ac.ResourceUID, ac.User, ruleID)
 }
 
 func admissionApprovalKeyForEvent(ev *AdmissionEvent) string {
 	if ev == nil {
 		return ""
 	}
-	return admissionApprovalKey(ev.Cluster, ev.Operation, ev.APIGroup, ev.Resource, ev.Namespace, ev.Name, ev.User, ev.RuleID)
+	return admissionApprovalKey(ev.Cluster, ev.Operation, ev.APIGroup, ev.Resource, ev.Namespace, ev.Name, ev.ResourceUID, ev.User, ev.RuleID)
 }
 
 func approvalTTLSecondsForRule(cfg *RuntimeConfig, rule *PolicyRule) int {
@@ -122,11 +124,19 @@ func findRuleByID(cfg *RuntimeConfig, id string) *PolicyRule {
 func (a *App) consumeAdmissionApproval(ctx context.Context, cfg *RuntimeConfig, ac AdmissionContext, pd PolicyDecision) (*AdmissionApprovalGrant, error) {
 	key := admissionApprovalKeyForContext(cfg, ac, pd)
 	if a.mongo != nil && a.mongo.Healthy() {
-		if grant, err := a.mongo.ConsumeAdmissionApprovalGrant(ctx, key, ac.RequestUID); err == nil && grant != nil {
+		grant, err := a.mongo.ConsumeAdmissionApprovalGrant(ctx, key, ac.RequestUID)
+		if err == nil {
+			// Mongo is the shared source of truth when healthy. The same grant is also
+			// saved locally as a fallback, so remove any local pending copy after Mongo
+			// has answered. Otherwise a consumed Mongo grant can be consumed a second
+			// time from the stale local fallback for a recreated same-name resource.
+			if a.local != nil {
+				_ = a.local.DeletePendingAdmissionApprovalGrant(key)
+			}
 			return grant, nil
 		}
 	}
-	if a.local == nil {
+	if a.local == nil || (cfg != nil && !cfg.Storage.UseSharedApprovalFallback) {
 		return nil, nil
 	}
 	grant, err := a.local.ConsumeAdmissionApprovalGrant(key, ac.RequestUID)
@@ -156,6 +166,7 @@ func (a *App) createAdmissionApprovalGrant(ctx context.Context, ev *AdmissionEve
 		Kind:         ev.Kind,
 		Namespace:    ev.Namespace,
 		Name:         ev.Name,
+		ResourceUID:  ev.ResourceUID,
 		User:         ev.User,
 		ApprovedBy:   approvedBy,
 		ApprovedByID: approvedByID,
@@ -204,6 +215,19 @@ func (s *LocalStore) SaveAdmissionApprovalGrant(grant *AdmissionApprovalGrant) e
 		return err
 	}
 	return os.Rename(tmp, pending)
+}
+
+func (s *LocalStore) DeletePendingAdmissionApprovalGrant(id string) error {
+	if s == nil || strings.TrimSpace(id) == "" {
+		return nil
+	}
+	name := safeFileName(id) + ".json"
+	pending := filepath.Join(s.root, "approvals/pending", name)
+	err := os.Remove(pending)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func (s *LocalStore) ConsumeAdmissionApprovalGrant(id, requestUID string) (*AdmissionApprovalGrant, error) {

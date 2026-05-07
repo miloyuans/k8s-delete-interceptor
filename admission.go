@@ -58,7 +58,7 @@ func (a *App) admit(ctx context.Context, req *admissionv1.AdmissionRequest) *adm
 	}
 	ac := AdmissionContext{
 		Operation: string(req.Operation), APIGroup: req.Resource.Group, APIVersion: req.Resource.Version, Resource: req.Resource.Resource, SubResource: req.SubResource,
-		Kind: req.Kind.Kind, Namespace: req.Namespace, Name: req.Name, User: req.UserInfo.Username, Groups: req.UserInfo.Groups,
+		Kind: req.Kind.Kind, Namespace: req.Namespace, Name: req.Name, ResourceUID: admissionResourceUID(objMap, oldMap), User: req.UserInfo.Username, Groups: req.UserInfo.Groups,
 		Object: objMap, OldObject: oldMap, ObjectRaw: req.Object.Raw, OldObjectRaw: req.OldObject.Raw, RequestUID: string(req.UID),
 	}
 	pd := decide(cfg, ac)
@@ -143,12 +143,22 @@ func ruleIDForLog(pd PolicyDecision) string {
 	return pd.Rule.ID
 }
 
+func admissionResourceUID(objMap, oldMap map[string]any) string {
+	if uid, ok := getNestedString(oldMap, "metadata", "uid"); ok && strings.TrimSpace(uid) != "" {
+		return strings.TrimSpace(uid)
+	}
+	if uid, ok := getNestedString(objMap, "metadata", "uid"); ok && strings.TrimSpace(uid) != "" {
+		return strings.TrimSpace(uid)
+	}
+	return ""
+}
+
 func (a *App) buildEvent(cfg *RuntimeConfig, req *admissionv1.AdmissionRequest, ac AdmissionContext, pd PolicyDecision, idOverride string, final bool, stage string) *AdmissionEvent {
 	id := strings.TrimSpace(idOverride)
 	if id == "" {
 		id = eventID(cfg.ClusterName, string(req.UID), ac.Operation, ac.APIGroup, ac.Resource, ac.Namespace, ac.Name)
 	}
-	ev := &AdmissionEvent{ID: id, RequestUID: string(req.UID), Time: time.Now().UTC(), Cluster: cfg.ClusterName, Operation: ac.Operation, APIVersion: ac.APIVersion, APIGroup: ac.APIGroup, Resource: ac.Resource, SubResource: ac.SubResource, Kind: ac.Kind, Namespace: ac.Namespace, Name: ac.Name, User: ac.User, Groups: ac.Groups, ScopeMatched: pd.ScopeMatched, ScopeIDs: pd.ScopeIDs, Decision: pd.Decision, Allowed: pd.Allowed && pd.Decision != DecisionRequireApproval, Reason: pd.Reason, ChangeClass: pd.ChangeClass, ChangeSummary: pd.ChangeSummary, Final: final, LifecycleStage: stage, PersistStatus: "unknown", Object: ac.ObjectRaw, OldObject: ac.OldObjectRaw}
+	ev := &AdmissionEvent{ID: id, RequestUID: string(req.UID), Time: time.Now().UTC(), Cluster: cfg.ClusterName, Operation: ac.Operation, APIVersion: ac.APIVersion, APIGroup: ac.APIGroup, Resource: ac.Resource, SubResource: ac.SubResource, Kind: ac.Kind, Namespace: ac.Namespace, Name: ac.Name, ResourceUID: ac.ResourceUID, User: ac.User, Groups: ac.Groups, ScopeMatched: pd.ScopeMatched, ScopeIDs: pd.ScopeIDs, Decision: pd.Decision, Allowed: pd.Allowed && pd.Decision != DecisionRequireApproval, Reason: pd.Reason, ChangeClass: pd.ChangeClass, ChangeSummary: pd.ChangeSummary, Final: final, LifecycleStage: stage, PersistStatus: "unknown", Object: ac.ObjectRaw, OldObject: ac.OldObjectRaw}
 	if pd.Rule != nil {
 		ev.RuleID = pd.Rule.ID
 		ev.RuleName = pd.Rule.Name

@@ -27,6 +27,7 @@ func admissionEventFingerprint(cfg *RuntimeConfig, ac AdmissionContext, pd Polic
 		"kind":         strings.TrimSpace(ac.Kind),
 		"namespace":    strings.TrimSpace(ac.Namespace),
 		"name":         strings.TrimSpace(ac.Name),
+		"resource_uid": strings.TrimSpace(ac.ResourceUID),
 		"user":         strings.TrimSpace(ac.User),
 		"rule_id":      ruleID,
 		"decision":     pd.Decision,

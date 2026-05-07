@@ -759,7 +759,7 @@ func admissionContextFromStoredEvent(ev *AdmissionEvent) AdmissionContext {
 	}
 	return AdmissionContext{
 		Operation: ev.Operation, APIGroup: ev.APIGroup, APIVersion: ev.APIVersion, Resource: ev.Resource, SubResource: ev.SubResource,
-		Kind: ev.Kind, Namespace: ev.Namespace, Name: ev.Name, User: ev.User, Groups: ev.Groups,
+		Kind: ev.Kind, Namespace: ev.Namespace, Name: ev.Name, ResourceUID: ev.ResourceUID, User: ev.User, Groups: ev.Groups,
 		Object: objMap, OldObject: oldMap, ObjectRaw: ev.Object, OldObjectRaw: ev.OldObject, RequestUID: ev.RequestUID,
 	}
 }

@@ -352,6 +352,7 @@ type AdmissionEvent struct {
 	Kind            string          `json:"kind" bson:"kind"`
 	Namespace       string          `json:"namespace" bson:"namespace"`
 	Name            string          `json:"name" bson:"name"`
+	ResourceUID     string          `json:"resource_uid,omitempty" bson:"resource_uid,omitempty"`
 	User            string          `json:"user" bson:"user"`
 	Groups          []string        `json:"groups" bson:"groups"`
 	ScopeMatched    bool            `json:"scope_matched" bson:"scope_matched"`

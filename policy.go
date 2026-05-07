@@ -18,6 +18,7 @@ type AdmissionContext struct {
 	Kind         string
 	Namespace    string
 	Name         string
+	ResourceUID  string
 	User         string
 	Groups       []string
 	Object       map[string]any

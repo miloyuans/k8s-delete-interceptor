@@ -383,6 +383,24 @@ func telegramActionLegacyAllowed(tg *TelegramConfig) bool {
 	return true
 }
 
+func telegramUnauthorizedHint(cb *telegramCallbackQuery, need string) string {
+	id := telegramCallbackUserID(cb)
+	username := telegramCallbackUsername(cb)
+	if id == "" {
+		id = "未知"
+	}
+	if username == "" {
+		username = "未公开"
+	} else {
+		username = "@" + username
+	}
+	roleHint := "telegram_approver,operator"
+	if strings.Contains(strings.ToLower(need), "回滚") {
+		roleHint = "rollback_operator 或 operator"
+	}
+	return fmt.Sprintf("未授权：请在 Web > Telegram > 用户ID 绑定 Telegram User ID=%s，用户名=%s，并配置角色 %s", id, username, roleHint)
+}
+
 func telegramCanApproveConfigChange(tg *TelegramConfig, cb *telegramCallbackQuery) bool {
 	if telegramActionLegacyAllowed(tg) {
 		return true

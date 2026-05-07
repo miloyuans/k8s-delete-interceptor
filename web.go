@@ -1623,6 +1623,9 @@ func upsertRuleFromRequest(cfg *RuntimeConfig, req RuleEditRequest) error {
 	if strings.TrimSpace(rule.ID) == "" {
 		return fmt.Errorf("rule name is required")
 	}
+	if ruleNeedsExplicitActorGroup(rule) && len(rule.ActorGroupIDs) == 0 {
+		return fmt.Errorf("通知、审批、回滚类规则必须选择 ActorGroup；未命中 ActorGroup 的用户/SA 将只做静默审计")
+	}
 	upsertScope(cfg, scope)
 	updated := false
 	for i := range cfg.Rules {
@@ -1689,6 +1692,11 @@ func normalizeRuleRequest(req RuleEditRequest) RuleEditRequest {
 	req.APIGroups = dedupeTrimAPIGroup(req.APIGroups)
 	req.Resources = dedupeTrim(req.Resources)
 	req.Kinds = dedupeTrim(req.Kinds)
+	if containsExact(req.APIGroups, "*") || containsExact(req.Resources, "*") || containsExact(req.Kinds, "*") {
+		req.APIGroups = []string{"*"}
+		req.Resources = []string{"*"}
+		req.Kinds = []string{"*"}
+	}
 	req.Namespaces = dedupeTrim(req.Namespaces)
 	req.Names = dedupeTrim(req.Names)
 	req.ActorGroupIDs = dedupeTrim(req.ActorGroupIDs)
@@ -1713,6 +1721,15 @@ func normalizeRuleRequest(req RuleEditRequest) RuleEditRequest {
 		req.Names = []string{"*"}
 	}
 	return req
+}
+
+func containsExact(xs []string, want string) bool {
+	for _, x := range xs {
+		if strings.TrimSpace(x) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func parseRuleYAML(raw string) (RuleEditRequest, error) {

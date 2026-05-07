@@ -711,13 +711,14 @@ func renderTemplate(cfg *RuntimeConfig, tg *TelegramConfig, ev *AdmissionEvent, 
 			}
 		}
 	}
+	timeDisplay := formatEventTimeForTelegram(cfg, ev.Time)
 	data := map[string]string{
 		"cluster": escapeForMode(ev.Cluster, tpl.ParseMode), "operation": escapeForMode(ev.Operation, tpl.ParseMode), "operation_cn": escapeForMode(operationCN(ev.Operation), tpl.ParseMode), "kind": escapeForMode(ev.Kind, tpl.ParseMode),
 		"namespace": escapeForMode(ev.Namespace, tpl.ParseMode), "name": escapeForMode(ev.Name, tpl.ParseMode), "resource": escapeForMode(ev.Resource, tpl.ParseMode),
 		"user": escapeForMode(ev.User, tpl.ParseMode), "actor_display": escapeForMode(actorDisplay, tpl.ParseMode), "rule_name": escapeForMode(ev.RuleName, tpl.ParseMode),
 		"reason": escapeForMode(ev.Reason, tpl.ParseMode), "change_class": escapeForMode(ev.ChangeClass, tpl.ParseMode), "change_summary": escapeForMode(ev.ChangeSummary, tpl.ParseMode),
 		"request_uid": escapeForMode(ev.RequestUID, tpl.ParseMode), "event_id": escapeForMode(ev.ID, tpl.ParseMode), "rollback_id": escapeForMode(ev.RollbackID, tpl.ParseMode),
-		"event_url": escapeForMode(eventURL, tpl.ParseMode), "time": escapeForMode(ev.Time.Format(time.RFC3339), tpl.ParseMode), "approvers_mentions": strings.Join(approvers, " "),
+		"event_url": escapeForMode(eventURL, tpl.ParseMode), "time": escapeForMode(ev.Time.Format(time.RFC3339), tpl.ParseMode), "time_display": escapeForMode(timeDisplay, tpl.ParseMode), "approvers_mentions": strings.Join(approvers, " "),
 	}
 	t, err := template.New(tpl.ID).Option("missingkey=zero").Parse(tpl.Body)
 	if err != nil {
@@ -728,6 +729,22 @@ func renderTemplate(cfg *RuntimeConfig, tg *TelegramConfig, ev *AdmissionEvent, 
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+func formatEventTimeForTelegram(cfg *RuntimeConfig, t time.Time) string {
+	if t.IsZero() {
+		t = time.Now().UTC()
+	}
+	tz := "UTC"
+	if cfg != nil && strings.TrimSpace(cfg.Web.DefaultTimezone) != "" {
+		tz = strings.TrimSpace(cfg.Web.DefaultTimezone)
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		loc = time.UTC
+		tz = "UTC"
+	}
+	return t.In(loc).Format("2006-01-02 15:04:05 ") + tz
 }
 
 func compactActorName(user string) string {
@@ -1203,7 +1220,7 @@ func (a *App) handleConfigChangeTelegramCallback(ctx context.Context, token stri
 		return
 	}
 	if !telegramCanApproveConfigChange(tg, cb) {
-		_ = answerTelegramCallback(ctx, token, callbackID, "未授权的 Telegram 审批人", true)
+		_ = answerTelegramCallback(ctx, token, callbackID, telegramUnauthorizedHint(cb, "配置审批"), true)
 		return
 	}
 	user := &AuthUser{Username: "telegram:" + actor, DisplayName: actor, Roles: []string{"telegram_approver"}, Permissions: []string{PermConfigApprove}}
@@ -1247,7 +1264,7 @@ func (a *App) handleEventTelegramCallback(ctx context.Context, token, chatID str
 		}
 		rule := findRuleByID(a.Config(), ev.RuleID)
 		if !telegramCanApproveAdmissionEvent(tg, cb, rule) {
-			_ = answerTelegramCallback(ctx, token, callbackID, "未授权的事件审批人", true)
+			_ = answerTelegramCallback(ctx, token, callbackID, telegramUnauthorizedHint(cb, "事件审批"), true)
 			return
 		}
 		action, execErr := a.executeApprovedAdmissionAction(ctx, ev, actor)
@@ -1273,7 +1290,7 @@ func (a *App) handleEventTelegramCallback(ctx context.Context, token, chatID str
 		}
 		rule := findRuleByID(a.Config(), ev.RuleID)
 		if !telegramCanApproveAdmissionEvent(tg, cb, rule) {
-			_ = answerTelegramCallback(ctx, token, callbackID, "未授权的事件审批人", true)
+			_ = answerTelegramCallback(ctx, token, callbackID, telegramUnauthorizedHint(cb, "事件审批"), true)
 			return
 		}
 		_ = answerTelegramCallback(ctx, token, callbackID, "已拒绝", false)
@@ -1299,7 +1316,7 @@ func (a *App) handleEventTelegramCallback(ctx context.Context, token, chatID str
 		go a.updateEventTelegramStatus(context.Background(), ev, fmt.Sprintf("📄 YAML 已下载\n用户: `%s`\n事件ID: `%s`", compactActorName(actor), ev.ID))
 	case "rollback":
 		if !telegramCanExecuteRollback(tg, cb) {
-			_ = answerTelegramCallback(ctx, token, callbackID, "未授权执行回滚", true)
+			_ = answerTelegramCallback(ctx, token, callbackID, telegramUnauthorizedHint(cb, "回滚"), true)
 			return
 		}
 		if !ev.Allowed {

@@ -97,3 +97,12 @@ db.grantRolesToUser("<mongo-user>", [
 ```
 
 如果你自定义了 `MONGO_DATABASE` 或站点设置里的 `cold_database`，把上面的库名替换为实际热库和冷库名称。
+
+## v6 patch
+
+- 修复 ActorGroup 匹配漏洞：空 users/groups/service_accounts 不再被视为 `*`，避免只配置了 ServiceAccount 的组误匹配所有用户。
+- 通知、审批和回滚类规则必须显式选择 ActorGroup；未命中组的用户或 SA 只做静默审计，不发送 Telegram，不生成回滚入口。
+- 规则编辑里选择“全部资源”时自动覆盖其他资源选择；后端 YAML/API 同步规范化为 `api_groups/resources/kinds: ["*"]`。
+- Admission Telegram 模板增加事件时间 `{{.time_display}}`，显示为站点默认时区下的真实接收/执行时间。
+- Telegram 用户资源新增 username 与审批角色配置；审批无权限时会在按钮反馈里直接提示当前 Telegram numeric ID 和应配置的角色。
+- 保持删除审批的安全边界：审批只生成原用户/原 SA 的一次性重试授权，审计程序不会代替原用户执行集群删除。

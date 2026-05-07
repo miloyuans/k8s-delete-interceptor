@@ -74,7 +74,12 @@ func decide(cfg *RuntimeConfig, ac AdmissionContext) PolicyDecision {
 		if len(r.ScopeIDs) > 0 && !intersects(r.ScopeIDs, scopeIDs) {
 			continue
 		}
-		if len(r.ActorGroupIDs) > 0 && !matchActorGroups(cfg, r.ActorGroupIDs, ac) {
+		if len(r.ActorGroupIDs) > 0 {
+			if !matchActorGroups(cfg, r.ActorGroupIDs, ac) {
+				continue
+			}
+		} else if ruleNeedsExplicitActorGroup(*r) {
+			logPolicyActorGate(ac, *r)
 			continue
 		}
 		if len(r.ChangeClasses) > 0 && !matchAnyFold(r.ChangeClasses, changeClass) {
@@ -163,17 +168,41 @@ func matchActorGroups(cfg *RuntimeConfig, ids []string, ac AdmissionContext) boo
 			if a.ID != id || !a.Enabled {
 				continue
 			}
-			if matchPatterns(a.Users, ac.User) || matchPatterns(a.ServiceAccounts, ac.User) {
+			if len(a.Users) > 0 && matchPatterns(a.Users, ac.User) {
 				return true
 			}
-			for _, g := range ac.Groups {
-				if matchPatterns(a.Groups, g) {
-					return true
+			if len(a.ServiceAccounts) > 0 && matchPatterns(a.ServiceAccounts, ac.User) {
+				return true
+			}
+			if len(a.Groups) > 0 {
+				for _, g := range ac.Groups {
+					if matchPatterns(a.Groups, g) {
+						return true
+					}
 				}
 			}
 		}
 	}
 	return false
+}
+
+func ruleNeedsExplicitActorGroup(r PolicyRule) bool {
+	if strings.EqualFold(r.Decision, DecisionAllowNotify) || strings.EqualFold(r.Decision, DecisionRequireApproval) {
+		return true
+	}
+	if r.Approval.Enabled || r.Rollback.Enabled {
+		return true
+	}
+	if r.Notify.Enabled && !strings.EqualFold(r.Decision, DecisionBlock) {
+		return true
+	}
+	return false
+}
+
+func logPolicyActorGate(ac AdmissionContext, r PolicyRule) {
+	// 通知、审批和回滚必须绑定 ActorGroup，避免全资源 UPDATE 规则误把系统控制器、Lease 续约等噪声事件推送到 Telegram。
+	_ = ac
+	_ = r
 }
 
 func passesControllerSafeRule(rule ControllerSafeRule, ac AdmissionContext) bool {

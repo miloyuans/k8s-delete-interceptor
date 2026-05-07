@@ -365,10 +365,10 @@ func defaultNotificationTemplates() []NotificationTemplate {
 
 func defaultTemplates() []NotificationTemplate {
 	return []NotificationTemplate{
-		{ID: "tpl_delete_approval", Name: "删除审批通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🚨 *K8s 删除操作待审批*\n事件ID: `{{.event_id}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n原因: `{{.reason}}`\n审批人: {{.approvers_mentions}}\n[事件详情]({{.event_url}})"},
-		{ID: "tpl_update_notify", Name: "重要更新放行通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "📝 *K8s 更新操作放行通知*\n事件ID: `{{.event_id}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n变更: `{{.change_summary}}`\n[事件详情]({{.event_url}})"},
-		{ID: "tpl_create_notify", Name: "重要创建放行通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🆕 *K8s 创建操作放行通知*\n事件ID: `{{.event_id}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n原因: `{{.reason}}`\n[事件详情]({{.event_url}})"},
-		{ID: "tpl_block", Name: "拦截通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "⛔ *K8s 操作已拦截*\n事件ID: `{{.event_id}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n操作: `{{.operation_cn}}`\n原因: `{{.reason}}`\n[事件详情]({{.event_url}})"},
+		{ID: "tpl_delete_approval", Name: "删除审批通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🚨 *K8s 删除操作待审批*\n事件ID: `{{.event_id}}`\n时间: `{{.time_display}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n原因: `{{.reason}}`\n审批人: {{.approvers_mentions}}\n[事件详情]({{.event_url}})"},
+		{ID: "tpl_update_notify", Name: "重要更新放行通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "📝 *K8s 更新操作放行通知*\n事件ID: `{{.event_id}}`\n时间: `{{.time_display}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n变更: `{{.change_summary}}`\n[事件详情]({{.event_url}})"},
+		{ID: "tpl_create_notify", Name: "重要创建操作放行通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🆕 *K8s 创建操作放行通知*\n事件ID: `{{.event_id}}`\n时间: `{{.time_display}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n原因: `{{.reason}}`\n[事件详情]({{.event_url}})"},
+		{ID: "tpl_block", Name: "拦截通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "⛔ *K8s 操作已拦截*\n事件ID: `{{.event_id}}`\n时间: `{{.time_display}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n操作: `{{.operation_cn}}`\n原因: `{{.reason}}`\n[事件详情]({{.event_url}})"},
 	}
 }
 

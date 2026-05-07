@@ -68,6 +68,7 @@ func (m *MongoStore) Init(ctx context.Context) error {
 		{"config_change_requests", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"config_change_requests", mongo.IndexModel{Keys: bson.D{{Key: "status", Value: 1}, {Key: "created_at", Value: -1}}}},
 		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
+		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "final", Value: 1}, {Key: "time", Value: -1}}}},
 		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "time", Value: -1}}}},
 		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "fingerprint", Value: 1}, {Key: "time", Value: -1}}}},
 		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "cluster", Value: 1}, {Key: "namespace", Value: 1}, {Key: "kind", Value: 1}, {Key: "name", Value: 1}, {Key: "operation", Value: 1}, {Key: "decision", Value: 1}}}},
@@ -500,6 +501,9 @@ func (m *MongoStore) ListEventsByQuery(ctx context.Context, q EventQuery) ([]Adm
 		return nil, errors.New("mongo unavailable")
 	}
 	filter := bson.M{}
+	if !q.IncludeNonFinal {
+		filter["final"] = true
+	}
 	if q.ID != "" {
 		filter["$or"] = []bson.M{{"id": q.ID}, {"request_uid": q.ID}}
 	}
@@ -730,7 +734,7 @@ func (m *MongoStore) FindRecentEventByFingerprint(ctx context.Context, fingerpri
 	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	filter := bson.M{"fingerprint": fingerprint, "time": bson.M{"$gte": since}}
+	filter := bson.M{"fingerprint": fingerprint, "final": true, "time": bson.M{"$gte": since}}
 	var ev AdmissionEvent
 	err := m.db.Collection("admission_events").FindOne(ctx, filter, options.FindOne().SetSort(bson.D{{Key: "time", Value: -1}})).Decode(&ev)
 	if err != nil {

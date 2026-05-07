@@ -325,10 +325,44 @@ func defaultNotificationTemplates() []NotificationTemplate {
 
 func defaultTemplates() []NotificationTemplate {
 	return []NotificationTemplate{
-		{ID: "tpl_delete_approval", Name: "删除审批通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🚨 *K8s 删除操作审批通知*\n动作: ⏳ 待审批\n集群: `{{.cluster}}`\n资源类型: `{{.kind}}`\n资源名称: `{{.name}}`\n命名空间: `{{.namespace}}`\n用户: {{.actor_display}}\n操作: 删除\n规则: `{{.rule_name}}`\n原因: {{.reason}}\n审批人: {{.approvers_mentions}}\n请求ID: `{{.request_uid}}`\n{{.time}}"},
-		{ID: "tpl_update_notify", Name: "重要更新通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "📝 *K8s 更新操作审计通知*\n动作: ✅ 放行\n集群: `{{.cluster}}`\n资源类型: `{{.kind}}`\n资源名称: `{{.name}}`\n命名空间: `{{.namespace}}`\n用户: {{.actor_display}}\n操作: 更新\n变更详情: {{.change_summary}}\n请求ID: `{{.request_uid}}`\n{{.time}}"},
-		{ID: "tpl_create_notify", Name: "重要创建通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🆕 *K8s 创建操作审计通知*\n动作: ✅ 放行\n集群: `{{.cluster}}`\n资源类型: `{{.kind}}`\n资源名称: `{{.name}}`\n命名空间: `{{.namespace}}`\n用户: {{.actor_display}}\n操作: 创建\n原因: {{.reason}}\n请求ID: `{{.request_uid}}`\n{{.time}}"},
-		{ID: "tpl_block", Name: "拦截通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "⛔ *K8s 操作拦截通知*\n动作: ⛔ 拦截\n集群: `{{.cluster}}`\n资源类型: `{{.kind}}`\n资源名称: `{{.name}}`\n命名空间: `{{.namespace}}`\n用户: {{.actor_display}}\n操作: {{.operation_cn}}\n原因: {{.reason}}\n请求ID: `{{.request_uid}}`\n{{.time}}"},
+		{ID: "tpl_delete_approval", Name: "删除审批通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: `🚨 *K8s 删除操作待审批*
+1、事件ID: ` + "`" + `{{.event_id}}` + "`" + `
+2、集群: ` + "`" + `{{.cluster}}` + "`" + `
+3、资源: ` + "`" + `{{.kind}}/{{.namespace}}/{{.name}}` + "`" + `
+4、用户: ` + "`" + `{{.actor_display}}` + "`" + `
+5、原因: ` + "`" + `{{.reason}}` + "`" + `
+审批人: {{.approvers_mentions}}
+查询关键字:
+1、` + "`" + `{{.event_id}}` + "`" + `
+[事件详情]({{.event_url}})`},
+		{ID: "tpl_update_notify", Name: "重要更新放行通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: `📝 *K8s 更新操作放行通知*
+1、事件ID: ` + "`" + `{{.event_id}}` + "`" + `
+2、集群: ` + "`" + `{{.cluster}}` + "`" + `
+3、资源: ` + "`" + `{{.kind}}/{{.namespace}}/{{.name}}` + "`" + `
+4、用户: ` + "`" + `{{.actor_display}}` + "`" + `
+5、变更: ` + "`" + `{{.change_summary}}` + "`" + `
+查询关键字:
+1、` + "`" + `{{.event_id}}` + "`" + `
+[事件详情]({{.event_url}})`},
+		{ID: "tpl_create_notify", Name: "重要创建放行通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: `🆕 *K8s 创建操作放行通知*
+1、事件ID: ` + "`" + `{{.event_id}}` + "`" + `
+2、集群: ` + "`" + `{{.cluster}}` + "`" + `
+3、资源: ` + "`" + `{{.kind}}/{{.namespace}}/{{.name}}` + "`" + `
+4、用户: ` + "`" + `{{.actor_display}}` + "`" + `
+5、原因: ` + "`" + `{{.reason}}` + "`" + `
+查询关键字:
+1、` + "`" + `{{.event_id}}` + "`" + `
+[事件详情]({{.event_url}})`},
+		{ID: "tpl_block", Name: "拦截通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: `⛔ *K8s 操作已拦截*
+1、事件ID: ` + "`" + `{{.event_id}}` + "`" + `
+2、集群: ` + "`" + `{{.cluster}}` + "`" + `
+3、资源: ` + "`" + `{{.kind}}/{{.namespace}}/{{.name}}` + "`" + `
+4、用户: ` + "`" + `{{.actor_display}}` + "`" + `
+5、操作: ` + "`" + `{{.operation_cn}}` + "`" + `
+6、原因: ` + "`" + `{{.reason}}` + "`" + `
+查询关键字:
+1、` + "`" + `{{.event_id}}` + "`" + `
+[事件详情]({{.event_url}})`},
 	}
 }
 

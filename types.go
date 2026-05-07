@@ -362,6 +362,8 @@ type AdmissionEvent struct {
 	Reason          string          `json:"reason" bson:"reason"`
 	ChangeClass     string          `json:"change_class" bson:"change_class"`
 	ChangeSummary   string          `json:"change_summary" bson:"change_summary"`
+	Final           bool            `json:"final" bson:"final"`
+	LifecycleStage  string          `json:"lifecycle_stage,omitempty" bson:"lifecycle_stage,omitempty"`
 	RollbackID      string          `json:"rollback_id,omitempty" bson:"rollback_id,omitempty"`
 	Fingerprint     string          `json:"fingerprint,omitempty" bson:"fingerprint,omitempty"`
 	Duplicate       bool            `json:"duplicate,omitempty" bson:"duplicate,omitempty"`

@@ -7,19 +7,20 @@ import (
 )
 
 type EventQuery struct {
-	ID        string
-	Limit     int
-	Start     time.Time
-	End       time.Time
-	Cluster   string
-	Namespace string
-	Kind      string
-	Resource  string
-	Name      string
-	User      string
-	Operation string
-	Decision  string
-	Allowed   *bool
+	ID              string
+	Limit           int
+	Start           time.Time
+	End             time.Time
+	Cluster         string
+	Namespace       string
+	Kind            string
+	Resource        string
+	Name            string
+	User            string
+	Operation       string
+	Decision        string
+	Allowed         *bool
+	IncludeNonFinal bool
 }
 
 func (q EventQuery) NormalizedLimit(def int) int {
@@ -36,6 +37,9 @@ func (q EventQuery) NormalizedLimit(def int) int {
 }
 
 func (q EventQuery) Match(ev AdmissionEvent) bool {
+	if !q.IncludeNonFinal && !ev.Final {
+		return false
+	}
 	if q.ID != "" && !matchPattern(ev.ID, q.ID, true) && !matchPattern(ev.RequestUID, q.ID, true) {
 		return false
 	}

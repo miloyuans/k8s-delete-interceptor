@@ -55,8 +55,8 @@ func (a *App) emitStartupNotification(ctx context.Context) {
 	if cfg != nil && cfg.ClusterName != "" {
 		cluster = cfg.ClusterName
 	}
-	body := fmt.Sprintf("🔔 *K8s 删除拦截服务启动*\n集群: `%s`\n实例: `%s`\n时间: `%s`\n状态: `webhook/web console 已启动`", cluster, envOr("HOSTNAME", "pod"), time.Now().UTC().Format(time.RFC3339))
-	a.emitSystemNotification(ctx, "service_start", "服务启动", body, false)
+	body := fmt.Sprintf("✅ *K8s 删除拦截服务启动成功*\n1、集群: `%s`\n2、实例: `%s`\n3、时间: `%s`\n4、状态: `webhook/web console 已启动`", cluster, envOr("HOSTNAME", "pod"), time.Now().UTC().Format(time.RFC3339))
+	a.emitSystemNotification(ctx, "service_start", "服务启动成功", body, true)
 }
 
 func (a *App) emitShutdownNotification(ctx context.Context) {
@@ -65,7 +65,7 @@ func (a *App) emitShutdownNotification(ctx context.Context) {
 	if cfg != nil && cfg.ClusterName != "" {
 		cluster = cfg.ClusterName
 	}
-	body := fmt.Sprintf("🛑 *K8s 删除拦截服务关闭*\n集群: `%s`\n实例: `%s`\n时间: `%s`\n状态: `收到终止信号，正在优雅关闭`", cluster, envOr("HOSTNAME", "pod"), time.Now().UTC().Format(time.RFC3339))
+	body := fmt.Sprintf("🛑 *K8s 删除拦截服务正在关闭*\n1、集群: `%s`\n2、实例: `%s`\n3、时间: `%s`\n4、状态: `收到终止信号，正在优雅关闭`", cluster, envOr("HOSTNAME", "pod"), time.Now().UTC().Format(time.RFC3339))
 	a.emitSystemNotification(ctx, "service_shutdown", "服务关闭", body, true)
 }
 
@@ -85,10 +85,10 @@ func (a *App) emitMongoStatusNotification(ctx context.Context, recovered bool, d
 		icon = "✅"
 		state = "Mongo 数据源已恢复，本地队列将继续同步并补发通知"
 	}
-	body := fmt.Sprintf("%s *%s*\n集群: `%s`\n实例: `%s`\n时间: `%s`\n状态: `%s`", icon, title, cluster, envOr("HOSTNAME", "pod"), time.Now().UTC().Format(time.RFC3339), state)
+	body := fmt.Sprintf("%s *%s*\n1、集群: `%s`\n2、实例: `%s`\n3、时间: `%s`\n4、状态: `%s`", icon, title, cluster, envOr("HOSTNAME", "pod"), time.Now().UTC().Format(time.RFC3339), state)
 	if strings.TrimSpace(detail) != "" {
 		detail = strings.ReplaceAll(truncateForTelegram(detail, 300), "`", "'")
-		body += "\n详情: `" + detail + "`"
+		body += "\n5、详情: `" + detail + "`"
 	}
 	a.emitSystemNotification(ctx, kind, title, body, false)
 }

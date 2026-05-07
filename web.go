@@ -1934,7 +1934,10 @@ func (a *App) handleDatasourceTest(w http.ResponseWriter, r *http.Request) {
 
 func parseEventQuery(r *http.Request) EventQuery {
 	qv := r.URL.Query()
-	q := EventQuery{ID: strings.TrimSpace(firstNonEmpty(qv.Get("id"), qv.Get("event_id"), qv.Get("event"))), Limit: parseLimit(r, 200), Cluster: strings.TrimSpace(qv.Get("cluster")), Namespace: strings.TrimSpace(qv.Get("namespace")), Kind: strings.TrimSpace(qv.Get("kind")), Resource: strings.TrimSpace(qv.Get("resource")), Name: strings.TrimSpace(qv.Get("name")), User: strings.TrimSpace(qv.Get("user")), Operation: strings.ToUpper(strings.TrimSpace(qv.Get("operation"))), Decision: strings.TrimSpace(qv.Get("decision"))}
+	q := EventQuery{ID: strings.TrimSpace(firstNonEmpty(qv.Get("id"), qv.Get("event_id"), qv.Get("event"))), Limit: parseLimit(r, 200), Cluster: strings.TrimSpace(qv.Get("cluster")), Namespace: strings.TrimSpace(qv.Get("namespace")), Kind: strings.TrimSpace(qv.Get("kind")), Resource: strings.TrimSpace(qv.Get("resource")), Name: strings.TrimSpace(qv.Get("name")), User: strings.TrimSpace(qv.Get("user")), Operation: strings.ToUpper(strings.TrimSpace(qv.Get("operation"))), Decision: strings.TrimSpace(qv.Get("decision")), IncludeNonFinal: truthy(qv.Get("include_non_final"))}
+	if q.ID != "" {
+		q.IncludeNonFinal = true
+	}
 	if v := strings.TrimSpace(qv.Get("allowed")); v != "" {
 		b := v == "true" || v == "1" || strings.EqualFold(v, "yes")
 		q.Allowed = &b
@@ -1946,6 +1949,11 @@ func parseEventQuery(r *http.Request) EventQuery {
 		q.Start, q.End = q.End, q.Start
 	}
 	return q
+}
+
+func truthy(v string) bool {
+	v = strings.TrimSpace(strings.ToLower(v))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
 func firstNonEmpty(xs ...string) string {

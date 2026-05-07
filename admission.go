@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
+	"crypto/rand"
+	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -63,45 +63,67 @@ func (a *App) admit(ctx context.Context, req *admissionv1.AdmissionRequest) *adm
 	}
 	pd := decide(cfg, ac)
 	log.Printf("admission policy decided: uid=%s op=%s group=%q resource=%s kind=%s ns=%s name=%s user=%s decision=%s allowed=%v rule=%s scopes=%v reason=%s", req.UID, ac.Operation, ac.APIGroup, ac.Resource, ac.Kind, ac.Namespace, ac.Name, ac.User, pd.Decision, pd.Allowed, ruleIDForLog(pd), pd.ScopeIDs, pd.Reason)
+
 	approvalConsumed := false
 	systemExecutionApproval := false
+	approvedEventID := ""
 	if pd.Decision == DecisionRequireApproval {
 		if grant, err := a.consumeAdmissionApproval(ctx, cfg, ac, pd); err == nil && grant != nil {
 			approvalConsumed = true
+			approvedEventID = strings.TrimSpace(grant.EventID)
 			if isSystemExecutionApprovalGrant(grant) {
 				systemExecutionApproval = true
-				pd.Decision = DecisionAuditOnly
+				pd.Decision = DecisionAllowNotify
 				pd.Allowed = true
-				pd.Reason = fmt.Sprintf("Telegram 已审批，系统代执行，审批人: %s，原事件: %s", grant.ApprovedBy, grant.EventID)
+				pd.Reason = fmt.Sprintf("审批放行后系统代执行，审批人: %s，事件ID: %s", compactActorName(grant.ApprovedBy), grant.EventID)
 			} else {
 				pd.Decision = DecisionAllowNotify
 				pd.Allowed = true
-				pd.Reason = fmt.Sprintf("已审批放行，审批人: %s，原事件: %s", grant.ApprovedBy, grant.EventID)
+				pd.Reason = fmt.Sprintf("审批放行后用户重试执行，审批人: %s，事件ID: %s", compactActorName(grant.ApprovedBy), grant.EventID)
 			}
 		} else if err != nil {
 			log.Printf("admission approval lookup failed: uid=%s key=%s err=%v", req.UID, admissionApprovalKeyForContext(cfg, ac, pd), err)
 		}
 	}
-	ev := a.buildEvent(cfg, req, ac, pd)
+
+	final := pd.Allowed && pd.Decision != DecisionRequireApproval
+	stage := "executed"
+	if !final {
+		stage = "not_executed"
+		if pd.Decision == DecisionRequireApproval {
+			stage = "pending_approval"
+		} else if pd.Decision == DecisionBlock {
+			stage = "blocked"
+		}
+	} else if approvalConsumed {
+		stage = "approved_executed"
+	}
+	ev := a.buildEvent(cfg, req, ac, pd, approvedEventID, final, stage)
 	if approvalConsumed {
 		ev.Reason = pd.Reason
 	}
 	ev.Fingerprint = admissionEventFingerprint(cfg, ac, pd)
-	if dup, err := a.recentDuplicateEvent(ctx, cfg, ev.Fingerprint); err == nil && dup != nil {
-		ev.Duplicate = true
-		ev.DuplicateOf = dup.ID
-		log.Printf("admission duplicate suppressed: uid=%s event=%s duplicate_of=%s fingerprint=%s", req.UID, ev.ID, dup.ID, ev.Fingerprint)
-		return admissionResponseForDecision(pd)
-	} else if err != nil {
-		log.Printf("admission duplicate lookup failed: uid=%s fingerprint=%s err=%v", req.UID, ev.Fingerprint, err)
-	}
-	if !systemExecutionApproval && shouldCreateRollback(cfg, pd, ac) {
-		if rb, err := a.createRollbackBackup(ctx, cfg, ev, ac, pd); err == nil && rb != nil {
-			ev.RollbackID = rb.ID
+	if final {
+		if dup, err := a.recentDuplicateEvent(ctx, cfg, ev.Fingerprint); err == nil && dup != nil && dup.ID != ev.ID {
+			ev.Duplicate = true
+			ev.DuplicateOf = dup.ID
+			log.Printf("admission duplicate suppressed: uid=%s event=%s duplicate_of=%s fingerprint=%s", req.UID, ev.ID, dup.ID, ev.Fingerprint)
+			return admissionResponseForDecision(pd)
+		} else if err != nil {
+			log.Printf("admission duplicate lookup failed: uid=%s fingerprint=%s err=%v", req.UID, ev.Fingerprint, err)
 		}
 	}
+	if final && shouldCreateRollback(cfg, pd, ac) {
+		if rb, err := a.createRollbackBackup(ctx, cfg, ev, ac, pd); err == nil && rb != nil {
+			ev.RollbackID = rb.ID
+		} else if err != nil {
+			log.Printf("rollback backup create failed: event=%s err=%v", ev.ID, err)
+		}
+	}
+
+	// 非最终事件仍会落库作为 Telegram/Web 审批内部状态，但历史事件默认只展示 Final=true 的真实集群执行事件。
 	a.recordEvent(ev)
-	if !systemExecutionApproval && shouldNotify(pd) {
+	if !approvalConsumed && !systemExecutionApproval && shouldNotify(pd) {
 		go a.notifyEvent(context.Background(), cfg, ev, pd)
 	}
 	return admissionResponseForDecision(pd)
@@ -124,9 +146,12 @@ func ruleIDForLog(pd PolicyDecision) string {
 	return pd.Rule.ID
 }
 
-func (a *App) buildEvent(cfg *RuntimeConfig, req *admissionv1.AdmissionRequest, ac AdmissionContext, pd PolicyDecision) *AdmissionEvent {
-	id := eventID(cfg.ClusterName, string(req.UID), ac.Operation, ac.APIGroup, ac.Resource, ac.Namespace, ac.Name)
-	ev := &AdmissionEvent{ID: id, RequestUID: string(req.UID), Time: time.Now().UTC(), Cluster: cfg.ClusterName, Operation: ac.Operation, APIVersion: ac.APIVersion, APIGroup: ac.APIGroup, Resource: ac.Resource, SubResource: ac.SubResource, Kind: ac.Kind, Namespace: ac.Namespace, Name: ac.Name, User: ac.User, Groups: ac.Groups, ScopeMatched: pd.ScopeMatched, ScopeIDs: pd.ScopeIDs, Decision: pd.Decision, Allowed: pd.Allowed && pd.Decision != DecisionRequireApproval, Reason: pd.Reason, ChangeClass: pd.ChangeClass, ChangeSummary: pd.ChangeSummary, PersistStatus: "unknown", Object: ac.ObjectRaw, OldObject: ac.OldObjectRaw}
+func (a *App) buildEvent(cfg *RuntimeConfig, req *admissionv1.AdmissionRequest, ac AdmissionContext, pd PolicyDecision, idOverride string, final bool, stage string) *AdmissionEvent {
+	id := strings.TrimSpace(idOverride)
+	if id == "" {
+		id = eventID(cfg.ClusterName, string(req.UID), ac.Operation, ac.APIGroup, ac.Resource, ac.Namespace, ac.Name)
+	}
+	ev := &AdmissionEvent{ID: id, RequestUID: string(req.UID), Time: time.Now().UTC(), Cluster: cfg.ClusterName, Operation: ac.Operation, APIVersion: ac.APIVersion, APIGroup: ac.APIGroup, Resource: ac.Resource, SubResource: ac.SubResource, Kind: ac.Kind, Namespace: ac.Namespace, Name: ac.Name, User: ac.User, Groups: ac.Groups, ScopeMatched: pd.ScopeMatched, ScopeIDs: pd.ScopeIDs, Decision: pd.Decision, Allowed: pd.Allowed && pd.Decision != DecisionRequireApproval, Reason: pd.Reason, ChangeClass: pd.ChangeClass, ChangeSummary: pd.ChangeSummary, Final: final, LifecycleStage: stage, PersistStatus: "unknown", Object: ac.ObjectRaw, OldObject: ac.OldObjectRaw}
 	if pd.Rule != nil {
 		ev.RuleID = pd.Rule.ID
 		ev.RuleName = pd.Rule.Name
@@ -135,12 +160,25 @@ func (a *App) buildEvent(cfg *RuntimeConfig, req *admissionv1.AdmissionRequest, 
 }
 
 func eventID(cluster, uid, op, group, res, ns, name string) string {
-	if strings.TrimSpace(uid) == "" {
-		uid = fmt.Sprintf("no_uid_%d", time.Now().UnixNano())
+	_ = cluster
+	_ = uid
+	_ = op
+	_ = group
+	_ = res
+	_ = ns
+	_ = name
+	buf := make([]byte, 10)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("ev_%x", time.Now().UnixNano())
 	}
-	s := strings.Join([]string{cluster, uid, op, group, res, ns, name}, "|")
-	h := sha1.Sum([]byte(s))
-	return fmt.Sprintf("%s_%s_%s_%s_%s", cluster, uid, strings.ToLower(op), res, hex.EncodeToString(h[:8]))
+	ts := time.Now().UTC().UnixMilli()
+	var tb [8]byte
+	for i := 7; i >= 0; i-- {
+		tb[i] = byte(ts)
+		ts >>= 8
+	}
+	enc := base32.StdEncoding.WithPadding(base32.NoPadding)
+	return "ev_" + strings.ToLower(enc.EncodeToString(tb[2:])) + "_" + strings.ToLower(enc.EncodeToString(buf[:5]))
 }
 
 func shouldNotify(pd PolicyDecision) bool {
@@ -154,7 +192,7 @@ func shouldNotify(pd PolicyDecision) bool {
 }
 
 func shouldCreateRollback(cfg *RuntimeConfig, pd PolicyDecision, ac AdmissionContext) bool {
-	if cfg == nil || !cfg.Rollback.Enabled || pd.Rule == nil || !pd.Rule.Rollback.Enabled {
+	if cfg == nil || !cfg.Rollback.Enabled || pd.Rule == nil || !pd.Rule.Rollback.Enabled || !pd.Allowed || pd.Decision == DecisionRequireApproval {
 		return false
 	}
 	switch strings.ToUpper(ac.Operation) {
@@ -177,7 +215,7 @@ func (a *App) recordEvent(ev *AdmissionEvent) {
 	if err := a.local.SpoolEvent(ev); err != nil {
 		log.Printf("admission event local spool failed: id=%s uid=%s err=%v", ev.ID, ev.RequestUID, err)
 	} else {
-		log.Printf("admission event spooled: id=%s uid=%s resource=%s/%s/%s op=%s", ev.ID, ev.RequestUID, ev.Kind, ev.Namespace, ev.Name, ev.Operation)
+		log.Printf("admission event spooled: id=%s uid=%s resource=%s/%s/%s op=%s final=%v stage=%s", ev.ID, ev.RequestUID, ev.Kind, ev.Namespace, ev.Name, ev.Operation, ev.Final, ev.LifecycleStage)
 	}
 	if a.mongo != nil && a.mongo.Healthy() {
 		ctx, cancel := context.WithTimeout(context.Background(), eventMongoWriteTimeout())
@@ -187,7 +225,7 @@ func (a *App) recordEvent(ev *AdmissionEvent) {
 			ev.PersistStatus = "local_spooled"
 			log.Printf("admission event mongo save failed, kept in local spool: id=%s uid=%s err=%v", ev.ID, ev.RequestUID, err)
 		} else {
-			log.Printf("admission event saved to mongo: id=%s uid=%s", ev.ID, ev.RequestUID)
+			log.Printf("admission event saved to mongo: id=%s uid=%s final=%v", ev.ID, ev.RequestUID, ev.Final)
 		}
 	} else {
 		log.Printf("admission event kept in local spool because mongo is unavailable: id=%s uid=%s", ev.ID, ev.RequestUID)

@@ -33,6 +33,7 @@ type RuntimeConfig struct {
 	Audit                 AuditConfig            `json:"audit" yaml:"audit" bson:"audit"`
 	SystemProtection      SystemProtectionConfig `json:"system_protection" yaml:"system_protection" bson:"system_protection"`
 	Web                   WebSettings            `json:"web" yaml:"web" bson:"web"`
+	Persistence           PersistenceSettings    `json:"persistence" yaml:"persistence" bson:"persistence"`
 	WebRoles              []WebRole              `json:"web_roles" yaml:"web_roles" bson:"web_roles"`
 	WebUsers              []WebUser              `json:"web_users" yaml:"web_users" bson:"web_users"`
 }
@@ -216,6 +217,21 @@ type WebSettings struct {
 	Theme           string `json:"theme" yaml:"theme" bson:"theme"`
 }
 
+// PersistenceSettings controls operational data lifetime. Runtime/business configuration
+// is deliberately excluded from archival and TTL cleanup.
+type PersistenceSettings struct {
+	Enabled                 bool   `json:"enabled" yaml:"enabled" bson:"enabled"`
+	ActiveDataTTL           string `json:"active_data_ttl" yaml:"active_data_ttl" bson:"active_data_ttl"`
+	ColdDataTTL             string `json:"cold_data_ttl" yaml:"cold_data_ttl" bson:"cold_data_ttl"`
+	ColdDatabase            string `json:"cold_database,omitempty" yaml:"cold_database,omitempty" bson:"cold_database,omitempty"`
+	CleanupInterval         string `json:"cleanup_interval" yaml:"cleanup_interval" bson:"cleanup_interval"`
+	TelegramInteractionTTL  string `json:"telegram_interaction_ttl" yaml:"telegram_interaction_ttl" bson:"telegram_interaction_ttl"`
+	DeleteApprovalTimeout   string `json:"delete_approval_timeout" yaml:"delete_approval_timeout" bson:"delete_approval_timeout"`
+	DuplicateEventWindow    string `json:"duplicate_event_window" yaml:"duplicate_event_window" bson:"duplicate_event_window"`
+	ArchiveBatchSize        int    `json:"archive_batch_size" yaml:"archive_batch_size" bson:"archive_batch_size"`
+	TelegramCallbackPolling bool   `json:"telegram_callback_polling" yaml:"telegram_callback_polling" bson:"telegram_callback_polling"`
+}
+
 type WebRole struct {
 	ID          string   `json:"id" yaml:"id" bson:"id"`
 	Name        string   `json:"name" yaml:"name" bson:"name"`
@@ -250,31 +266,34 @@ const (
 )
 
 type TelegramNotificationEvent struct {
-	ID            string         `json:"id" bson:"id"`
-	Kind          string         `json:"kind" bson:"kind"`
-	EventID       string         `json:"event_id" bson:"event_id"`
-	ChangeID      string         `json:"change_id,omitempty" bson:"change_id,omitempty"`
-	RuleID        string         `json:"rule_id,omitempty" bson:"rule_id,omitempty"`
-	RuleName      string         `json:"rule_name,omitempty" bson:"rule_name,omitempty"`
-	BotID         string         `json:"bot_id" bson:"bot_id"`
-	ChatID        string         `json:"chat_id" bson:"chat_id"`
-	TargetName    string         `json:"target_name,omitempty" bson:"target_name,omitempty"`
-	Text          string         `json:"text" bson:"text"`
-	ParseMode     string         `json:"parse_mode,omitempty" bson:"parse_mode,omitempty"`
-	ReplyMarkup   map[string]any `json:"reply_markup,omitempty" bson:"reply_markup,omitempty"`
-	Status        string         `json:"status" bson:"status"`
-	Attempts      int            `json:"attempts" bson:"attempts"`
-	MaxAttempts   int            `json:"max_attempts" bson:"max_attempts"`
-	NextAttemptAt time.Time      `json:"next_attempt_at" bson:"next_attempt_at"`
-	ClaimedBy     string         `json:"claimed_by,omitempty" bson:"claimed_by,omitempty"`
-	ClaimedAt     time.Time      `json:"claimed_at,omitempty" bson:"claimed_at,omitempty"`
-	CreatedAt     time.Time      `json:"created_at" bson:"created_at"`
-	SentAt        time.Time      `json:"sent_at,omitempty" bson:"sent_at,omitempty"`
-	MessageID     int64          `json:"message_id,omitempty" bson:"message_id,omitempty"`
-	ViewedAt      time.Time      `json:"viewed_at,omitempty" bson:"viewed_at,omitempty"`
-	ViewedBy      string         `json:"viewed_by,omitempty" bson:"viewed_by,omitempty"`
-	ViewCount     int            `json:"view_count,omitempty" bson:"view_count,omitempty"`
-	LastError     string         `json:"last_error,omitempty" bson:"last_error,omitempty"`
+	ID                   string         `json:"id" bson:"id"`
+	Kind                 string         `json:"kind" bson:"kind"`
+	EventID              string         `json:"event_id" bson:"event_id"`
+	ChangeID             string         `json:"change_id,omitempty" bson:"change_id,omitempty"`
+	RuleID               string         `json:"rule_id,omitempty" bson:"rule_id,omitempty"`
+	RuleName             string         `json:"rule_name,omitempty" bson:"rule_name,omitempty"`
+	BotID                string         `json:"bot_id" bson:"bot_id"`
+	ChatID               string         `json:"chat_id" bson:"chat_id"`
+	TargetName           string         `json:"target_name,omitempty" bson:"target_name,omitempty"`
+	Text                 string         `json:"text" bson:"text"`
+	ParseMode            string         `json:"parse_mode,omitempty" bson:"parse_mode,omitempty"`
+	ReplyMarkup          map[string]any `json:"reply_markup,omitempty" bson:"reply_markup,omitempty"`
+	Status               string         `json:"status" bson:"status"`
+	Attempts             int            `json:"attempts" bson:"attempts"`
+	MaxAttempts          int            `json:"max_attempts" bson:"max_attempts"`
+	NextAttemptAt        time.Time      `json:"next_attempt_at" bson:"next_attempt_at"`
+	ClaimedBy            string         `json:"claimed_by,omitempty" bson:"claimed_by,omitempty"`
+	ClaimedAt            time.Time      `json:"claimed_at,omitempty" bson:"claimed_at,omitempty"`
+	CreatedAt            time.Time      `json:"created_at" bson:"created_at"`
+	SentAt               time.Time      `json:"sent_at,omitempty" bson:"sent_at,omitempty"`
+	MessageID            int64          `json:"message_id,omitempty" bson:"message_id,omitempty"`
+	ViewedAt             time.Time      `json:"viewed_at,omitempty" bson:"viewed_at,omitempty"`
+	ViewedBy             string         `json:"viewed_by,omitempty" bson:"viewed_by,omitempty"`
+	ViewCount            int            `json:"view_count,omitempty" bson:"view_count,omitempty"`
+	LastError            string         `json:"last_error,omitempty" bson:"last_error,omitempty"`
+	Interactive          bool           `json:"interactive,omitempty" bson:"interactive,omitempty"`
+	InteractionExpiresAt time.Time      `json:"interaction_expires_at,omitempty" bson:"interaction_expires_at,omitempty"`
+	InteractionClosedAt  time.Time      `json:"interaction_closed_at,omitempty" bson:"interaction_closed_at,omitempty"`
 }
 
 type ConfigChangeRequest struct {
@@ -343,6 +362,9 @@ type AdmissionEvent struct {
 	ChangeClass     string          `json:"change_class" bson:"change_class"`
 	ChangeSummary   string          `json:"change_summary" bson:"change_summary"`
 	RollbackID      string          `json:"rollback_id,omitempty" bson:"rollback_id,omitempty"`
+	Fingerprint     string          `json:"fingerprint,omitempty" bson:"fingerprint,omitempty"`
+	Duplicate       bool            `json:"duplicate,omitempty" bson:"duplicate,omitempty"`
+	DuplicateOf     string          `json:"duplicate_of,omitempty" bson:"duplicate_of,omitempty"`
 	PersistStatus   string          `json:"persist_status" bson:"persist_status"`
 	NotificationIDs []string        `json:"notification_ids,omitempty" bson:"notification_ids,omitempty"`
 	Object          json.RawMessage `json:"object,omitempty" bson:"object,omitempty"`

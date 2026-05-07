@@ -236,6 +236,12 @@ func (a *App) enqueueTelegramNotification(ctx context.Context, ev *TelegramNotif
 	if ev == nil {
 		return nil
 	}
+	if telegramMarkupHasCallback(ev.ReplyMarkup) {
+		ev.Interactive = true
+		if ev.InteractionExpiresAt.IsZero() {
+			ev.InteractionExpiresAt = time.Now().UTC().Add(telegramInteractionTTL(a.Config()))
+		}
+	}
 	if a.mongo == nil || !a.mongo.Healthy() {
 		return fmt.Errorf("telegram notification queue unavailable: mongo is not healthy")
 	}
@@ -440,6 +446,12 @@ func (a *App) sendTelegramNotificationNow(ctx context.Context, n *TelegramNotifi
 		if cr, err := a.getConfigChange(ctx, n.ChangeID); err == nil && cr != nil {
 			text = configChangeTelegramText(cr)
 			if kb := configChangeKeyboard(cr, n.ID); kb != nil {
+				markup = kb
+			}
+		}
+	} else if n.Kind == NotifyKindAdmissionEvent && n.EventID != "" {
+		if ev, err := a.getAdmissionEvent(ctx, n.EventID); err == nil && ev != nil {
+			if kb := eventKeyboardFor(ev, n.ID); kb != nil {
 				markup = kb
 			}
 		}
@@ -985,14 +997,74 @@ func eventKeyboardForStatus(ev *AdmissionEvent, notificationID, status string) a
 		return nil
 	}
 	buttons := [][]map[string]string{}
-	if ev.Decision == DecisionRequireApproval && !ev.Allowed && !strings.Contains(status, "审批") {
+	statusDone := strings.TrimSpace(status) != ""
+	callbacksAllowed := !statusDone
+	if callbacksAllowed && ev.Decision == DecisionRequireApproval && !ev.Allowed {
 		buttons = append(buttons, []map[string]string{{"text": "✅ 审批放行", "callback_data": "ev:approve:" + notificationID}, {"text": "❌ 拒绝", "callback_data": "ev:reject:" + notificationID}})
 	}
-	if ev.Allowed && ev.RollbackID != "" && !strings.Contains(status, "回滚已执行") {
+	if callbacksAllowed && ev.Allowed && ev.RollbackID != "" {
 		buttons = append(buttons, []map[string]string{{"text": "执行回滚", "callback_data": "ev:rollback:" + notificationID}})
 	}
-	buttons = append(buttons, []map[string]string{{"text": "下载 YAML", "callback_data": "ev:yaml:" + notificationID}})
+	if callbacksAllowed {
+		buttons = append(buttons, []map[string]string{{"text": "下载 YAML", "callback_data": "ev:yaml:" + notificationID}})
+	} else if web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/"); web != "" {
+		buttons = append(buttons, []map[string]string{{"text": "打开事件页下载 YAML", "url": webURL(web, "/events", map[string]string{"event": ev.ID, "ntf": notificationID})}})
+	}
+	if len(buttons) == 0 {
+		return nil
+	}
 	return map[string]any{"inline_keyboard": buttons}
+}
+
+func telegramMarkupHasCallback(markup any) bool {
+	m, ok := markup.(map[string]any)
+	if !ok || m == nil {
+		return false
+	}
+	rows, ok := m["inline_keyboard"].([][]map[string]string)
+	if !ok {
+		return false
+	}
+	for _, row := range rows {
+		for _, btn := range row {
+			if strings.TrimSpace(btn["callback_data"]) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func telegramInteractionExpired(n *TelegramNotificationEvent) bool {
+	return n != nil && n.Interactive && !n.InteractionExpiresAt.IsZero() && time.Now().UTC().After(n.InteractionExpiresAt)
+}
+
+func eventSearchKey(ev *AdmissionEvent) string {
+	if ev == nil {
+		return ""
+	}
+	parts := []string{"查询关键字: `event:" + ev.ID + "`"}
+	if ev.RollbackID != "" {
+		parts = append(parts, "`rollback:"+ev.RollbackID+"`")
+	}
+	if ev.Fingerprint != "" {
+		parts = append(parts, "`fp:"+ev.Fingerprint+"`")
+	}
+	return strings.Join(parts, " ")
+}
+
+func eventStatusText(base string, ev *AdmissionEvent, status string) string {
+	out := strings.TrimRight(base, "\n")
+	if strings.TrimSpace(status) != "" {
+		out += "\n\n" + strings.TrimSpace(status)
+	}
+	if key := eventSearchKey(ev); key != "" {
+		out += "\n" + key
+	}
+	if web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/"); web != "" {
+		out += "\nWeb: " + webURL(web, "/events", map[string]string{"event": ev.ID})
+	}
+	return out
 }
 
 func configChangeKeyboard(cr *ConfigChangeRequest, notificationID string) any {
@@ -1000,7 +1072,7 @@ func configChangeKeyboard(cr *ConfigChangeRequest, notificationID string) any {
 		return nil
 	}
 	rows := [][]map[string]string{}
-	if cr.Status == ChangePending {
+	if cr.Status == ChangePending && notificationID != "" {
 		rows = append(rows, []map[string]string{{"text": "✅ 同意变更", "callback_data": "cfg:approve:" + notificationID}, {"text": "❌ 拒绝变更", "callback_data": "cfg:reject:" + notificationID}})
 	}
 	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
@@ -1067,6 +1139,11 @@ func (a *App) handleTelegramCallback(ctx context.Context, cb *telegramCallbackQu
 		log.Printf("telegram callback skipped: token empty bot_id=%s notification=%s", n.BotID, notificationID)
 		return
 	}
+	if telegramInteractionExpired(n) {
+		_ = answerTelegramCallback(ctx, token, cb.ID, "交互窗口已过期，请登录 Web 事件页处理或下载 YAML", true)
+		go a.closeExpiredTelegramNotification(context.Background(), n)
+		return
+	}
 	actor := telegramCallbackActor(cb)
 	chatID := n.ChatID
 	if chatID == "" && cb.Message.Chat.ID != 0 {
@@ -1129,6 +1206,15 @@ func (a *App) handleConfigChangeTelegramCallback(ctx context.Context, token stri
 		return
 	}
 	_ = answerTelegramCallback(ctx, token, callbackID, "处理完成: "+next.Status, false)
+	if a.mongo != nil && a.mongo.Healthy() {
+		if ns, e := a.mongo.ListTelegramNotificationsByChange(ctx, next.ID); e == nil {
+			for _, item := range ns {
+				_ = a.mongo.CloseTelegramNotificationInteraction(ctx, item.ID, configChangeWebKeyboard(next, item.ID), "配置变更已处理: "+next.Status)
+			}
+		} else {
+			_ = a.mongo.CloseTelegramNotificationInteraction(ctx, n.ID, configChangeWebKeyboard(next, n.ID), "配置变更已处理: "+next.Status)
+		}
+	}
 	go a.updateConfigChangeTelegramStatus(context.Background(), next)
 }
 
@@ -1260,10 +1346,12 @@ func (a *App) updateEventTelegramStatus(ctx context.Context, ev *AdmissionEvent,
 		if token == "" {
 			continue
 		}
-		text := n.Text + "\n\n" + status
+		text := eventStatusText(n.Text, ev, status)
 		markup := eventKeyboardForStatus(ev, n.ID, status)
 		if err := editTelegramMessage(ctx, token, n.ChatID, n.MessageID, text, n.ParseMode, markup); err != nil {
 			log.Printf("event telegram status update failed: event=%s notification=%s err=%v", ev.ID, n.ID, err)
+		} else {
+			_ = a.mongo.CloseTelegramNotificationInteraction(ctx, n.ID, markup, status)
 		}
 	}
 }

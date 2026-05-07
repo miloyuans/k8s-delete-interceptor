@@ -154,24 +154,46 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, cfg.Web)
+		writeJSON(w, map[string]any{"web": cfg.Web, "persistence": cfg.Persistence})
 	case http.MethodPut, http.MethodPost:
 		if !userFromContext(r.Context()).Can(PermSettingsWrite) {
 			http.Error(w, "forbidden: need permission "+PermSettingsWrite, 403)
 			return
 		}
-		var s WebSettings
-		if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+		var raw map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
+		webSettings := cfg.Web
+		if b, ok := raw["web"]; ok {
+			if err := json.Unmarshal(b, &webSettings); err != nil {
+				http.Error(w, "invalid web settings: "+err.Error(), 400)
+				return
+			}
+		} else {
+			_ = json.Unmarshal(mustJSON(raw), &webSettings)
+		}
+		persistence := cfg.Persistence
+		if b, ok := raw["persistence"]; ok {
+			if err := json.Unmarshal(b, &persistence); err != nil {
+				http.Error(w, "invalid persistence settings: "+err.Error(), 400)
+				return
+			}
+		}
 		next := cloneConfig(cfg)
-		next.Web = s
-		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "settings", "更新站点名称、图标、默认时区或主题", userFromContext(r.Context()), true)
+		next.Web = webSettings
+		next.Persistence = normalizePersistenceSettings(persistence)
+		cr, applied, err := a.proposeConfigChange(r.Context(), *next, "settings", "更新站点设置和数据持久化生命周期", userFromContext(r.Context()), true)
 		writeChangeResponse(w, cr, applied, err)
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
+}
+
+func mustJSON(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 func (a *App) handleMetadata(w http.ResponseWriter, r *http.Request) {
@@ -279,6 +301,9 @@ func (a *App) handleEventYAML(w http.ResponseWriter, r *http.Request) {
 	}
 	raw := ev.Object
 	if r.URL.Query().Get("old") == "1" || strings.EqualFold(r.URL.Query().Get("object"), "old") {
+		raw = ev.OldObject
+	}
+	if len(raw) == 0 {
 		raw = ev.OldObject
 	}
 	if len(raw) == 0 {

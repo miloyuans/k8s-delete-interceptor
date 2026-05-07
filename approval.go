@@ -18,7 +18,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-const defaultAdmissionApprovalTTLSeconds = 300
+const defaultAdmissionApprovalTTLSeconds = 12 * 60 * 60
 
 type AdmissionApprovalGrant struct {
 	ID                 string    `json:"id" bson:"id"`
@@ -76,9 +76,18 @@ func admissionApprovalKeyForEvent(ev *AdmissionEvent) string {
 	return admissionApprovalKey(ev.Cluster, ev.Operation, ev.APIGroup, ev.Resource, ev.Namespace, ev.Name, ev.User, ev.RuleID)
 }
 
-func approvalTTLSecondsForRule(rule *PolicyRule) int {
+func approvalTTLSecondsForRule(cfg *RuntimeConfig, rule *PolicyRule) int {
 	if rule != nil && rule.Approval.TTLSeconds > 0 {
 		return rule.Approval.TTLSeconds
+	}
+	if cfg != nil {
+		d := parseConfigDuration(cfg.Persistence.DeleteApprovalTimeout, 0)
+		if d <= 0 {
+			d = parseConfigDuration(cfg.Persistence.TelegramInteractionTTL, 0)
+		}
+		if d > 0 {
+			return int(d.Seconds())
+		}
 	}
 	return defaultAdmissionApprovalTTLSeconds
 }
@@ -116,8 +125,9 @@ func (a *App) createAdmissionApprovalGrant(ctx context.Context, ev *AdmissionEve
 	if ev == nil {
 		return nil, errors.New("event is nil")
 	}
-	rule := findRuleByID(a.Config(), ev.RuleID)
-	ttl := approvalTTLSecondsForRule(rule)
+	cfg := a.Config()
+	rule := findRuleByID(cfg, ev.RuleID)
+	ttl := approvalTTLSecondsForRule(cfg, rule)
 	now := time.Now().UTC()
 	grant := &AdmissionApprovalGrant{
 		ID:           admissionApprovalKeyForEvent(ev),

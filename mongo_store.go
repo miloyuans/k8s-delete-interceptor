@@ -15,9 +15,10 @@ import (
 )
 
 type MongoStore struct {
-	client  *mongo.Client
-	db      *mongo.Database
-	healthy atomic.Bool
+	client   *mongo.Client
+	db       *mongo.Database
+	database string
+	healthy  atomic.Bool
 }
 
 func NewMongoStore(ctx context.Context, uri, database string) (*MongoStore, error) {
@@ -31,7 +32,7 @@ func NewMongoStore(ctx context.Context, uri, database string) (*MongoStore, erro
 	if err != nil {
 		return nil, err
 	}
-	m := &MongoStore{client: client, db: client.Database(database)}
+	m := &MongoStore{client: client, db: client.Database(database), database: database}
 	if err := m.Ping(ctx); err != nil {
 		return nil, err
 	}
@@ -68,6 +69,7 @@ func (m *MongoStore) Init(ctx context.Context) error {
 		{"config_change_requests", mongo.IndexModel{Keys: bson.D{{Key: "status", Value: 1}, {Key: "created_at", Value: -1}}}},
 		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "time", Value: -1}}}},
+		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "fingerprint", Value: 1}, {Key: "time", Value: -1}}}},
 		{"admission_events", mongo.IndexModel{Keys: bson.D{{Key: "cluster", Value: 1}, {Key: "namespace", Value: 1}, {Key: "kind", Value: 1}, {Key: "name", Value: 1}, {Key: "operation", Value: 1}, {Key: "decision", Value: 1}}}},
 		{"admission_approval_grants", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"admission_approval_grants", mongo.IndexModel{Keys: bson.D{{Key: "expires_at", Value: 1}, {Key: "consumed", Value: 1}}}},
@@ -82,6 +84,7 @@ func (m *MongoStore) Init(ctx context.Context) error {
 		{"telegram_notification_events", mongo.IndexModel{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"telegram_notification_events", mongo.IndexModel{Keys: bson.D{{Key: "status", Value: 1}, {Key: "bot_id", Value: 1}, {Key: "next_attempt_at", Value: 1}, {Key: "created_at", Value: 1}}}},
 		{"telegram_notification_events", mongo.IndexModel{Keys: bson.D{{Key: "kind", Value: 1}, {Key: "event_id", Value: 1}}}},
+		{"telegram_notification_events", mongo.IndexModel{Keys: bson.D{{Key: "interactive", Value: 1}, {Key: "interaction_expires_at", Value: 1}, {Key: "interaction_closed_at", Value: 1}}}},
 	}
 	for _, x := range idx {
 		_, _ = m.db.Collection(x.col).Indexes().CreateOne(ctx, x.model)
@@ -172,7 +175,7 @@ func (m *MongoStore) CountRunnableTelegramNotifications(ctx context.Context, now
 	return n, err
 }
 
-func (m *MongoStore) AcquireTelegramDispatchLock(ctx context.Context, owner string, lease time.Duration) (bool, error) {
+func (m *MongoStore) acquireWorkerLock(ctx context.Context, lockID, owner string, lease time.Duration) (bool, error) {
 	if m == nil {
 		return false, errors.New("mongo unavailable")
 	}
@@ -180,8 +183,8 @@ func (m *MongoStore) AcquireTelegramDispatchLock(ctx context.Context, owner stri
 		lease = 2 * time.Minute
 	}
 	now := time.Now().UTC()
-	filter := bson.M{"id": "telegram_dispatcher", "$or": []bson.M{{"expires_at": bson.M{"$lte": now}}, {"owner": owner}, {"expires_at": bson.M{"$exists": false}}}}
-	update := bson.M{"$set": bson.M{"id": "telegram_dispatcher", "owner": owner, "expires_at": now.Add(lease), "updated_at": now}, "$inc": bson.M{"epoch": 1}}
+	filter := bson.M{"id": lockID, "$or": []bson.M{{"expires_at": bson.M{"$lte": now}}, {"owner": owner}, {"expires_at": bson.M{"$exists": false}}}}
+	update := bson.M{"$set": bson.M{"id": lockID, "owner": owner, "expires_at": now.Add(lease), "updated_at": now}, "$inc": bson.M{"epoch": 1}}
 	opts := options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
@@ -200,7 +203,7 @@ func (m *MongoStore) AcquireTelegramDispatchLock(ctx context.Context, owner stri
 	return doc.Owner == owner, nil
 }
 
-func (m *MongoStore) RenewTelegramDispatchLock(ctx context.Context, owner string, lease time.Duration) (bool, error) {
+func (m *MongoStore) renewWorkerLock(ctx context.Context, lockID, owner string, lease time.Duration) (bool, error) {
 	if m == nil {
 		return false, errors.New("mongo unavailable")
 	}
@@ -210,7 +213,7 @@ func (m *MongoStore) RenewTelegramDispatchLock(ctx context.Context, owner string
 	now := time.Now().UTC()
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	res, err := m.db.Collection("telegram_worker_locks").UpdateOne(ctx, bson.M{"id": "telegram_dispatcher", "owner": owner}, bson.M{"$set": bson.M{"expires_at": now.Add(lease), "updated_at": now}})
+	res, err := m.db.Collection("telegram_worker_locks").UpdateOne(ctx, bson.M{"id": lockID, "owner": owner}, bson.M{"$set": bson.M{"expires_at": now.Add(lease), "updated_at": now}})
 	m.healthy.Store(err == nil)
 	if err != nil {
 		return false, err
@@ -218,16 +221,40 @@ func (m *MongoStore) RenewTelegramDispatchLock(ctx context.Context, owner string
 	return res.ModifiedCount > 0 || res.MatchedCount > 0, nil
 }
 
-func (m *MongoStore) ReleaseTelegramDispatchLock(ctx context.Context, owner string) error {
+func (m *MongoStore) releaseWorkerLock(ctx context.Context, lockID, owner string) error {
 	if m == nil {
 		return errors.New("mongo unavailable")
 	}
 	now := time.Now().UTC()
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	_, err := m.db.Collection("telegram_worker_locks").UpdateOne(ctx, bson.M{"id": "telegram_dispatcher", "owner": owner}, bson.M{"$set": bson.M{"expires_at": now, "updated_at": now}})
+	_, err := m.db.Collection("telegram_worker_locks").UpdateOne(ctx, bson.M{"id": lockID, "owner": owner}, bson.M{"$set": bson.M{"expires_at": now, "updated_at": now}})
 	m.healthy.Store(err == nil)
 	return err
+}
+
+func (m *MongoStore) AcquireTelegramDispatchLock(ctx context.Context, owner string, lease time.Duration) (bool, error) {
+	return m.acquireWorkerLock(ctx, "telegram_dispatcher", owner, lease)
+}
+
+func (m *MongoStore) RenewTelegramDispatchLock(ctx context.Context, owner string, lease time.Duration) (bool, error) {
+	return m.renewWorkerLock(ctx, "telegram_dispatcher", owner, lease)
+}
+
+func (m *MongoStore) ReleaseTelegramDispatchLock(ctx context.Context, owner string) error {
+	return m.releaseWorkerLock(ctx, "telegram_dispatcher", owner)
+}
+
+func (m *MongoStore) AcquireTelegramCallbackLock(ctx context.Context, owner string, lease time.Duration) (bool, error) {
+	return m.acquireWorkerLock(ctx, "telegram_callback_poller", owner, lease)
+}
+
+func (m *MongoStore) RenewTelegramCallbackLock(ctx context.Context, owner string, lease time.Duration) (bool, error) {
+	return m.renewWorkerLock(ctx, "telegram_callback_poller", owner, lease)
+}
+
+func (m *MongoStore) ReleaseTelegramCallbackLock(ctx context.Context, owner string) error {
+	return m.releaseWorkerLock(ctx, "telegram_callback_poller", owner)
 }
 
 func (m *MongoStore) EnsureConfig(ctx context.Context, cfg *RuntimeConfig) error {
@@ -693,6 +720,84 @@ func (m *MongoStore) FailTelegramNotification(ctx context.Context, ev *TelegramN
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	_, err := m.db.Collection("telegram_notification_events").UpdateOne(ctx, bson.M{"id": ev.ID}, bson.M{"$set": set})
+	m.healthy.Store(err == nil)
+	return err
+}
+
+func (m *MongoStore) FindRecentEventByFingerprint(ctx context.Context, fingerprint string, since time.Time) (*AdmissionEvent, error) {
+	if m == nil || strings.TrimSpace(fingerprint) == "" {
+		return nil, errors.New("mongo unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	filter := bson.M{"fingerprint": fingerprint, "time": bson.M{"$gte": since}}
+	var ev AdmissionEvent
+	err := m.db.Collection("admission_events").FindOne(ctx, filter, options.FindOne().SetSort(bson.D{{Key: "time", Value: -1}})).Decode(&ev)
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			m.healthy.Store(true)
+			return nil, nil
+		}
+		m.healthy.Store(false)
+		return nil, err
+	}
+	m.healthy.Store(true)
+	return &ev, nil
+}
+
+func (m *MongoStore) CountActiveTelegramInteractions(ctx context.Context, now time.Time) (int64, error) {
+	if m == nil {
+		return 0, errors.New("mongo unavailable")
+	}
+	filter := bson.M{"interactive": true, "status": NotifyStatusSent, "interaction_expires_at": bson.M{"$gt": now}, "$or": []bson.M{{"interaction_closed_at": bson.M{"$exists": false}}, {"interaction_closed_at": time.Time{}}}}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	n, err := m.db.Collection("telegram_notification_events").CountDocuments(ctx, filter)
+	m.healthy.Store(err == nil)
+	return n, err
+}
+
+func (m *MongoStore) ListExpiredTelegramInteractions(ctx context.Context, now time.Time, limit int) ([]TelegramNotificationEvent, error) {
+	if m == nil {
+		return nil, errors.New("mongo unavailable")
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	filter := bson.M{"interactive": true, "status": NotifyStatusSent, "interaction_expires_at": bson.M{"$lte": now}, "$or": []bson.M{{"interaction_closed_at": bson.M{"$exists": false}}, {"interaction_closed_at": time.Time{}}}}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cur, err := m.db.Collection("telegram_notification_events").Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "interaction_expires_at", Value: 1}}).SetLimit(int64(limit)))
+	if err != nil {
+		m.healthy.Store(false)
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	out := []TelegramNotificationEvent{}
+	for cur.Next(ctx) {
+		var ev TelegramNotificationEvent
+		if cur.Decode(&ev) == nil {
+			out = append(out, ev)
+		}
+	}
+	m.healthy.Store(cur.Err() == nil)
+	return out, cur.Err()
+}
+
+func (m *MongoStore) CloseTelegramNotificationInteraction(ctx context.Context, id string, markup any, note string) error {
+	if m == nil || strings.TrimSpace(id) == "" {
+		return errors.New("mongo unavailable")
+	}
+	set := bson.M{"interaction_closed_at": time.Now().UTC(), "interactive": false}
+	if m, ok := markup.(map[string]any); ok && m != nil {
+		set["reply_markup"] = m
+	}
+	if strings.TrimSpace(note) != "" {
+		set["last_error"] = "interaction closed: " + note
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := m.db.Collection("telegram_notification_events").UpdateOne(ctx, bson.M{"id": id}, bson.M{"$set": set})
 	m.healthy.Store(err == nil)
 	return err
 }

@@ -18,19 +18,21 @@ import (
 )
 
 type App struct {
-	configValue     atomic.Value // *RuntimeConfig
-	local           *LocalStore
-	mongo           *MongoStore
-	mongoURI        string
-	mongoDatabase   string
-	mongoMu         sync.Mutex
-	kubeClient      *kubernetes.Clientset
-	dynamicClient   dynamic.Interface
-	discoveryClient discovery.DiscoveryInterface
-	adminToken      string
-	metadataValue   atomic.Value // *ClusterMetadata
-	metadataMu      sync.Mutex
-	metadataRefresh atomic.Bool
+	configValue      atomic.Value // *RuntimeConfig
+	local            *LocalStore
+	mongo            *MongoStore
+	mongoURI         string
+	mongoDatabase    string
+	mongoMu          sync.Mutex
+	kubeClient       *kubernetes.Clientset
+	dynamicClient    dynamic.Interface
+	discoveryClient  discovery.DiscoveryInterface
+	adminToken       string
+	metadataValue    atomic.Value // *ClusterMetadata
+	metadataMu       sync.Mutex
+	metadataRefresh  atomic.Bool
+	telegramOffsetMu sync.Mutex
+	telegramOffsets  map[string]int64
 }
 
 func NewApp(ctx context.Context, bootstrapPath, stateDir string) (*App, error) {
@@ -66,7 +68,7 @@ func NewApp(ctx context.Context, bootstrapPath, stateDir string) (*App, error) {
 		}
 	}
 	_ = local.SaveConfig(cfg, "startup")
-	a := &App{local: local, mongo: mongoStore, mongoURI: uri, mongoDatabase: db, adminToken: os.Getenv("WEB_ADMIN_TOKEN")}
+	a := &App{local: local, mongo: mongoStore, mongoURI: uri, mongoDatabase: db, adminToken: os.Getenv("WEB_ADMIN_TOKEN"), telegramOffsets: map[string]int64{}}
 	a.configValue.Store(cfg)
 	a.initKubeClients()
 	a.loadPersistedMetadata(ctx)
@@ -127,6 +129,8 @@ func (a *App) startBackground(ctx context.Context) {
 	go a.mongoHealthLoop(ctx)
 	go a.metadataRefreshLoop(ctx)
 	go a.telegramNotificationLoop(ctx)
+	go a.telegramCallbackPollingLoop(ctx)
+	go a.retentionMaintenanceLoop(ctx)
 }
 
 func (a *App) configSyncLoop(ctx context.Context) {

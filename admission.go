@@ -78,6 +78,15 @@ func (a *App) admit(ctx context.Context, req *admissionv1.AdmissionRequest) *adm
 	if approvalConsumed {
 		ev.Reason = pd.Reason
 	}
+	ev.Fingerprint = admissionEventFingerprint(cfg, ac, pd)
+	if dup, err := a.recentDuplicateEvent(ctx, cfg, ev.Fingerprint); err == nil && dup != nil {
+		ev.Duplicate = true
+		ev.DuplicateOf = dup.ID
+		log.Printf("admission duplicate suppressed: uid=%s event=%s duplicate_of=%s fingerprint=%s", req.UID, ev.ID, dup.ID, ev.Fingerprint)
+		return admissionResponseForDecision(pd)
+	} else if err != nil {
+		log.Printf("admission duplicate lookup failed: uid=%s fingerprint=%s err=%v", req.UID, ev.Fingerprint, err)
+	}
 	if shouldCreateRollback(cfg, pd, ac) {
 		if rb, err := a.createRollbackBackup(ctx, cfg, ev, ac, pd); err == nil && rb != nil {
 			ev.RollbackID = rb.ID
@@ -87,6 +96,10 @@ func (a *App) admit(ctx context.Context, req *admissionv1.AdmissionRequest) *adm
 	if shouldNotify(pd) {
 		go a.notifyEvent(context.Background(), cfg, ev, pd)
 	}
+	return admissionResponseForDecision(pd)
+}
+
+func admissionResponseForDecision(pd PolicyDecision) *admissionv1.AdmissionResponse {
 	if pd.Decision == DecisionRequireApproval {
 		return &admissionv1.AdmissionResponse{Allowed: false, Result: &metav1.Status{Reason: metav1.StatusReasonForbidden, Message: "请求需要审批，已被拦截。请在 Web Console 或 Telegram 审批后重新执行。"}}
 	}

@@ -97,6 +97,7 @@ func applyRuntimeDefaults(c *RuntimeConfig) {
 	if len(c.WebRoles) == 0 {
 		c.WebRoles = defaultWebRoles()
 	}
+	c.Persistence = normalizePersistenceSettings(c.Persistence)
 	if len(c.WebUsers) == 0 {
 		c.WebUsers = defaultWebUsers()
 	}
@@ -154,6 +155,10 @@ func ensureBuiltInConfigObjects(c *RuntimeConfig) {
 			// only for Mongo assets; label-based hard protection is still enforced in code.
 			c.Rules[i].ScopeIDs = []string{"internal_mongo_assets"}
 			c.Rules[i].Reason = "内置 MongoDB 属于系统核心数据源，禁止直接删除"
+		}
+		if c.Rules[i].ID == "core_delete_approval" && c.Rules[i].Approval.TTLSeconds == 300 {
+			// v2 初始配置里 300 秒过短且与 Telegram 交互窗口不一致；0 表示继承站点持久化设置。
+			c.Rules[i].Approval.TTLSeconds = 0
 		}
 	}
 }
@@ -286,6 +291,7 @@ func defaultRuntimeConfig() *RuntimeConfig {
 		Rollback:         RollbackConfig{Enabled: true, CreateDeleteRollback: false, RequireDryRun: true},
 		SystemProtection: SystemProtectionConfig{Enabled: true, SystemResourceLabel: "k8s-delete-interceptor.io/system-resource", InternalMongoResourceValue: "internal-mongodb", ProtectedNamespaces: []string{"webhook-system"}, AllowWebhookSelfMaintenance: true},
 		Web:              defaultWebSettings(),
+		Persistence:      defaultPersistenceSettings(),
 		WebRoles:         defaultWebRoles(),
 		WebUsers:         defaultWebUsers(),
 		DataSources:      []DataSource{{ID: "internal_mongo_default", Name: "内置 MongoDB", Type: "internal_mongodb", Enabled: true, Active: true, URIEnv: "MONGO_URI", Database: envOr("MONGO_DATABASE", "k8s_delete_interceptor"), Namespace: envOr("POD_NAMESPACE", "webhook-system"), Service: "delete-interceptor-mongodb", ReplicaSet: "rs0"}},
@@ -331,10 +337,55 @@ func defaultRules() []PolicyRule {
 		{ID: "internal_mongo_delete_protection", Name: "内置 Mongo 硬保护", Enabled: true, Priority: 1, ScopeIDs: []string{"internal_mongo_assets"}, Operations: []string{"DELETE"}, Decision: DecisionBlock, Reason: "内置 MongoDB 属于系统核心数据源，禁止直接删除", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_block"}},
 		{ID: "pod_controller_lifecycle_audit", Name: "控制器 Pod 生命周期只审计", Enabled: true, Priority: 20, ScopeIDs: []string{"pod_lifecycle"}, Operations: []string{"DELETE"}, ActorGroupIDs: []string{"cluster_controllers"}, Decision: DecisionAuditOnly, Reason: "控制器或节点维护 Pod 生命周期，仅审计", ControllerSafe: ControllerSafeRule{RequireOwnerReference: true, RequireControllerOwnerReference: true, AllowedOwnerKinds: []string{"ReplicaSet", "DaemonSet", "StatefulSet", "Job"}, RequireNodeUserMatchesPodNode: true}},
 		{ID: "workload_restart_silent", Name: "工作负载重启只审计", Enabled: true, Priority: 30, ScopeIDs: []string{"workload_core"}, Operations: []string{"UPDATE"}, ChangeClasses: []string{"workload_restart", "no_effective_change", "managed_fields_only", "status_only", "metadata_only"}, Decision: DecisionAuditOnly, Reason: "低风险或无有效变化更新，仅审计"},
-		{ID: "core_delete_approval", Name: "核心资源删除审批", Enabled: true, Priority: 50, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core", "cluster_core"}, Operations: []string{"DELETE"}, Decision: DecisionRequireApproval, Reason: "核心资源删除需要审批", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_delete_approval"}, Approval: ApprovalBinding{Enabled: true, Mode: "both", TTLSeconds: 300, FailWhenStoreDown: true}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackRestoreOldObject, ShowInWeb: true, ShowInTelegram: true}},
+		{ID: "core_delete_approval", Name: "核心资源删除审批", Enabled: true, Priority: 50, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core", "cluster_core"}, Operations: []string{"DELETE"}, Decision: DecisionRequireApproval, Reason: "核心资源删除需要审批", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_delete_approval"}, Approval: ApprovalBinding{Enabled: true, Mode: "both", TTLSeconds: 0, FailWhenStoreDown: true}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackRestoreOldObject, ShowInWeb: true, ShowInTelegram: true}},
 		{ID: "important_update_notify", Name: "重要资源有效更新通知", Enabled: true, Priority: 60, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core"}, Operations: []string{"UPDATE"}, ChangeClasses: []string{"image_changed", "env_changed", "volume_changed", "scale_only", "service_selector_changed", "service_port_changed", "ingress_backend_changed", "configmap_data_changed", "secret_data_changed", "spec_changed"}, Decision: DecisionAllowNotify, Reason: "重要资源发生有效更新，已记录回滚和 YAML", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_update_notify"}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackRestoreOldObject, ShowInWeb: true, ShowInTelegram: false}},
 		{ID: "important_create_notify", Name: "重要资源创建记录", Enabled: true, Priority: 70, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core"}, Operations: []string{"CREATE"}, Decision: DecisionAllowNotify, Reason: "重要资源创建已放行并记录", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_create_notify"}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackDeleteCreatedObject, ShowInWeb: true, ShowInTelegram: false}},
 	}
+}
+
+func defaultPersistenceSettings() PersistenceSettings {
+	return PersistenceSettings{
+		Enabled:                 true,
+		ActiveDataTTL:           "24h",
+		ColdDataTTL:             "24h",
+		CleanupInterval:         "15m",
+		TelegramInteractionTTL:  "12h",
+		DeleteApprovalTimeout:   "12h",
+		DuplicateEventWindow:    "30s",
+		ArchiveBatchSize:        500,
+		TelegramCallbackPolling: true,
+	}
+}
+
+func normalizePersistenceSettings(p PersistenceSettings) PersistenceSettings {
+	if !p.Enabled && p.ActiveDataTTL == "" && p.ColdDataTTL == "" && p.TelegramInteractionTTL == "" && p.DeleteApprovalTimeout == "" {
+		p = defaultPersistenceSettings()
+	}
+	if p.ActiveDataTTL == "" {
+		p.ActiveDataTTL = "24h"
+	}
+	if p.ColdDataTTL == "" {
+		p.ColdDataTTL = "24h"
+	}
+	if p.CleanupInterval == "" {
+		p.CleanupInterval = "15m"
+	}
+	if p.TelegramInteractionTTL == "" {
+		p.TelegramInteractionTTL = "12h"
+	}
+	if p.DeleteApprovalTimeout == "" {
+		p.DeleteApprovalTimeout = p.TelegramInteractionTTL
+	}
+	if p.DuplicateEventWindow == "" {
+		p.DuplicateEventWindow = "30s"
+	}
+	if p.ArchiveBatchSize <= 0 {
+		p.ArchiveBatchSize = 500
+	}
+	if p.ArchiveBatchSize > 5000 {
+		p.ArchiveBatchSize = 5000
+	}
+	return p
 }
 
 func envOr(k, def string) string {

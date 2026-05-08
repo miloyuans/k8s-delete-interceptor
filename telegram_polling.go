@@ -242,7 +242,8 @@ func (a *App) closeExpiredTelegramNotification(ctx context.Context, n *TelegramN
 		}
 	} else if n.Kind == NotifyKindConfigChange && n.ChangeID != "" {
 		if cr, err := a.getConfigChange(ctx, n.ChangeID); err == nil && cr != nil {
-			text = configChangeTelegramText(cr) + "\n\n" + status
+			text = configChangeTelegramTextWithConfig(a.Config(), cr) + "\n\n" + status
+			parseMode = configChangeParseMode(a.Config())
 			markup = configChangeWebKeyboard(cr, n.ID)
 		}
 	}

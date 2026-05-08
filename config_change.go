@@ -380,7 +380,7 @@ func (a *App) notifyConfigChange(ctx context.Context, cr *ConfigChangeRequest) {
 		log.Printf("config change telegram skipped: db telegram global disabled change=%s", cr.ID)
 		return
 	}
-	text := configChangeTelegramText(cr)
+	text := configChangeTelegramTextWithConfig(a.Config(), cr)
 	web := strings.TrimRight(os.Getenv("WEB_BASE_URL"), "/")
 	queued := 0
 	seen := map[string]bool{}
@@ -398,7 +398,7 @@ func (a *App) notifyConfigChange(ctx context.Context, cr *ConfigChangeRequest) {
 			log.Printf("config change telegram skipped: bot disabled, missing or token empty bot_id=%s change=%s", chat.BotID, cr.ID)
 			continue
 		}
-		n := &TelegramNotificationEvent{Kind: NotifyKindConfigChange, EventID: cr.EventID, ChangeID: cr.ID, BotID: bot.ID, ChatID: chat.ChatID, TargetName: chat.Name, Text: text, Status: NotifyStatusPending, MaxAttempts: telegramMaxAttempts(), CreatedAt: time.Now().UTC(), NextAttemptAt: time.Now().UTC()}
+		n := &TelegramNotificationEvent{Kind: NotifyKindConfigChange, EventID: cr.EventID, ChangeID: cr.ID, BotID: bot.ID, ChatID: chat.ChatID, TargetName: chat.Name, Text: text, ParseMode: configChangeParseMode(a.Config()), Status: NotifyStatusPending, MaxAttempts: telegramMaxAttempts(), CreatedAt: time.Now().UTC(), NextAttemptAt: time.Now().UTC()}
 		n.ID = notificationID(n.Kind, cr.EventID, bot.ID, chat.ChatID)
 		if web != "" || cr.Status == ChangePending {
 			if kb := configChangeKeyboard(cr, n.ID); kb != nil {
@@ -444,13 +444,35 @@ func (a *App) addConfigChangeTelegramRef(ctx context.Context, id string, ref Tel
 	return a.saveConfigChange(ctx, cr)
 }
 
+func configChangeParseMode(cfg *RuntimeConfig) string {
+	if tpl := findTemplateExact(cfg, "tpl_config_approval"); tpl != nil && strings.TrimSpace(tpl.ParseMode) != "" {
+		return tpl.ParseMode
+	}
+	return "Markdown"
+}
+
 func configChangeTelegramText(cr *ConfigChangeRequest) string {
-	return configChangeTelegramTextWithView(cr, "")
+	return configChangeTelegramTextWithConfig(nil, cr)
 }
 
 func configChangeTelegramTextWithView(cr *ConfigChangeRequest, viewedBy string) string {
+	return configChangeTelegramTextWithConfigView(nil, cr, viewedBy)
+}
+
+func configChangeTelegramTextWithConfig(cfg *RuntimeConfig, cr *ConfigChangeRequest) string {
+	return configChangeTelegramTextWithConfigView(cfg, cr, "")
+}
+
+func configChangeTelegramTextWithConfigView(cfg *RuntimeConfig, cr *ConfigChangeRequest, viewedBy string) string {
 	if cr == nil {
 		return ""
+	}
+	if cfg != nil {
+		if tpl := findTemplateExact(cfg, "tpl_config_approval"); tpl != nil && tpl.Enabled {
+			if out, err := renderPlainTemplate(tpl.ID, tpl.Body, configChangeTemplateData(cfg, cr, viewedBy)); err == nil {
+				return out
+			}
+		}
 	}
 	status := "⏳ 配置变更待审批"
 	suffix := ""
@@ -475,8 +497,43 @@ func configChangeTelegramTextWithView(cr *ConfigChangeRequest, viewedBy string) 
 	return fmt.Sprintf("%s\n事件ID: %s\n类型: %s\n申请人: %s\n版本: v%d -> v%d%s%s\n摘要: %s\n差异: %s", status, cr.EventID, cr.Kind, cr.CreatedBy, cr.BaseVersion, cr.TargetVersion, decided, suffix, cr.Summary, strings.Join(cr.DiffSummary, ", "))
 }
 
+func configChangeTemplateData(cfg *RuntimeConfig, cr *ConfigChangeRequest, viewedBy string) map[string]string {
+	siteName := "K8s Delete Interceptor"
+	if cfg != nil && strings.TrimSpace(cfg.Web.SiteName) != "" {
+		siteName = strings.TrimSpace(cfg.Web.SiteName)
+	}
+	statusCN := "待审批"
+	switch cr.Status {
+	case ChangeApproved:
+		statusCN = "已通过"
+	case ChangeRejected:
+		statusCN = "已拒绝"
+	case ChangeApplying:
+		statusCN = "处理中"
+	}
+	decidedAt := ""
+	if !cr.DecidedAt.IsZero() {
+		decidedAt = cr.DecidedAt.Format("2006-01-02 15:04:05 MST")
+	}
+	return map[string]string{
+		"site_name":        siteName,
+		"event_id":         cr.EventID,
+		"change_id":        cr.ID,
+		"change_kind":      cr.Kind,
+		"change_status":    cr.Status,
+		"change_status_cn": statusCN,
+		"created_by":       cr.CreatedBy,
+		"decided_by":       cr.DecidedBy,
+		"decided_at":       decidedAt,
+		"viewed_by":        viewedBy,
+		"base_version":     fmt.Sprintf("v%d", cr.BaseVersion),
+		"target_version":   fmt.Sprintf("v%d", cr.TargetVersion),
+		"summary":          cr.Summary,
+		"diff_summary":     strings.Join(cr.DiffSummary, ", "),
+	}
+}
 func (a *App) updateSingleConfigChangeTelegramStatus(ctx context.Context, cr *ConfigChangeRequest, ref TelegramMessageRef) {
-	a.updateSingleConfigChangeTelegramText(ctx, cr, ref, configChangeTelegramText(cr), "打开 Web 查看")
+	a.updateSingleConfigChangeTelegramText(ctx, cr, ref, configChangeTelegramTextWithConfig(a.Config(), cr), "打开 Web 查看")
 }
 
 func (a *App) updateSingleConfigChangeTelegramText(ctx context.Context, cr *ConfigChangeRequest, ref TelegramMessageRef, text, buttonText string) {
@@ -504,7 +561,7 @@ func (a *App) updateSingleConfigChangeTelegramText(ctx context.Context, cr *Conf
 			markup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "打开 Web 查看", "url": webURL(web, "/changes", map[string]string{"change": cr.ID})}}}}
 		}
 	}
-	if err := editTelegramMessage(ctx, token, ref.ChatID, ref.MessageID, text, "", markup); err != nil {
+	if err := editTelegramMessage(ctx, token, ref.ChatID, ref.MessageID, text, configChangeParseMode(a.Config()), markup); err != nil {
 		log.Printf("config change telegram status update failed: bot_id=%s chat_id=%s message_id=%d source=%s change=%s err=%v", bot.ID, ref.ChatID, ref.MessageID, source, cr.ID, err)
 	} else {
 		log.Printf("config change telegram status updated: bot_id=%s chat_id=%s message_id=%d change=%s status=%s", bot.ID, ref.ChatID, ref.MessageID, cr.ID, cr.Status)
@@ -533,7 +590,7 @@ func (a *App) updateSingleConfigChangeTelegramTextWithMarkup(ctx context.Context
 			markup = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "打开 Web 查看", "url": webURL(web, "/changes", map[string]string{"change": cr.ID})}}}}
 		}
 	}
-	if err := editTelegramMessage(ctx, token, ref.ChatID, ref.MessageID, text, "", markup); err != nil {
+	if err := editTelegramMessage(ctx, token, ref.ChatID, ref.MessageID, text, configChangeParseMode(a.Config()), markup); err != nil {
 		log.Printf("config change telegram viewed update failed: bot_id=%s chat_id=%s message_id=%d source=%s change=%s err=%v", bot.ID, ref.ChatID, ref.MessageID, source, cr.ID, err)
 	}
 }
@@ -546,7 +603,7 @@ func (a *App) updateConfigChangeTelegramViewed(ctx context.Context, changeID, vi
 	if err != nil || cr == nil || cr.Status != ChangePending {
 		return
 	}
-	text := configChangeTelegramTextWithView(cr, viewedBy)
+	text := configChangeTelegramTextWithConfigView(a.Config(), cr, viewedBy)
 	if a.mongo != nil && a.mongo.Healthy() {
 		if ns, e := a.mongo.ListTelegramNotificationsByChange(ctx, changeID); e == nil && len(ns) > 0 {
 			for _, n := range ns {

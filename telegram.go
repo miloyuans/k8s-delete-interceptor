@@ -459,7 +459,8 @@ func (a *App) sendTelegramNotificationNow(ctx context.Context, n *TelegramNotifi
 	parseMode := n.ParseMode
 	if n.Kind == NotifyKindConfigChange && n.ChangeID != "" {
 		if cr, err := a.getConfigChange(ctx, n.ChangeID); err == nil && cr != nil {
-			text = configChangeTelegramText(cr)
+			text = configChangeTelegramTextWithConfig(a.Config(), cr)
+			parseMode = configChangeParseMode(a.Config())
 			if kb := configChangeKeyboard(cr, n.ID); kb != nil {
 				markup = kb
 			}
@@ -617,13 +618,23 @@ type telegramTarget struct {
 }
 
 func findTemplate(cfg *RuntimeConfig, id string) *NotificationTemplate {
+	if tpl := findTemplateExact(cfg, id); tpl != nil {
+		return tpl
+	}
+	if len(cfg.NotificationTemplates) > 0 {
+		return &cfg.NotificationTemplates[0]
+	}
+	return nil
+}
+
+func findTemplateExact(cfg *RuntimeConfig, id string) *NotificationTemplate {
+	if cfg == nil || strings.TrimSpace(id) == "" {
+		return nil
+	}
 	for i := range cfg.NotificationTemplates {
 		if cfg.NotificationTemplates[i].ID == id {
 			return &cfg.NotificationTemplates[i]
 		}
-	}
-	if len(cfg.NotificationTemplates) > 0 {
-		return &cfg.NotificationTemplates[0]
 	}
 	return nil
 }
@@ -780,7 +791,18 @@ func renderTemplate(cfg *RuntimeConfig, tg *TelegramConfig, ev *AdmissionEvent, 
 		}
 	}
 	timeDisplay := formatEventTimeForTelegram(cfg, ev.Time)
+	siteName := "K8s Delete Interceptor"
+	siteSubtitle := "Admission Guard Console"
+	if cfg != nil {
+		if strings.TrimSpace(cfg.Web.SiteName) != "" {
+			siteName = strings.TrimSpace(cfg.Web.SiteName)
+		}
+		if strings.TrimSpace(cfg.Web.SiteSubtitle) != "" {
+			siteSubtitle = strings.TrimSpace(cfg.Web.SiteSubtitle)
+		}
+	}
 	data := map[string]string{
+		"site_name": escapeForMode(siteName, tpl.ParseMode), "site_subtitle": escapeForMode(siteSubtitle, tpl.ParseMode),
 		"cluster": escapeForMode(ev.Cluster, tpl.ParseMode), "operation": escapeForMode(ev.Operation, tpl.ParseMode), "operation_cn": escapeForMode(operationCN(ev.Operation), tpl.ParseMode), "kind": escapeForMode(ev.Kind, tpl.ParseMode),
 		"namespace": escapeForMode(ev.Namespace, tpl.ParseMode), "name": escapeForMode(ev.Name, tpl.ParseMode), "resource": escapeForMode(ev.Resource, tpl.ParseMode),
 		"user": escapeForMode(ev.User, tpl.ParseMode), "actor_display": escapeForMode(actorDisplay, tpl.ParseMode), "rule_name": escapeForMode(ev.RuleName, tpl.ParseMode),

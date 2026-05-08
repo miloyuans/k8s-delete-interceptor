@@ -127,12 +127,8 @@ func ensureBuiltInConfigObjects(c *RuntimeConfig) {
 	ensureActor := func(actor ActorGroup) {
 		for i := range c.ActorGroups {
 			if c.ActorGroups[i].ID == actor.ID {
-				if actor.ID == "human_admins" || actor.ID == "cluster_controllers" {
-					c.ActorGroups[i].Name = actor.Name
-					c.ActorGroups[i].Users = actor.Users
-					c.ActorGroups[i].Groups = actor.Groups
-					c.ActorGroups[i].ServiceAccounts = actor.ServiceAccounts
-				}
+				// Existing ActorGroups, including built-in defaults, are user-editable from the Web console.
+				// Do not overwrite their SA/user/group matchers on every config load.
 				return
 			}
 		}
@@ -149,7 +145,7 @@ func ensureBuiltInConfigObjects(c *RuntimeConfig) {
 	}
 	// Keep built-in Telegram templates current unless explicitly disabled.
 	// This removes noisy numbered fields and legacy request_uid text from older generated configs.
-	if strings.ToLower(envOr("TEMPLATE_AUTO_MIGRATE_WEB_LINKS", "true")) != "false" {
+	if strings.ToLower(envOr("TEMPLATE_FORCE_DEFAULT_TEMPLATES", "false")) == "true" {
 		builtins := map[string]NotificationTemplate{}
 		for _, tpl := range defaultNotificationTemplates() {
 			builtins[tpl.ID] = tpl
@@ -183,21 +179,9 @@ func ensureBuiltInConfigObjects(c *RuntimeConfig) {
 			c.Rules[i].Notify = NotificationBinding{}
 			c.Rules[i].ControllerSafe = ControllerSafeRule{}
 		}
-		if c.Rules[i].ID == "core_delete_approval" {
-			c.Rules[i].ScopeIDs = []string{"workload_core", "service_network_core", "config_secret_core", "identity_rbac_core", "cluster_core"}
-			c.Rules[i].ActorGroupIDs = []string{"human_admins"}
-			if c.Rules[i].Approval.TTLSeconds == 300 {
-				// v2 初始配置里 300 秒过短且与 Telegram 交互窗口不一致；0 表示继承站点持久化设置。
-				c.Rules[i].Approval.TTLSeconds = 0
-			}
-		}
-		if c.Rules[i].ID == "important_update_notify" {
-			c.Rules[i].ScopeIDs = []string{"workload_core", "service_network_core", "config_secret_core", "identity_rbac_core"}
-			c.Rules[i].ActorGroupIDs = []string{"human_admins"}
-		}
-		if c.Rules[i].ID == "important_create_notify" {
-			c.Rules[i].ScopeIDs = []string{"workload_core", "service_network_core", "config_secret_core", "identity_rbac_core", "cluster_core"}
-			c.Rules[i].ActorGroupIDs = []string{"human_admins"}
+		if c.Rules[i].ID == "core_delete_approval" && c.Rules[i].Approval.TTLSeconds == 300 {
+			// v2 初始配置里 300 秒过短且与 Telegram 交互窗口不一致；0 表示继承站点持久化设置。
+			c.Rules[i].Approval.TTLSeconds = 0
 		}
 	}
 }
@@ -365,21 +349,22 @@ func defaultNotificationTemplates() []NotificationTemplate {
 
 func defaultTemplates() []NotificationTemplate {
 	return []NotificationTemplate{
-		{ID: "tpl_delete_approval", Name: "删除审批通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🚨 *K8s 删除操作待审批*\n事件ID: `{{.event_id}}`\n时间: `{{.time_display}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n原因: `{{.reason}}`\n审批人: {{.approvers_mentions}}\n[事件详情]({{.event_url}})"},
-		{ID: "tpl_update_notify", Name: "重要更新放行通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "📝 *K8s 更新操作放行通知*\n事件ID: `{{.event_id}}`\n时间: `{{.time_display}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n变更: `{{.change_summary}}`\n[事件详情]({{.event_url}})"},
-		{ID: "tpl_create_notify", Name: "重要创建操作放行通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🆕 *K8s 创建操作放行通知*\n事件ID: `{{.event_id}}`\n时间: `{{.time_display}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n原因: `{{.reason}}`\n[事件详情]({{.event_url}})"},
-		{ID: "tpl_block", Name: "拦截通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "⛔ *K8s 操作已拦截*\n事件ID: `{{.event_id}}`\n时间: `{{.time_display}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n操作: `{{.operation_cn}}`\n原因: `{{.reason}}`\n[事件详情]({{.event_url}})"},
+		{ID: "tpl_block", Name: "拦截通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "⛔ *{{.site_name}} 拦截通知*\n动作: `{{.operation_cn}}`\n事件ID: `{{.event_id}}`\n时间: `{{.time_display}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n原因: `{{.reason}}`\nWeb: [事件详情]({{.event_url}})"},
+		{ID: "tpl_allow", Name: "放行通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "✅ *{{.site_name}} 放行通知*\n动作: `{{.operation_cn}}`\n事件ID: `{{.event_id}}`\n时间: `{{.time_display}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n变更: `{{.change_summary}}`\n原因: `{{.reason}}`\nWeb: [事件详情]({{.event_url}})"},
+		{ID: "tpl_interactive", Name: "交互通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🚨 *{{.site_name}} 交互通知*\n动作: `{{.operation_cn}}`\n事件ID: `{{.event_id}}`\n时间: `{{.time_display}}`\n集群: `{{.cluster}}`\n资源: `{{.kind}}/{{.namespace}}/{{.name}}`\n用户: `{{.actor_display}}`\n规则: `{{.rule_name}}`\n原因: `{{.reason}}`\n审批人: {{.approvers_mentions}}\nWeb: [事件详情]({{.event_url}})"},
+		{ID: "tpl_service_start", Name: "启动通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "✅ *{{.site_name}} 启动通知*\n集群: `{{.cluster}}`\n实例: `{{.instance}}`\n时间: `{{.time_display}}`\n状态: `{{.status}}`"},
+		{ID: "tpl_service_stop", Name: "停止通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "🛑 *{{.site_name}} 停止通知*\n集群: `{{.cluster}}`\n实例: `{{.instance}}`\n时间: `{{.time_display}}`\n状态: `{{.status}}`"},
+		{ID: "tpl_config_approval", Name: "审批通知", Channel: "telegram", ParseMode: "Markdown", Enabled: true, Body: "📋 *{{.site_name}} 审批通知*\n状态: `{{.change_status_cn}}`\n事件ID: `{{.event_id}}`\n变更ID: `{{.change_id}}`\n类型: `{{.change_kind}}`\n申请人: `{{.created_by}}`\n版本: `{{.base_version}} -> {{.target_version}}`\n摘要: `{{.summary}}`\n差异: `{{.diff_summary}}`"},
 	}
 }
-
 func defaultRules() []PolicyRule {
 	return []PolicyRule{
 		{ID: "internal_mongo_delete_protection", Name: "内置 Mongo 硬保护", Enabled: true, Priority: 1, ScopeIDs: []string{"internal_mongo_assets"}, Operations: []string{"DELETE"}, Decision: DecisionBlock, Reason: "内置 MongoDB 属于系统核心数据源，禁止直接删除", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_block"}},
 		{ID: "pod_controller_lifecycle_audit", Name: "控制器 Pod 创建/删除只审计", Enabled: true, Priority: 20, ScopeIDs: []string{"pod_lifecycle"}, Operations: []string{"CREATE", "DELETE"}, ActorGroupIDs: []string{"cluster_controllers"}, Decision: DecisionAuditOnly, Reason: "控制器或节点维护 Pod 生命周期，仅审计"},
 		{ID: "workload_restart_silent", Name: "工作负载重启只审计", Enabled: true, Priority: 30, ScopeIDs: []string{"workload_core"}, Operations: []string{"UPDATE"}, ChangeClasses: []string{"workload_restart", "no_effective_change", "managed_fields_only", "status_only", "metadata_only"}, Decision: DecisionAuditOnly, Reason: "低风险或无有效变化更新，仅审计"},
-		{ID: "core_delete_approval", Name: "人工核心资源删除审批", Enabled: true, Priority: 50, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core", "identity_rbac_core", "cluster_core"}, Operations: []string{"DELETE"}, ActorGroupIDs: []string{"human_admins"}, Decision: DecisionRequireApproval, Reason: "核心资源删除需要审批", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_delete_approval"}, Approval: ApprovalBinding{Enabled: true, Mode: "both", TTLSeconds: 0, FailWhenStoreDown: true}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackRestoreOldObject, ShowInWeb: true, ShowInTelegram: true}},
-		{ID: "important_update_notify", Name: "人工重要资源有效更新通知", Enabled: true, Priority: 60, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core", "identity_rbac_core"}, Operations: []string{"UPDATE"}, ActorGroupIDs: []string{"human_admins"}, ChangeClasses: []string{"image_changed", "env_changed", "volume_changed", "scale_only", "service_selector_changed", "service_port_changed", "ingress_backend_changed", "configmap_data_changed", "secret_data_changed", "spec_changed"}, Decision: DecisionAllowNotify, Reason: "重要资源发生有效更新，已记录回滚和 YAML", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_update_notify"}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackRestoreOldObject, ShowInWeb: true, ShowInTelegram: false}},
-		{ID: "important_create_notify", Name: "人工重要资源创建通知", Enabled: true, Priority: 70, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core", "identity_rbac_core", "cluster_core"}, Operations: []string{"CREATE"}, ActorGroupIDs: []string{"human_admins"}, Decision: DecisionAllowNotify, Reason: "重要资源创建已放行并记录", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_create_notify"}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackDeleteCreatedObject, ShowInWeb: true, ShowInTelegram: false}},
+		{ID: "core_delete_approval", Name: "人工核心资源删除审批", Enabled: true, Priority: 50, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core", "identity_rbac_core", "cluster_core"}, Operations: []string{"DELETE"}, ActorGroupIDs: []string{"human_admins"}, Decision: DecisionRequireApproval, Reason: "核心资源删除需要审批", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_interactive"}, Approval: ApprovalBinding{Enabled: true, Mode: "both", TTLSeconds: 0, FailWhenStoreDown: true}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackRestoreOldObject, ShowInWeb: true, ShowInTelegram: true}},
+		{ID: "important_update_notify", Name: "人工重要资源有效更新通知", Enabled: true, Priority: 60, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core", "identity_rbac_core"}, Operations: []string{"UPDATE"}, ActorGroupIDs: []string{"human_admins"}, ChangeClasses: []string{"image_changed", "env_changed", "volume_changed", "scale_only", "service_selector_changed", "service_port_changed", "ingress_backend_changed", "configmap_data_changed", "secret_data_changed", "spec_changed"}, Decision: DecisionAllowNotify, Reason: "重要资源发生有效更新，已记录回滚和 YAML", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_allow"}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackRestoreOldObject, ShowInWeb: true, ShowInTelegram: false}},
+		{ID: "important_create_notify", Name: "人工重要资源创建通知", Enabled: true, Priority: 70, ScopeIDs: []string{"workload_core", "service_network_core", "config_secret_core", "identity_rbac_core", "cluster_core"}, Operations: []string{"CREATE"}, ActorGroupIDs: []string{"human_admins"}, Decision: DecisionAllowNotify, Reason: "重要资源创建已放行并记录", Notify: NotificationBinding{Enabled: true, TemplateID: "tpl_allow"}, Rollback: RollbackBinding{Enabled: true, Mode: RollbackDeleteCreatedObject, ShowInWeb: true, ShowInTelegram: false}},
 	}
 }
 

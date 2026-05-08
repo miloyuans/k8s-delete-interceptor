@@ -50,23 +50,44 @@ func (a *App) emitSystemNotification(ctx context.Context, kind, title, body stri
 }
 
 func (a *App) emitStartupNotification(ctx context.Context) {
-	cfg := a.Config()
-	cluster := "unknown"
-	if cfg != nil && cfg.ClusterName != "" {
-		cluster = cfg.ClusterName
-	}
-	body := fmt.Sprintf("✅ *K8s 删除拦截服务启动成功*\n集群: `%s`\n实例: `%s`\n时间: `%s`\n状态: `webhook/web console 已启动`", cluster, envOr("HOSTNAME", "pod"), time.Now().UTC().Format(time.RFC3339))
-	a.emitSystemNotification(ctx, "service_start", "服务启动成功", body, true)
+	title, body := a.renderSystemTemplate("service_start", "tpl_service_start", "webhook/web console 已启动")
+	a.emitSystemNotification(ctx, "service_start", title, body, true)
 }
 
 func (a *App) emitShutdownNotification(ctx context.Context) {
+	title, body := a.renderSystemTemplate("service_shutdown", "tpl_service_stop", "收到终止信号，正在优雅关闭")
+	a.emitSystemNotification(ctx, "service_shutdown", title, body, true)
+}
+
+func (a *App) renderSystemTemplate(kind, templateID, status string) (string, string) {
 	cfg := a.Config()
 	cluster := "unknown"
-	if cfg != nil && cfg.ClusterName != "" {
-		cluster = cfg.ClusterName
+	siteName := "K8s Delete Interceptor"
+	if cfg != nil {
+		if cfg.ClusterName != "" {
+			cluster = cfg.ClusterName
+		}
+		if strings.TrimSpace(cfg.Web.SiteName) != "" {
+			siteName = strings.TrimSpace(cfg.Web.SiteName)
+		}
 	}
-	body := fmt.Sprintf("🛑 *K8s 删除拦截服务正在关闭*\n集群: `%s`\n实例: `%s`\n时间: `%s`\n状态: `收到终止信号，正在优雅关闭`", cluster, envOr("HOSTNAME", "pod"), time.Now().UTC().Format(time.RFC3339))
-	a.emitSystemNotification(ctx, "service_shutdown", "服务关闭", body, true)
+	now := time.Now().UTC().Format(time.RFC3339)
+	data := map[string]string{"site_name": siteName, "cluster": cluster, "instance": envOr("HOSTNAME", "pod"), "time_display": now, "time": now, "status": status, "kind": kind}
+	if cfg != nil {
+		if tpl := findTemplateExact(cfg, templateID); tpl != nil && tpl.Enabled {
+			if out, err := renderPlainTemplate(tpl.ID, tpl.Body, data); err == nil {
+				return tpl.Name, out
+			}
+		}
+	}
+	icon := "✅"
+	title := "服务启动成功"
+	if kind == "service_shutdown" {
+		icon = "🛑"
+		title = "服务关闭"
+	}
+	body := fmt.Sprintf("%s *%s %s*\n集群: `%s`\n实例: `%s`\n时间: `%s`\n状态: `%s`", icon, siteName, title, cluster, envOr("HOSTNAME", "pod"), now, status)
+	return title, body
 }
 
 func (a *App) emitMongoStatusNotification(ctx context.Context, recovered bool, detail string) {

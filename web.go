@@ -22,6 +22,7 @@ func (a *App) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/", a.handleIndex)
 	mux.HandleFunc("/api/health", a.handleHealth)
 	mux.HandleFunc("/api/auth/login", a.handleLogin)
+	mux.HandleFunc("/api/me/profile", a.auth(a.handleMeProfile))
 	mux.HandleFunc("/api/me", a.auth(a.handleMe))
 	mux.HandleFunc("/api/settings", a.auth(a.handleSettings))
 	mux.HandleFunc("/api/metadata", a.require(PermDashboardRead, a.handleMetadata))
@@ -82,7 +83,7 @@ func isWebRoute(path string) bool {
 		return false
 	}
 	switch strings.Trim(path, "/") {
-	case "dashboard", "events", "actorgroups", "serviceaccounts", "rules", "datasources", "telegram", "templates", "changes", "users", "settings", "export":
+	case "dashboard", "events", "actorgroups", "serviceaccounts", "rules", "datasources", "telegram", "templates", "changes", "users", "settings", "export", "login":
 		return true
 	default:
 		return false
@@ -145,6 +146,57 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "authenticated": true, "auth_required": a.authRequired(), "user": userFromContext(r.Context())})
+}
+
+func (a *App) handleMeProfile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	u := userFromContext(r.Context())
+	if u == nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		DisplayName string `json:"display_name"`
+		Password    string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if u.TokenMode == "admin_token" || u.TokenMode == "no_auth" {
+		writeJSON(w, map[string]any{"ok": true, "local_only": true, "message": "token/no-auth superadmin profile is stored by the Web client"})
+		return
+	}
+	cfg := a.Config()
+	if cfg == nil {
+		http.Error(w, "runtime config unavailable", 500)
+		return
+	}
+	next := cloneConfig(cfg)
+	found := false
+	now := time.Now().UTC()
+	for i := range next.WebUsers {
+		if strings.EqualFold(next.WebUsers[i].Username, u.Username) {
+			if strings.TrimSpace(body.DisplayName) != "" {
+				next.WebUsers[i].DisplayName = strings.TrimSpace(body.DisplayName)
+			}
+			if strings.TrimSpace(body.Password) != "" {
+				next.WebUsers[i].PasswordHash = hashPassword(next.WebUsers[i].Username, body.Password)
+			}
+			next.WebUsers[i].UpdatedAt = now
+			found = true
+			break
+		}
+	}
+	if !found {
+		http.Error(w, "current user does not exist in web_users", http.StatusNotFound)
+		return
+	}
+	cr, applied, err := a.proposeConfigChange(r.Context(), *next, "users", "更新当前用户个人信息", u, true)
+	writeChangeResponse(w, cr, applied, err)
 }
 
 func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -1696,10 +1748,6 @@ func normalizeRuleRequest(req RuleEditRequest) RuleEditRequest {
 	}
 	if req.Decision == "" {
 		req.Decision = DecisionRequireApproval
-	}
-	if !req.Enabled {
-		// zero value from old clients should still create enabled rules unless the ID already exists.
-		req.Enabled = true
 	}
 	if len(req.APIGroups) == 0 && req.APIGroup != "" {
 		req.APIGroups = []string{req.APIGroup}

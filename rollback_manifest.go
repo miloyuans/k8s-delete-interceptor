@@ -27,6 +27,9 @@ func rollbackBackupYAML(rb *RollbackBackup) (string, error) {
 		return "", err
 	}
 	cleanupRollbackObject(obj)
+	if isScaleRollbackBackup(rb) {
+		normalizeScaleRollbackObject(obj)
+	}
 	b, err := yaml.Marshal(obj)
 	if err != nil {
 		return "", err
@@ -34,6 +37,9 @@ func rollbackBackupYAML(rb *RollbackBackup) (string, error) {
 	y := strings.TrimSpace(string(b)) + "\n"
 	if rb.Mode == RollbackDeleteCreatedObject {
 		return "# Rollback mode: delete_created_object\n# Use: kubectl delete -f this-file.yaml\n" + y, nil
+	}
+	if isScaleRollbackBackup(rb) {
+		return "# Rollback mode: restore_old_object\n# Target: parent resource subresource /scale\n# Web execute/dry-run uses the Kubernetes scale subresource directly.\n# For manual rollback, prefer: kubectl scale " + strings.TrimSpace(rb.Resource) + " " + strings.TrimSpace(rb.Name) + " -n " + strings.TrimSpace(rb.Namespace) + " --replicas=<spec.replicas from this file>\n" + y, nil
 	}
 	return "# Rollback mode: restore_old_object\n# Use: kubectl apply --server-side --force-conflicts -f this-file.yaml\n" + y, nil
 }

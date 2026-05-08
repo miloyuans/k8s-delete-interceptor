@@ -388,6 +388,7 @@ type RollbackBackup struct {
 	APIVersion       string          `json:"api_version" bson:"api_version"`
 	Kind             string          `json:"kind" bson:"kind"`
 	Resource         string          `json:"resource" bson:"resource"`
+	SubResource      string          `json:"sub_resource,omitempty" bson:"sub_resource,omitempty"`
 	Namespace        string          `json:"namespace" bson:"namespace"`
 	Name             string          `json:"name" bson:"name"`
 	SourceObject     json.RawMessage `json:"source_object" bson:"source_object"`

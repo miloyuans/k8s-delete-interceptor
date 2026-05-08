@@ -32,7 +32,7 @@ func (a *App) createRollbackBackup(ctx context.Context, cfg *RuntimeConfig, ev *
 	if len(source) == 0 {
 		return nil, nil
 	}
-	rb := &RollbackBackup{ID: "rb_" + ev.ID, RequestUID: ev.RequestUID, EventID: ev.ID, CreatedAt: time.Now().UTC(), Cluster: cfg.ClusterName, Operation: ac.Operation, Mode: mode, APIGroup: ac.APIGroup, APIVersion: ac.APIVersion, Kind: ac.Kind, Resource: ac.Resource, Namespace: ac.Namespace, Name: ac.Name, SourceObject: source, CreatedObjectUID: createdUID, DryRunRequired: cfg.Rollback.RequireDryRun}
+	rb := &RollbackBackup{ID: "rb_" + ev.ID, RequestUID: ev.RequestUID, EventID: ev.ID, CreatedAt: time.Now().UTC(), Cluster: cfg.ClusterName, Operation: ac.Operation, Mode: mode, APIGroup: ac.APIGroup, APIVersion: ac.APIVersion, Kind: ac.Kind, Resource: ac.Resource, SubResource: ac.SubResource, Namespace: ac.Namespace, Name: ac.Name, SourceObject: source, CreatedObjectUID: createdUID, DryRunRequired: cfg.Rollback.RequireDryRun}
 	_ = a.local.SaveRollback(rb)
 	if a.mongo != nil && a.mongo.Healthy() {
 		_ = a.mongo.SaveRollback(ctx, rb)
@@ -57,13 +57,10 @@ func (a *App) executeRollback(ctx context.Context, id string, dryRun bool) (stri
 	if err != nil {
 		return "", err
 	}
-	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(a.discoveryClient))
-	gv := schema.GroupVersion{Group: rb.APIGroup, Version: rb.APIVersion}
-	mapping, err := mapper.RESTMapping(gv.WithKind(rb.Kind).GroupKind(), rb.APIVersion)
+	ri, patchSubresource, err := a.rollbackResourceInterface(rb)
 	if err != nil {
 		return "", err
 	}
-	ri := resourceInterface(a, mapping, rb.Namespace)
 	dry := []string{}
 	if dryRun {
 		dry = []string{metav1.DryRunAll}
@@ -87,9 +84,26 @@ func (a *App) executeRollback(ctx context.Context, id string, dryRun bool) (stri
 		return "", err
 	}
 	cleanupRollbackObject(obj)
+	if isScaleRollbackBackup(rb) {
+		normalizeScaleRollbackObject(obj)
+	}
 	ub, _ := json.Marshal(obj)
-	fieldManager := "k8s-delete-interceptor-rollback"
-	_, err = ri.Patch(ctx, rb.Name, types.ApplyPatchType, ub, metav1.PatchOptions{FieldManager: fieldManager, Force: boolPtr(true), DryRun: dry})
+	patchType := types.ApplyPatchType
+	patchOptions := metav1.PatchOptions{FieldManager: "k8s-delete-interceptor-rollback", Force: boolPtr(true), DryRun: dry}
+	if strings.EqualFold(patchSubresource, "scale") {
+		if b, err := scaleRollbackMergePatch(obj); err == nil {
+			ub = b
+			patchType = types.MergePatchType
+			patchOptions = metav1.PatchOptions{DryRun: dry}
+		} else {
+			return "", err
+		}
+	}
+	patchSubresources := []string{}
+	if patchSubresource != "" {
+		patchSubresources = append(patchSubresources, patchSubresource)
+	}
+	_, err = ri.Patch(ctx, rb.Name, patchType, ub, patchOptions, patchSubresources...)
 	if err != nil {
 		return "", err
 	}
@@ -97,6 +111,89 @@ func (a *App) executeRollback(ctx context.Context, id string, dryRun bool) (stri
 		return "dry-run apply ok", nil
 	}
 	return "restore-old-object rollback executed", nil
+}
+
+func (a *App) rollbackResourceInterface(rb *RollbackBackup) (dynamicResourceInterface, string, error) {
+	if rb == nil {
+		return nil, "", errors.New("rollback backup is nil")
+	}
+	subresource := strings.TrimSpace(rb.SubResource)
+	if subresource == "" && isScaleRollbackBackup(rb) {
+		subresource = "scale"
+	}
+	if subresource != "" {
+		if strings.TrimSpace(rb.Resource) == "" || strings.TrimSpace(rb.APIVersion) == "" {
+			return nil, "", fmt.Errorf("rollback subresource %q requires parent resource and api_version", subresource)
+		}
+		gvr := schema.GroupVersionResource{Group: rb.APIGroup, Version: rb.APIVersion, Resource: rb.Resource}
+		if rb.Namespace != "" {
+			return a.dynamicClient.Resource(gvr).Namespace(rb.Namespace), subresource, nil
+		}
+		return a.dynamicClient.Resource(gvr), subresource, nil
+	}
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(a.discoveryClient))
+	gv := schema.GroupVersion{Group: rb.APIGroup, Version: rb.APIVersion}
+	mapping, err := mapper.RESTMapping(gv.WithKind(rb.Kind).GroupKind(), rb.APIVersion)
+	if err != nil {
+		return nil, "", err
+	}
+	return resourceInterface(a, mapping, rb.Namespace), "", nil
+}
+
+func isScaleRollbackBackup(rb *RollbackBackup) bool {
+	if rb == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(rb.SubResource), "scale") {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(rb.Kind), "Scale") && strings.TrimSpace(rb.Resource) != "" {
+		return true
+	}
+	var obj map[string]any
+	if len(rb.SourceObject) > 0 && json.Unmarshal(rb.SourceObject, &obj) == nil {
+		kind, _ := obj["kind"].(string)
+		return strings.EqualFold(strings.TrimSpace(kind), "Scale") && strings.TrimSpace(rb.Resource) != ""
+	}
+	return false
+}
+
+func scaleRollbackMergePatch(obj map[string]any) ([]byte, error) {
+	replicas, ok := scaleReplicas(obj)
+	if !ok {
+		return nil, errors.New("scale rollback source object is missing spec.replicas")
+	}
+	return json.Marshal(map[string]any{"spec": map[string]any{"replicas": replicas}})
+}
+
+func scaleReplicas(obj map[string]any) (int64, bool) {
+	v, ok := getNested(obj, "spec", "replicas")
+	if !ok {
+		return 0, false
+	}
+	switch x := v.(type) {
+	case int:
+		return int64(x), true
+	case int32:
+		return int64(x), true
+	case int64:
+		return x, true
+	case float64:
+		return int64(x), true
+	case json.Number:
+		n, err := x.Int64()
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func normalizeScaleRollbackObject(obj map[string]any) {
+	if obj == nil {
+		return
+	}
+	obj["apiVersion"] = "autoscaling/v1"
+	obj["kind"] = "Scale"
 }
 
 func resourceInterface(a *App, mapping *meta.RESTMapping, namespace string) dynamicResourceInterface {

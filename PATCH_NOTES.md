@@ -50,3 +50,14 @@
 
 - Fixed `telegram.go` compile error caused by assigning the two-value result of `DeleteTelegramNotifications` to a single blank identifier.
 - Changed stale admission notification cleanup call to discard both return values: `_, _ = ...`.
+
+## v10 - Rollback Scale + Web Refresh UX
+
+- Fixed rollback execution for Kubernetes scale subresources. Scale backups are no longer resolved as a top-level `apps/v1` `Scale` kind; rollback now targets the parent workload resource and patches its `/scale` subresource directly with a minimal merge patch for `spec.replicas`.
+- Added `sub_resource` to rollback backups so future rollback records preserve whether the original admission event targeted a subresource such as `scale`.
+- Existing older rollback records with `kind: Scale` are also handled as `/scale` rollbacks when the parent resource is present.
+- Scale rollback YAML is normalized to `autoscaling/v1` `Scale` and includes a safer manual rollback hint.
+- Removed the top-right global refresh button from the console.
+- Switching function windows now automatically reloads current data for that section, including health/auth checks and the section-specific backend lists.
+- Approving or rejecting a business configuration change now refreshes config, metadata, pending changes, audit history, and the active section automatically.
+- Improved the top-right user detail dropdown so long roles/permissions wrap within an adaptive-width panel instead of overflowing.

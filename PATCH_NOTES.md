@@ -61,3 +61,13 @@
 - Switching function windows now automatically reloads current data for that section, including health/auth checks and the section-specific backend lists.
 - Approving or rejecting a business configuration change now refreshes config, metadata, pending changes, audit history, and the active section automatically.
 - Improved the top-right user detail dropdown so long roles/permissions wrap within an adaptive-width panel instead of overflowing.
+
+## v11 UI layout and config editor upgrade
+
+- Reworked ActorGroup management into a fixed-width, scrollable left list and a right-side detail/editor pane.
+- Reworked rule management with a wider scrollable rule list, selected-row highlighting, and an undo button for unsubmitted rule draft edits.
+- Reworked notification templates into a scrollable selectable template list with a right-side final notification preview bubble.
+- Reworked change approval into one combined change/audit window with sub-tabs, scrollable lists, selected-row highlighting, and right-side details.
+- Replaced the site default timezone text input with the same timezone selector used by the global top bar and synchronized the selected value.
+- Reworked config export into a scrollable version list plus a right-side full config editor that defaults to YAML, supports JSON/YAML switching, one-click copy, and top-right approval submission.
+- Extended raw config publish endpoint to accept YAML payloads via `format=yaml` or YAML content type while preserving JSON support.

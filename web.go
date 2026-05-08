@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -404,12 +405,32 @@ func (a *App) handlePublishConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
+	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	contentType := strings.ToLower(r.Header.Get("Content-Type"))
 	var cfg RuntimeConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
-		http.Error(w, err.Error(), 400)
-		return
+	if format == "yaml" || format == "yml" || strings.Contains(contentType, "yaml") || strings.Contains(contentType, "yml") {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if err := yaml.Unmarshal(b, &cfg); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+	} else {
+		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
 	}
-	cr, applied, err := a.proposeConfigChange(r.Context(), cfg, "raw_config", "通过 JSON 编辑器提交完整运行配置", userFromContext(r.Context()), false)
+	summary := "通过完整配置编辑器提交运行配置"
+	if format == "yaml" || format == "yml" {
+		summary = "通过 YAML 编辑器提交完整运行配置"
+	} else if format == "json" || strings.Contains(contentType, "json") {
+		summary = "通过 JSON 编辑器提交完整运行配置"
+	}
+	cr, applied, err := a.proposeConfigChange(r.Context(), cfg, "raw_config", summary, userFromContext(r.Context()), false)
 	writeChangeResponse(w, cr, applied, err)
 }
 
